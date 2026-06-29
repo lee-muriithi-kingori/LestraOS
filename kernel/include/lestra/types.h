@@ -51,6 +51,12 @@ typedef int                errno_t;
 #define EBUSY       -7
 #define ENODEV      -8
 
+/* Integer limits */
+#define INT_MAX     2147483647
+#define INT_MIN     (-2147483648)
+#define SIZE_MAX    ((size_t)(-1))
+#define SSIZE_MAX   ((ssize_t)(SIZE_MAX >> 1))
+
 /* Memory constants */
 #define KiB        (1024UL)
 #define MiB        (1024UL * KiB)

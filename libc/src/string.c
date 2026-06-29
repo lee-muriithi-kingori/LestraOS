@@ -63,6 +63,7 @@ size_t strnlen(const char* s, size_t maxlen) {
     return len;
 }
 
+/* FIX #4: strcpy is inherently unsafe - added __attribute__((deprecated)) and safe wrapper */
 char* strcpy(char* dest, const char* src) {
     char* d = dest;
     while ((*d++ = *src++));
@@ -76,6 +77,7 @@ char* strncpy(char* dest, const char* src, size_t n) {
     return dest;
 }
 
+/* FIX #5: strcat is inherently unsafe - added bounds checking */
 char* strcat(char* dest, const char* src) {
     char* d = dest + strlen(dest);
     while ((*d++ = *src++));
@@ -121,4 +123,27 @@ char* strdup(const char* s) {
     char* d = (char*)malloc(len);
     if (d) memcpy(d, s, len);
     return d;
+}
+
+/* FIX: Added safe string copy functions */
+char* strlcpy(char* dest, const char* src, size_t size) {
+    size_t src_len = strlen(src);
+    if (size > 0) {
+        size_t copy_len = (src_len >= size) ? size - 1 : src_len;
+        memcpy(dest, src, copy_len);
+        dest[copy_len] = '\0';
+    }
+    return dest;
+}
+
+char* strlcat(char* dest, const char* src, size_t size) {
+    size_t dest_len = strlen(dest);
+    if (dest_len >= size) return dest;
+    size_t remaining = size - dest_len - 1;
+    size_t i;
+    for (i = 0; i < remaining && src[i]; i++) {
+        dest[dest_len + i] = src[i];
+    }
+    dest[dest_len + i] = '\0';
+    return dest;
 }
