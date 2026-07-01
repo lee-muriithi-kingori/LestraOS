@@ -35,14 +35,14 @@ static inline size_t pfn_to_bit(size_t pfn) {
 /* FIX #9: Add bounds checking to all bitmap operations (CRITICAL) */
 static inline bool bitmap_test(size_t pfn) {
     if (pfn >= highest_pfn) {
-        panic("PMM: bitmap_test out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
+        panicf("PMM: bitmap_test out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
     }
     return (bitmap[pfn_to_idx(pfn)] >> pfn_to_bit(pfn)) & 1;
 }
 
 static inline void bitmap_set(size_t pfn) {
     if (pfn >= highest_pfn) {
-        panic("PMM: bitmap_set out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
+        panicf("PMM: bitmap_set out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
         return;
     }
     bitmap[pfn_to_idx(pfn)] |= (1ULL << pfn_to_bit(pfn));
@@ -50,7 +50,7 @@ static inline void bitmap_set(size_t pfn) {
 
 static inline void bitmap_clear(size_t pfn) {
     if (pfn >= highest_pfn) {
-        panic("PMM: bitmap_clear out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
+        panicf("PMM: bitmap_clear out of bounds (pfn=%lu, max=%lu)", pfn, highest_pfn);
         return;
     }
     bitmap[pfn_to_idx(pfn)] &= ~(1ULL << pfn_to_bit(pfn));
