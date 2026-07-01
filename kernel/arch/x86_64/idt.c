@@ -4,6 +4,7 @@
  */
 
 #include <lestra/types.h>
+#include <lestra/gdt.h>
 #include <lestra/idt.h>
 #include <lestra/irq.h>
 #include <lestra/printk.h>
