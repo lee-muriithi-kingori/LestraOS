@@ -231,9 +231,11 @@ align 8
 gdt64:
     dq 0                    ; Null descriptor
 
+gdt64.code:
     ; Code segment (64-bit)
     dq (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53)
 
+gdt64.data:
     ; Data segment
     dq (1 << 41) | (1 << 44) | (1 << 47)
 
@@ -267,21 +269,8 @@ long_mode_start:
     mov gs, ax
     mov ss, ax
 
-    ; Set up stack pointer (higher half)
-    mov rsp, (boot_stack_top - 0xFFFFFFFF80000000)
-    add rsp, 0xFFFFFFFF80000000
-
-    ; Jump to higher half
-    mov rax, higher_half
-    jmp rax
-
-higher_half:
-    ; Remove identity mapping (lower half)
-    mov qword [boot_pml4], 0
-
-    ; Reload CR3 to flush TLB
-    mov rax, cr3
-    mov cr3, rax
+    ; Set up stack pointer (flat - no higher half adjustment)
+    mov rsp, boot_stack_top
 
     ; Push multiboot info pointer as argument
     mov rdi, [mb_info_ptr]
