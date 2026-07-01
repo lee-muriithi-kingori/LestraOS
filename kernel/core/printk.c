@@ -9,6 +9,7 @@
 #include <lestra/printk.h>
 #include <lestra/vga.h>
 #include <lestra/serial.h>
+#include <string.h>
 #include <stdarg.h>
 
 /* Simple itoa for numbers */
