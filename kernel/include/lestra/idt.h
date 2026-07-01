@@ -58,6 +58,9 @@ struct idt_ptr {
 
 #define IDT_ENTRIES         256
 
+/* Forward declaration for interrupt frame */
+struct interrupt_frame;
+
 /* Interrupt handler function type */
 typedef void (*interrupt_handler_t)(struct interrupt_frame* frame);
 
