@@ -66,9 +66,10 @@ entry:
     stosd
     stosd                           ; null descriptor
 
-    ; code: base=0, limit=0xFFFFF, P+DPL0+code+R, D=1, G=1
+    ; code: base=0, limit=0xFFFFF, P+DPL0+code+R, L=1, D=0, G=1
+    ; L=1 (64-bit mode), D=0 (default operand size 64)
     mov eax, 0x0000FFFF
-    mov edx, 0x00CF9A00
+    mov edx, 0x00AF9A00
     stosd
     stosd
 
@@ -157,11 +158,18 @@ pm_switch:
     ; Set stack
     mov esp, 0x80000
 
-    ; Debug: write 'A' after switching to protected mode
-    mov word [0xB87F00], 0x0F41  ; 'A' in text row 62 col 0
+    ; ---- Far jump to 64-bit code segment ----
+    ; This transitions from 32-bit protected mode to 64-bit long mode
+    jmp 0x0008:.enter64
 
-    ; Jump to 64-bit kernel entry
-    jmp KERNEL_ENTRY
+.enter64:
+    ; Now in 64-bit mode!
+    ; Pass 0 as mb_info pointer (no multiboot2 info from our custom bootloader)
+    xor edi, edi           ; RDI = 0
+
+    ; Jump to kernel entry (in 64-bit mode)
+    ; The raw kernel has _start at file offset 0x1000, which is at physical KERNEL_PADDR + 0x1000
+    jmp 0x101000
 
 ; ============================================================
 ; 64-bit mode halt loop (fallback, should never run)
