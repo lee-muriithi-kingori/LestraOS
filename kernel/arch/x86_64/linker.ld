@@ -8,16 +8,17 @@
 
 ENTRY(_start)
 
-KERNEL_VMA = 0xFFFFFFFF80000000;
+/* Kernel loads at 1MB physical, no higher-half mapping for now */
+KERNEL_VMA = 0x100000;
 
 SECTIONS
 {
-    . = KERNEL_VMA + 0x100000;
+    . = KERNEL_VMA;
 
     __kernel_start = .;
 
     /* Text section - executable code */
-    .text : AT(ADDR(.text) - KERNEL_VMA)
+    .text : AT(0x100000)
     {
         __text_start = .;
         *(.multiboot)
@@ -29,7 +30,7 @@ SECTIONS
     }
 
     /* Read-only data */
-    .rodata : AT(ADDR(.rodata) - KERNEL_VMA)
+    .rodata :
     {
         __rodata_start = .;
         *(.rodata)
@@ -39,7 +40,7 @@ SECTIONS
     }
 
     /* Initialized data */
-    .data : AT(ADDR(.data) - KERNEL_VMA)
+    .data :
     {
         __data_start = .;
         *(.data)
@@ -49,7 +50,7 @@ SECTIONS
     }
 
     /* BSS - uninitialized data */
-    .bss : AT(ADDR(.bss) - KERNEL_VMA)
+    .bss :
     {
         __bss_start = .;
         *(.bss)
