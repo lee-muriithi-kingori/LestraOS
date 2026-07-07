@@ -48,7 +48,7 @@ static int64_t sys_fork(void) {
 
 static int64_t sys_read(int64_t fd, void* buf, size_t count) {
     (void)fd;
-    if (!buf || count == 0) return -1;
+    if (!buf || count == 0) return -EFAULT;
     char* cbuf = (char*)buf;
     for (size_t i = 0; i < count; i++) {
         cbuf[i] = keyboard_getchar();
@@ -58,7 +58,7 @@ static int64_t sys_read(int64_t fd, void* buf, size_t count) {
 
 static int64_t sys_write(int64_t fd, const void* buf, size_t count) {
     (void)fd;
-    if (!buf || count == 0) return 0;
+    if (!buf || count == 0) return -EFAULT;
     const char* cbuf = (const char*)buf;
     for (size_t i = 0; i < count; i++) {
         if (cbuf[i] == '\n') {
@@ -122,7 +122,7 @@ static int64_t sys_sleep(uint64_t ms) {
 }
 
 static int64_t sys_getcwd(char* buf, size_t size) {
-    if (!buf || size == 0) return -1;
+    if (!buf || size == 0) return -EFAULT;
     const char* cwd = "/";
     size_t len = strlen(cwd) + 1;
     if (len > size) len = size;
@@ -172,7 +172,7 @@ static int64_t sys_reboot(int64_t cmd) {
 }
 
 static int64_t sys_uname(void* buf) {
-    if (!buf) return -1;
+    if (!buf) return -EFAULT;
     /* Simple uname - just write "LestraOS" to buf */
     memset(buf, 0, 256);
     strcpy((char*)buf, "LestraOS");

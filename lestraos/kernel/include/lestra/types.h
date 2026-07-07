@@ -88,6 +88,7 @@ typedef int                errno_t;
 #define ENOSYS      -6
 #define EBUSY       -7
 #define ENODEV      -8
+#define EFAULT     -14  /* Bad address (Linux errno 14, mirrored as -14) */
 
 /* Integer limits */
 #define INT_MAX     2147483647
