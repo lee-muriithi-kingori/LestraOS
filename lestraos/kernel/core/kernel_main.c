@@ -86,57 +86,112 @@ static void print_banner(void) {
 /* Forward declarations */
 extern void shell_run(void);
 
-/* Parse multiboot2 info: extract mmap + initrd modules in one pass. */
+/* Parse multiboot2 info: extract mmap + initrd modules in one pass.
+ * PR #8 fix: hardened against malformed / hostile multiboot2 info.
+ *  - reject NULL / too-small / too-large info struct,
+  - validate each tag's size before dereferencing,
+  - clamp the mmap entry_count math so a bad `entry_size` can't
+    underflow us into reading GBs of memory,
+  - bail out cleanly if a tag's size is bogus or if the next
+    tag pointer would land outside [info, info + total_size).
+ */
+#define MB2_MIN_INFO_SIZE  16   /* total_size(4) + reserved(4) + 1 tag + pad */
+#define MB2_MAX_INFO_SIZE  (16UL * 1024UL * 1024UL)  /* 16 MiB sanity cap */
+#define MB2_MAX_TAG_SIZE   (1UL  * 1024UL * 1024UL)  /* 1 MiB per-tag cap */
 static void parse_multiboot2(void* mb2_info,
                              struct mmap_entry** mmap_out,
                              uint32_t* mmap_count_out,
                              void** initrd_addr_out,
                              uint32_t* initrd_size_out) {
-    uint32_t total_size = *(uint32_t*)mb2_info;
-    struct mb2_tag* tag = (struct mb2_tag*)((uintptr_t)mb2_info + 8);
-
     *mmap_out = NULL;
     *mmap_count_out = 0;
     *initrd_addr_out = NULL;
     *initrd_size_out = 0;
 
-    while (tag->type != MB2_TAG_END) {
+    if (!mb2_info) {
+        pr_warn("parse_multiboot2: mb2_info is NULL\n");
+        return;
+    }
+
+    uint32_t total_size = *(volatile uint32_t*)mb2_info;
+    if (total_size < MB2_MIN_INFO_SIZE || total_size > MB2_MAX_INFO_SIZE) {
+        pr_warn("parse_multiboot2: implausible total_size=%u (refusing)\n", total_size);
+        return;
+    }
+
+    uintptr_t info_base = (uintptr_t)mb2_info;
+    uintptr_t info_end  = info_base + total_size;
+    struct mb2_tag* tag = (struct mb2_tag*)(info_base + 8);
+
+    while ((uintptr_t)tag >= info_base + 8 &&
+           (uintptr_t)tag + sizeof(struct mb2_tag) <= info_end) {
+        if (tag->type == MB2_TAG_END) break;
+
+        /* Reject tags with bogus sizes (0 or implausibly large)
+         * BEFORE dereferencing their payload. */
+        if (tag->size < sizeof(struct mb2_tag) || tag->size > MB2_MAX_TAG_SIZE) {
+            pr_warn("parse_multiboot2: bogus tag size=%u type=0x%x, stopping\n",
+                    tag->size, tag->type);
+            break;
+        }
+        /* And ensure the tag's payload fits inside info before we read it. */
+        if ((uintptr_t)tag + tag->size > info_end) {
+            pr_warn("parse_multiboot2: tag overflows info, stopping\n");
+            break;
+        }
+
         switch (tag->type) {
             case MB2_TAG_MEMINFO: {
-                struct mb2_meminfo* mem = (struct mb2_meminfo*)tag;
-                pr_info("Memory: Lower=%uKB, Upper=%uKB\n",
-                        mem->mem_lower, mem->mem_upper);
-                break;
-            }
-            case MB2_TAG_MMAP: {
-                struct mb2_mmap* mmap_tag = (struct mb2_mmap*)tag;
-                *mmap_out = mmap_tag->entries;
-                *mmap_count_out = (mmap_tag->tag.size - 16) / mmap_tag->entry_size;
-                pr_info("Memory map: %u entries\n", *mmap_count_out);
-                break;
-            }
-            case MB2_TAG_MODULE: {
-                struct mb2_module* mod = (struct mb2_module*)tag;
-                pr_info("Boot module: addr=0x%x-0x%x (size=%u) string='%s'\n",
-                        mod->mod_start, mod->mod_end,
-                        mod->mod_end - mod->mod_start,
-                        mod->string ? mod->string : "(none)");
-                /* Take the first module as initrd */
-                if (*initrd_addr_out == NULL) {
-                    *initrd_addr_out = (void*)(uintptr_t)mod->mod_start;
-                    *initrd_size_out = mod->mod_end - mod->mod_start;
+                if (tag->size >= sizeof(struct mb2_meminfo)) {
+                    struct mb2_meminfo* mem = (struct mb2_meminfo*)tag;
+                    pr_info("Memory: Lower=%uKB, Upper=%uKB\n",
+                            mem->mem_lower, mem->mem_upper);
                 }
                 break;
             }
+            case MB2_TAG_MMAP: {
+                if (tag->size >= sizeof(struct mb2_mmap)) {
+                    struct mb2_mmap* mmap_tag = (struct mb2_mmap*)tag;
+                    /* entry_size must be >= sizeof(struct mmap_entry)
+                     * and non-zero, or the count math is meaningless. */
+                    if (mmap_tag->entry_size >= sizeof(struct mmap_entry)) {
+                        uint32_t count = (mmap_tag->tag.size - sizeof(struct mb2_mmap))
+                                          / mmap_tag->entry_size;
+                        *mmap_out = mmap_tag->entries;
+                        *mmap_count_out = count;
+                        pr_info("Memory map: %u entries\n", count);
+                    } else {
+                        pr_warn("parse_multiboot2: mmap entry_size=%u too small\n",
+                                mmap_tag->entry_size);
+                    }
+                }
+                break;
+            }
+            case MB2_TAG_MODULE: {
+                if (tag->size >= sizeof(struct mb2_module) &&
+                    mod->mod_end >= mod->mod_start) {
+                    struct mb2_module* mod = (struct mb2_module*)tag;
+                    pr_info("Boot module: addr=0x%x-0x%x (size=%u) string='%s'\n",
+                            mod->mod_start, mod->mod_end,
+                            mod->mod_end - mod->mod_start,
+                            mod->string ? mod->string : "(none)");
+                    /* Take the first module as initrd */
+                    if (*initrd_addr_out == NULL) {
+                        *initrd_addr_out = (void*)(uintptr_t)mod->mod_start;
+                        *initrd_size_out = mod->mod_end - mod->mod_start;
+                    }
+                }
+                break;
+            }
+            default:
+                /* unknown tag — ignore but still advance */
+                break;
         }
 
         /* Move to next tag (aligned to 8 bytes) */
-        tag = (struct mb2_tag*)ALIGN_UP((uintptr_t)tag + tag->size, 8);
-
-        /* Safety check - don't read past the info structure */
-        if ((uintptr_t)tag >= (uintptr_t)mb2_info + total_size) {
-            break;
-        }
+        uintptr_t next = ALIGN_UP((uintptr_t)tag + tag->size, 8);
+        if (next <= (uintptr_t)tag) break;  /* size 0 or overflow */
+        tag = (struct mb2_tag*)next;
     }
 }
 
