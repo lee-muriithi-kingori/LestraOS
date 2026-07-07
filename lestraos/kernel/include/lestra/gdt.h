@@ -61,4 +61,35 @@ void gdt_init(void);
 void gdt_set_entry(int index, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
 void gdt_reload(uint16_t cs, uint16_t ds);
 
+/* --- Task State Segment (long mode) ---
+ * PR #6 fix: GDT was missing a TSS descriptor. Without one:
+ *  - syscall entry does NOT swap to a kernel stack (no rsp0 load),
+    so user-mode ROP can clobber the kernel stack during syscall.
+ *  - #DF (double fault), #NMI, #DB, etc. cannot use a separate
+    stack via IST, so a kernel stack overflow turns into a
+    triple fault and immediate reboot.
+ */
+struct tss_entry {
+    uint32_t reserved0;
+    uint64_t rsp0;
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist1;
+    uint64_t ist2;
+    uint64_t ist3;
+    uint64_t ist4;
+    uint64_t ist5;
+    uint64_t ist6;
+    uint64_t ist7;
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __packed;
+
+/* TSS descriptor flags (system segment, S bit = 0) */
+#define TSS_TYPE_AVAILABLE  0x9  /* 64-bit TSS (available) */
+#define TSS_TYPE_BUSY       0xB  /* 64-bit TSS (busy) */
+
+/* Update gdt_entries array size: 5 (code/data) + 1 (TSS) = 6 */
 #endif /* LESTRA_GDT_H */
