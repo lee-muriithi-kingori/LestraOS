@@ -12,6 +12,9 @@
 #include <string.h>
 #include <stdarg.h>
 
+/* Cap for %s format specifier — matches the buffer cap below (PR #7 fix). */
+#define PRINTK_MAX_STR 1024
+
 /* Simple itoa for numbers */
 static int itoa(int64_t value, char* buf, int base, bool uppercase) {
     char* digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -103,6 +106,23 @@ static void print_string(const char* str) {
     }
 }
 
+/* Bounded variant — writes at most `max` chars, then a '...' suffix if the
+ * source was truncated. Returns the number of source characters consumed. */
+static size_t print_string_n(const char* str, size_t max) {
+    if (!str) return 0;
+    size_t i = 0;
+    while (str[i] && i < max) {
+        print_char(str[i]);
+        i++;
+    }
+    if (str[i]) {
+        print_char('.');
+        print_char('.');
+        print_char('.');
+    }
+    return i + (str[i] ? 3 : 0);
+}
+
 int vprintk(const char* fmt, va_list args) {
     char buf[128];
     int count = 0;
@@ -160,8 +180,9 @@ int vprintk(const char* fmt, va_list args) {
             case 's': {
                 const char* s = va_arg(args, const char*);
                 if (!s) s = "(null)";
-                print_string(s);
-                count += strlen(s);
+                /* PR #7 fix: bound to PRINTK_MAX_STR to avoid runaway output
+                 * when callers pass a non-null-terminated / very long string. */
+                count += print_string_n(s, PRINTK_MAX_STR);
                 break;
             }
             case 'd':
