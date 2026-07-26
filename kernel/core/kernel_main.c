@@ -483,12 +483,28 @@ void kernel_main(void* mb2_info) {
             pr_warn("SSH server failed to start (network not up?)\n");
         }
 
-        /* Start HTTP management API */
+        /* Start HTTP management API (plaintext, for simple monitoring) */
         pr_info("Starting HTTP management API on port 8080...\n");
         extern void http_mgmt_start(uint16_t);
         http_mgmt_start(8080);
         pr_info("HTTP management API listening on port 8080\n");
         printk("HTTP management API on port 8080\n");
+
+        /* Start HTTPS (TLS 1.2) management API for secure management.
+         * The TLS server must be initialized first to generate the
+         * self-signed certificate and key pair.  All management
+         * operations (/reboot, /shutdown) are fully functional on
+         * HTTPS without rate-limiting. */
+        pr_info("Initializing TLS server (self-signed cert + key pair)...\n");
+        extern void tls_server_init(void);
+        tls_server_init();
+
+        pr_info("Starting HTTPS management API on port 8443...\n");
+        extern void http_mgmt_tls_start(uint16_t);
+        http_mgmt_tls_start(8443);
+        pr_info("HTTPS (TLS 1.2) management API listening on port 8443\n");
+        printk("HTTPS management API on port 8443 (TLS 1.2)\n");
+        printk("Use HTTPS for secure management operations\n");
 
         /* Enter serial-only shell — no VGA needed */
         pr_info("Entering serial shell...\n");

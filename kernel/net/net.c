@@ -6,7 +6,7 @@
  * because it's a stateful beast. HTTP is in http.c.
  *
  * Design:
- *   - Single NIC (E1000 driver in drivers/net/e1000.c).
+ *   - Single NIC: VirtIO-net (preferred on KVM/QEMU VPS) or E1000 (Intel).
  *   - Polling-based packet pump: net_tick() is called from the 1 kHz
  *     timer IRQ. Each tick we drain the RX ring and dispatch packets
  *     to the right protocol handler.
@@ -31,6 +31,27 @@ extern int        e1000_is_present(void);
 extern mac_addr_t e1000_get_mac(void);
 extern int        e1000_send(const void* data, uint16_t len);
 extern int        e1000_recv(void* buf, uint16_t bufsz);
+
+/* VirtIO-net driver entry points (defined in drivers/net/virtio_net.c) */
+extern int        virtio_net_init(void);
+extern int        virtio_net_is_present(void);
+extern mac_addr_t virtio_net_get_mac(void);
+extern int        virtio_net_send(const void* data, uint16_t len);
+extern int        virtio_net_recv(void* buf, uint16_t bufsz);
+
+/* Active NIC driver selector: VirtIO-net is preferred on KVM/QEMU,
+ * e1000 is the fallback for bare-metal Intel NICs. */
+static int        use_virtio_net = 0;
+
+/* Unified driver wrappers — route through the active NIC driver */
+static int net_driver_send(const void* data, uint16_t len) {
+    if (use_virtio_net) return virtio_net_send(data, len);
+    return e1000_send(data, len);
+}
+static int net_driver_recv(void* buf, uint16_t bufsz) {
+    if (use_virtio_net) return virtio_net_recv(buf, bufsz);
+    return e1000_recv(buf, bufsz);
+}
 
 /* WiFi frame handler (defined in net/wifi.c) */
 extern void wifi_handle_frame(const uint8_t* data, uint16_t len);
@@ -190,6 +211,8 @@ static ipv4_addr_t  my_mask = IP_ZERO;
 static ipv4_addr_t  my_gw   = IP_ZERO;
 static ipv4_addr_t  my_dns  = IP_ZERO;
 static mac_addr_t   my_mac  = MAC_ZERO;
+/* NIC driver type ("virtio_net" or "e1000") for net_get_iface_name() */
+static const char* net_iface_name = "e1000";
 
 /* IPv6 state */
 static ipv6_addr_t  my_ip6       = IPV6_ZERO;
@@ -345,7 +368,7 @@ static void arp_send_request(ipv4_addr_t ip) {
     arp->tha   = MAC_ZERO;
     arp->tpa   = ip;
 
-    e1000_send(buf, sizeof(buf));
+    net_driver_send(buf, sizeof(buf));
 }
 
 /* Public: resolve an IP to a MAC. Blocks up to `timeout_ms` ms. */
@@ -486,7 +509,7 @@ static void ndp_send_solicit(ipv6_addr_t target) {
     ih->checksum = htons16(ipv6_l4_checksum(src_ll, target,
                            IPV6_PROTO_ICMPV6, icmp, payload_len));
 
-    e1000_send(buf, sizeof(buf));
+    net_driver_send(buf, sizeof(buf));
 }
 
 /* Resolve IPv6 address to MAC via NDP. Blocks up to timeout_ms. */
@@ -559,7 +582,7 @@ static int eth_send_ipv6_raw(ipv6_addr_t dst, uint8_t next_hdr,
 
     memcpy(pl, payload, payload_len);
 
-    return e1000_send(buf, total);
+    return net_driver_send(buf, total);
 }
 
 /* Public wrapper for tcp.c */
@@ -826,7 +849,7 @@ static int eth_send_ipv4(ipv4_addr_t dst_ip, uint8_t proto,
 
     memcpy(pl, payload, payload_len);
 
-    return e1000_send(buf, total);
+    return net_driver_send(buf, total);
 }
 
 /* ----- ICMP (ping) ----- */
@@ -1055,7 +1078,7 @@ static void dhcp_send(uint8_t msg_type, ipv4_addr_t requested_ip, ipv4_addr_t se
     *p++ = DHCP_OPT_END;
 
     /* Send via the driver directly (we built the full Ethernet frame) */
-    e1000_send(buf, sizeof(buf));
+    net_driver_send(buf, sizeof(buf));
 }
 
 static void dhcp_start(void) {
@@ -1358,7 +1381,7 @@ static void handle_arp(uint8_t* data, uint16_t len, mac_addr_t src_mac) {
         rep->spa   = my_ip;
         rep->tha   = arp->sha;
         rep->tpa   = arp->spa;
-        e1000_send(buf, sizeof(buf));
+        net_driver_send(buf, sizeof(buf));
     }
 }
 
@@ -1482,11 +1505,21 @@ static void handle_ethernet(uint8_t* data, uint16_t len) {
 /* ----- public API ----- */
 void net_init(void) {
     pr_info("net: initializing network stack\n");
-    if (!e1000_init()) {
+    /* Try VirtIO-net first (preferred on KVM/QEMU VPS), then e1000 */
+    if (virtio_net_init()) {
+        use_virtio_net = 1;
+        net_iface_name = "virtio_net";
+        my_mac = virtio_net_get_mac();
+        pr_info("net: using VirtIO-net driver\n");
+    } else if (e1000_init()) {
+        use_virtio_net = 0;
+        net_iface_name = "e1000";
+        my_mac = e1000_get_mac();
+        pr_info("net: using E1000 driver\n");
+    } else {
         pr_warn("net: no NIC - networking disabled\n");
         return;
     }
-    my_mac = e1000_get_mac();
     net_initialized = 1;
     net_link_up = 1;   /* link is up from driver perspective; IP not yet */
     fw_init();
@@ -1513,7 +1546,7 @@ void net_tick(void) {
     static uint8_t buf[NET_MAX_PKT];
     int rx_count = 0;
     while (rx_count < 8) {
-        int n = e1000_recv(buf, sizeof(buf));
+        int n = net_driver_recv(buf, sizeof(buf));
         if (n <= 0) break;
         rx_count++;
         /* Check for ICMP Echo Reply (for our own pings) or ICMPv6 Echo Reply. */
@@ -1577,7 +1610,7 @@ ipv4_addr_t  net_get_ip(void)        { return my_ip; }
 ipv4_addr_t  net_get_gateway(void)   { return my_gw; }
 ipv4_addr_t  net_get_dns(void)       { return my_dns; }
 mac_addr_t   net_get_mac(void)       { return my_mac; }
-const char*  net_get_iface_name(void){ return "e1000"; }
+const char*  net_get_iface_name(void){ return net_iface_name; }
 
 /* Expose eth_send_ipv4 and udp_send to TCP and HTTP layers */
 int eth_send_ipv4_pub(ipv4_addr_t dst_ip, uint8_t proto,
