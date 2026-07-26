@@ -241,26 +241,69 @@ static int ext2_read_inode(uint32_t inode_num, struct ext2_inode* out) {
     return 1;
 }
 
-/* Find a directory entry by name in the directory identified by `dir_inode`.
- * Returns the inode number of the entry, or 0 if not found. */
+static uint32_t ext2_get_inode_block(struct ext2_inode* inode, uint32_t logical_block) {
+    uint32_t bpb = ext2_block_size / 4;
+
+    if (logical_block < 12) {
+        return inode->i_block[logical_block];
+    }
+
+    logical_block -= 12;
+    if (logical_block < bpb) {
+        if (inode->i_block[12] == 0) return 0;
+        static uint32_t ptr[1024];
+        if (!ext2_read_block(inode->i_block[12], ptr)) return 0;
+        return ptr[logical_block];
+    }
+
+    logical_block -= bpb;
+    if (logical_block < bpb * bpb) {
+        if (inode->i_block[13] == 0) return 0;
+        static uint32_t ptr[1024];
+        if (!ext2_read_block(inode->i_block[13], ptr)) return 0;
+        uint32_t idx1 = logical_block / bpb;
+        uint32_t idx2 = logical_block % bpb;
+        if (ptr[idx1] == 0) return 0;
+        uint32_t blk = ptr[idx1];
+        if (!ext2_read_block(blk, ptr)) return 0;
+        return ptr[idx2];
+    }
+
+    logical_block -= bpb * bpb;
+    if (inode->i_block[14] == 0) return 0;
+    static uint32_t ptr[1024];
+    if (!ext2_read_block(inode->i_block[14], ptr)) return 0;
+    uint32_t idx1 = logical_block / (bpb * bpb);
+    uint32_t rem = logical_block % (bpb * bpb);
+    uint32_t idx2 = rem / bpb;
+    uint32_t idx3 = rem % bpb;
+    if (ptr[idx1] == 0) return 0;
+    uint32_t blk = ptr[idx1];
+    if (!ext2_read_block(blk, ptr)) return 0;
+    if (ptr[idx2] == 0) return 0;
+    blk = ptr[idx2];
+    if (!ext2_read_block(blk, ptr)) return 0;
+    return ptr[idx3];
+}
+
 static uint32_t ext2_find_dirent(struct ext2_inode* dir_inode, const char* name) {
     if (!ext2_mounted) return 0;
 
-    /* Read directory data from direct blocks (i_block[0..11]) */
     static uint8_t block_buf[4096];
-    for (int i = 0; i < 12; i++) {
-        if (dir_inode->i_block[i] == 0) continue;
+    uint32_t bytes_walked = 0;
+    uint32_t logical_block = 0;
 
-        if (!ext2_read_block(dir_inode->i_block[i], block_buf)) continue;
+    while (bytes_walked < dir_inode->i_size) {
+        uint32_t phys = ext2_get_inode_block(dir_inode, logical_block);
+        if (phys == 0) break;
+        if (!ext2_read_block(phys, block_buf)) break;
 
-        /* Parse directory entries */
         uint32_t offset = 0;
-        while (offset < ext2_block_size && offset < dir_inode->i_size) {
+        while (offset < ext2_block_size && bytes_walked + offset < dir_inode->i_size) {
             struct ext2_dirent* de = (struct ext2_dirent*)&block_buf[offset];
             if (de->rec_len == 0) break;
 
             if (de->inode != 0 && de->name_len > 0) {
-                /* Compare name (name_len chars, not null-terminated) */
                 int match = 1;
                 for (int j = 0; j < de->name_len; j++) {
                     if (name[j] != de->name[j]) { match = 0; break; }
@@ -271,6 +314,8 @@ static uint32_t ext2_find_dirent(struct ext2_inode* dir_inode, const char* name)
             }
             offset += de->rec_len;
         }
+        bytes_walked += ext2_block_size;
+        logical_block++;
     }
     return 0;
 }
@@ -335,17 +380,18 @@ int ext2_read_file(const char* path, void* buf, uint32_t bufsize) {
     uint32_t file_size = inode.i_size;
     if (file_size > bufsize) file_size = bufsize;
 
-    /* Read from direct blocks (i_block[0..11]) */
     static uint8_t block_buf[4096];
     uint32_t bytes_read = 0;
-    for (int i = 0; i < 12 && bytes_read < file_size; i++) {
-        if (inode.i_block[i] == 0) break;
+    while (bytes_read < file_size) {
+        uint32_t logical_block = bytes_read / ext2_block_size;
+        uint32_t phys = ext2_get_inode_block(&inode, logical_block);
+        if (phys == 0) break;
+        if (!ext2_read_block(phys, block_buf)) break;
 
-        if (!ext2_read_block(inode.i_block[i], block_buf)) break;
-
-        uint32_t to_copy = ext2_block_size;
+        uint32_t block_offset = bytes_read % ext2_block_size;
+        uint32_t to_copy = ext2_block_size - block_offset;
         if (to_copy > file_size - bytes_read) to_copy = file_size - bytes_read;
-        memcpy((uint8_t*)buf + bytes_read, block_buf, to_copy);
+        memcpy((uint8_t*)buf + bytes_read, block_buf + block_offset, to_copy);
         bytes_read += to_copy;
     }
 
@@ -360,12 +406,16 @@ void ext2_list_root(void (*callback)(const char* name, uint32_t inode, uint8_t t
     if (!ext2_read_inode(2, &inode)) return;  /* root = inode 2 */
 
     static uint8_t block_buf[4096];
-    for (int i = 0; i < 12; i++) {
-        if (inode.i_block[i] == 0) continue;
-        if (!ext2_read_block(inode.i_block[i], block_buf)) continue;
+    uint32_t bytes_walked = 0;
+    uint32_t logical_block = 0;
+
+    while (bytes_walked < inode.i_size) {
+        uint32_t phys = ext2_get_inode_block(&inode, logical_block);
+        if (phys == 0) break;
+        if (!ext2_read_block(phys, block_buf)) break;
 
         uint32_t offset = 0;
-        while (offset < ext2_block_size && offset < inode.i_size) {
+        while (offset < ext2_block_size && bytes_walked + offset < inode.i_size) {
             struct ext2_dirent* de = (struct ext2_dirent*)&block_buf[offset];
             if (de->rec_len == 0) break;
 
@@ -378,6 +428,8 @@ void ext2_list_root(void (*callback)(const char* name, uint32_t inode, uint8_t t
             }
             offset += de->rec_len;
         }
+        bytes_walked += ext2_block_size;
+        logical_block++;
     }
 }
 

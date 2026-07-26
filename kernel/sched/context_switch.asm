@@ -15,12 +15,13 @@ global context_switch
 %define OFF_R12   0x18
 %define OFF_RBP   0x20
 %define OFF_RBX   0x28
-%define OFF_RIP   0x30
-%define OFF_CS    0x38
-%define OFF_RFLAGS 0x40
-%define OFF_RSP   0x48
-%define OFF_SS    0x50
-%define OFF_FSBASE 0x58
+%define OFF_RAX   0x30
+%define OFF_RIP   0x38
+%define OFF_CS    0x40
+%define OFF_RFLAGS 0x48
+%define OFF_RSP   0x50
+%define OFF_SS    0x58
+%define OFF_FSBASE 0x60
 
 section .text
 
@@ -36,6 +37,7 @@ context_switch:
     mov     [rdi + OFF_R12], r12
     mov     [rdi + OFF_RBP], rbp
     mov     [rdi + OFF_RBX], rbx
+    mov     [rdi + OFF_RAX], rax
 
     mov     ecx, 0xC0000100
     rdmsr
@@ -74,6 +76,7 @@ context_switch:
     mov     r13, [r12 + OFF_R13]
     mov     rbp, [r12 + OFF_RBP]
     mov     rbx, [r12 + OFF_RBX]
+    mov     rax, [r12 + OFF_RAX]
     mov     r12, [r12 + OFF_R12]
 
     iretq

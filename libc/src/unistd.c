@@ -148,3 +148,11 @@ long sysconf(int name) {
         default: return -1;
     }
 }
+
+int pipe(int pipefd[2]) {
+    return (int)syscall(23, (uint64_t)pipefd, 0, 0, 0, 0);  /* SYS_PIPE */
+}
+
+int dup2(int oldfd, int newfd) {
+    return (int)syscall(28, (uint64_t)oldfd, (uint64_t)newfd, 0, 0, 0);  /* SYS_DUP2 */
+}

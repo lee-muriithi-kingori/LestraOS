@@ -46,7 +46,13 @@ typedef int32_t pid_t;
 #define SYS_GETDENTS     20
 #define SYS_REBOOT       21
 #define SYS_UNAME        22
-#define SYS_MAX          23
+#define SYS_PIPE         23
+#define SYS_KILL         24
+#define SYS_RT_SIGACTION    25
+#define SYS_RT_SIGPROCMASK  26
+#define SYS_RT_SIGRETURN    27
+#define SYS_DUP2            28
+#define SYS_MAX             29
 
 /* Process */
 pid_t fork(void);
@@ -64,6 +70,8 @@ int close(int fd);
 ssize_t read(int fd, void* buf, size_t count);
 ssize_t write(int fd, const void* buf, size_t count);
 off_t lseek(int fd, off_t offset, int whence);
+int pipe(int pipefd[2]);
+int dup2(int oldfd, int newfd);
 
 /* Directory */
 int chdir(const char* path);

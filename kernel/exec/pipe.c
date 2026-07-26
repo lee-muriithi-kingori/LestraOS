@@ -19,6 +19,8 @@ struct pipe {
     int bytes_available;
     int read_open;
     int write_open;
+    int read_waiter;   /* PID of process blocked reading, 0 = none */
+    int write_waiter;  /* PID of process blocked writing, 0 = none */
 };
 
 static struct pipe pipes[MAX_PIPES];
@@ -85,7 +87,10 @@ ssize_t pipe_read(int fd, void* buf, size_t count) {
     if (pfd->is_write_end) return -1;
     while (p->bytes_available == 0) {
         if (!p->write_open) return 0;
+        extern int proc_getpid(void);
+        p->read_waiter = proc_getpid();
         task_block();
+        p->read_waiter = 0;
     }
     size_t to_read = count;
     if (to_read > (size_t)p->bytes_available) to_read = p->bytes_available;
@@ -93,6 +98,11 @@ ssize_t pipe_read(int fd, void* buf, size_t count) {
         ((uint8_t*)buf)[i] = p->buf[p->read_pos];
         p->read_pos = (p->read_pos + 1) % PIPE_BUF_SIZE;
         p->bytes_available--;
+    }
+    if (p->write_waiter > 0) {
+        extern void task_unblock_pid(int pid);
+        task_unblock_pid(p->write_waiter);
+        p->write_waiter = 0;
     }
     return (ssize_t)to_read;
 }
@@ -107,12 +117,21 @@ ssize_t pipe_write(int fd, const void* buf, size_t count) {
     while (written < count) {
         while (p->bytes_available >= PIPE_BUF_SIZE) {
             if (!p->read_open) return -32;
+            extern int proc_getpid(void);
+            p->write_waiter = proc_getpid();
             task_block();
+            p->write_waiter = 0;
         }
         p->buf[p->write_pos] = ((const uint8_t*)buf)[written];
         p->write_pos = (p->write_pos + 1) % PIPE_BUF_SIZE;
         p->bytes_available++;
         written++;
+        /* Wake blocked reader if any */
+        if (p->read_waiter > 0) {
+            extern void task_unblock_pid(int pid);
+            task_unblock_pid(p->read_waiter);
+            p->read_waiter = 0;
+        }
     }
     return (ssize_t)written;
 }

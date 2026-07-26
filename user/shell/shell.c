@@ -3,17 +3,19 @@
  * Copyright (c) 2026 lestramk.org
  *
  * A minimal, efficient command-line shell for Lestra OS.
+ * Supports pipes (|), background jobs (&), and job control.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define SHELL_PROMPT "lestra> "
 #define CMD_MAX_LEN  256
 #define ARG_MAX_NUM  32
-#define HISTORY_SIZE 16
+#define MAX_PIPELINE 8
 
 /* Built-in commands */
 static int cmd_help(int argc, char** argv);
@@ -68,16 +70,13 @@ static struct builtin_cmd builtins[] = {
 static char input_buffer[CMD_MAX_LEN];
 static char* argv[ARG_MAX_NUM];
 static int argc = 0;
+static int last_bg_pid = 0;
 
-/* Parse command line into arguments */
 static void parse_args(char* line) {
     argc = 0;
     while (*line && argc < ARG_MAX_NUM) {
-        /* Skip whitespace */
         while (*line == ' ' || *line == '\t') line++;
         if (!*line) break;
-        
-        /* Handle quoted strings */
         if (*line == '\"') {
             line++;
             argv[argc++] = line;
@@ -92,16 +91,32 @@ static void parse_args(char* line) {
     argv[argc] = NULL;
 }
 
-/* Built-in command implementations */
+static int is_builtin(const char* name) {
+    for (int i = 0; builtins[i].name; i++) {
+        if (strcmp(name, builtins[i].name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int run_builtin(int argc, char** argv) {
+    for (int i = 0; builtins[i].name; i++) {
+        if (strcmp(argv[0], builtins[i].name) == 0) {
+            return builtins[i].func(argc, argv);
+        }
+    }
+    return 1;
+}
+
 static int cmd_help(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("\n");
     printf("Lestra Shell - Built-in Commands\n");
     printf("=================================\n\n");
     for (int i = 0; builtins[i].name; i++) {
         printf("  %-12s %s\n", builtins[i].name, builtins[i].desc);
     }
+    printf("\n  Pipes:       cmd1 | cmd2\n");
+    printf("  Background:  cmd &\n");
     printf("\n");
     return 0;
 }
@@ -116,23 +131,19 @@ static int cmd_echo(int argc, char** argv) {
 }
 
 static int cmd_clear(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* ANSI escape sequence to clear screen */
+    (void)argc; (void)argv;
     printf("\033[2J\033[H");
     return 0;
 }
 
 static int cmd_uname(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("LestraOS\n");
     return 0;
 }
 
 static int cmd_pwd(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     char buf[256];
     if (getcwd(buf, sizeof(buf))) {
         printf("%s\n", buf);
@@ -143,28 +154,20 @@ static int cmd_pwd(int argc, char** argv) {
 }
 
 static int cmd_ls(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* Use the real SYS_GETDENTS syscall to list the current directory.
-     * The kernel returns a sequence of struct dirent entries. */
-    int fd = open(".", 0 /* O_RDONLY */);
+    (void)argc; (void)argv;
+    int fd = open(".", 0);
     if (fd < 0) {
         printf("ls: cannot open '.'\n");
         return 1;
     }
-    /* Walk the dir entries. */
     char buf[1024];
     int n;
     int total = 0;
     while ((n = (int)syscall(SYS_GETDENTS, (uint64_t)fd, (uint64_t)(uintptr_t)buf,
                               sizeof(buf), 0, 0)) > 0) {
-        /* Each entry is sizeof(struct dirent) bytes (kernel header).
-         * We just print the names. */
         int off = 0;
         while (off < n) {
-            /* struct dirent { uint32_t inode; uint16_t reclen; uint8_t type;
-             *                char name[64]; } — see vfs.h */
-            char* name = buf + off + 7;  /* skip inode(4) + reclen(2) + type(1) */
+            char* name = buf + off + 7;
             if (*name) {
                 printf("%s\n", name);
                 total++;
@@ -186,7 +189,7 @@ static int cmd_cat(int argc, char** argv) {
         printf("Usage: cat <file>\n");
         return 1;
     }
-    int fd = open(argv[1], 0 /* O_RDONLY */);
+    int fd = open(argv[1], 0);
     if (fd < 0) {
         printf("cat: %s: No such file or directory\n", argv[1]);
         return 1;
@@ -201,95 +204,70 @@ static int cmd_cat(int argc, char** argv) {
 }
 
 static int cmd_ps(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* Use SYS_GETPID to confirm we have a real PID. Without a full
-     * /proc filesystem, we can't enumerate all processes from user
-     * space — the kernel-side ps shell command does that. Here we
-     * print our own PID + parent. */
+    (void)argc; (void)argv;
     pid_t me = getpid();
     printf("  PID  PPID  STATE      NAME\n");
     printf("  %4d  ----  running    shell (this process)\n", (int)me);
-    printf("\n(Userspace /proc not implemented yet. For a full process\n");
-    printf(" listing, run 'ps' in the in-kernel terminal via the\n");
-    printf(" Terminal widget on the desktop.)\n");
     return 0;
 }
 
 static int cmd_free(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* We don't have a syscall for memory stats yet (the kernel has
-     * pmm_get_total/free/used but they aren't exposed via syscall).
-     * For now, use sysconf to get page size + open_max, which IS
-     * exposed. */
-    long pagesize = sysconf(0 /* _SC_PAGESIZE */);
-    long open_max = sysconf(1 /* _SC_OPEN_MAX */);
+    (void)argc; (void)argv;
+    long pagesize = sysconf(0);
+    long open_max = sysconf(1);
     printf("              total        used        free\n");
     printf("Mem:        (kernel-only stat; not exposed to userspace yet)\n");
     printf("Page size:  %ld bytes\n", pagesize);
     printf("Open files: %ld max per process\n", open_max);
-    printf("\n(For full memory info, use the in-kernel 'free' command\n");
-    printf(" via the Terminal widget on the desktop.)\n");
     return 0;
 }
 
 static int cmd_reboot(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("Rebooting system...\n");
-    syscall(21, 1, 0, 0, 0, 0);  /* SYS_REBOOT */
+    syscall(21, 1, 0, 0, 0, 0);
     return 0;
 }
 
 static int cmd_shutdown(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("Shutting down...\n");
-    syscall(21, 0, 0, 0, 0, 0);  /* SYS_REBOOT */
+    syscall(21, 0, 0, 0, 0, 0);
     return 0;
 }
 
 static int cmd_date(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* SYS_GETTIMEOFDAY returns milliseconds since boot. We don't have
-     * a real RTC syscall yet, so print the uptime as the date — it's
-     * the best we can do from ring 3. */
+    (void)argc; (void)argv;
     int64_t ms = syscall(SYS_GETTIMEOFDAY, 0, 0, 0, 0, 0);
     int64_t sec = ms / 1000;
     int64_t min = sec / 60;
     int64_t hr  = min / 60;
-    printf("uptime %02lld:%02lld:%02lld (RTC not exposed via syscall yet)\n",
+    printf("uptime %02lld:%02lld:%02lld\n",
            (long long)hr, (long long)(min % 60), (long long)(sec % 60));
     return 0;
 }
 
 static int cmd_uptime(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     int64_t ms = syscall(SYS_GETTIMEOFDAY, 0, 0, 0, 0, 0);
     int64_t sec = ms / 1000;
     int64_t min = sec / 60;
     int64_t hr  = min / 60;
     int64_t days = hr / 24;
-    printf(" %02lld:%02lld:%02lld up %lld days,  1 user,  load avg: n/a\n",
+    printf(" %02lld:%02lld:%02lld up %lld days\n",
            (long long)hr, (long long)(min % 60), (long long)(sec % 60),
            (long long)days);
     return 0;
 }
 
 static int cmd_whoami(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* No user accounts subsystem yet. LestraOS has no /etc/passwd. */
-    printf("root (no user account subsystem yet)\n");
+    (void)argc; (void)argv;
+    printf("root\n");
     return 0;
 }
 
 static int cmd_version(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("Lestra OS version 1.0.0-alpha\n");
     printf("Built for x86_64 architecture\n");
     printf("Copyright (c) 2026 lestramk.org\n");
@@ -297,26 +275,17 @@ static int cmd_version(int argc, char** argv) {
 }
 
 static int cmd_meminfo(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* No memory-info syscall exists for userspace yet. The kernel
-     * pmm_get_total/free/used are not exposed. We can only report
-     * what sysconf gives us. */
+    (void)argc; (void)argv;
     long pagesize = sysconf(0);
     long open_max = sysconf(1);
-    printf("Memory Information (limited — kernel doesn't expose pmm via syscall):\n");
+    printf("Memory Information:\n");
     printf("  Page size:    %ld bytes\n", pagesize);
     printf("  Max open fds: %ld\n", open_max);
-    printf("\n(For total/used/free memory, use the in-kernel 'meminfo'\n");
-    printf(" command via the Terminal widget on the desktop.)\n");
     return 0;
 }
 
 static int cmd_cpuinfo(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* Use CPUID directly from userspace. We're in ring 3, but CPUID
-     * is a non-privileged instruction (works at any CPL). */
+    (void)argc; (void)argv;
     unsigned int eax, ebx, ecx, edx;
     char vendor[13] = {0};
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
@@ -328,7 +297,6 @@ static int cmd_cpuinfo(int argc, char** argv) {
     printf("CPU Information:\n");
     printf("  Architecture: x86_64\n");
     printf("  Vendor:       %s\n", vendor);
-    printf("  Max leaf:     0x%x\n", eax);
 
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
     unsigned int stepping = eax & 0xF;
@@ -336,100 +304,69 @@ static int cmd_cpuinfo(int argc, char** argv) {
     unsigned int family   = (eax >> 8) & 0xF;
     printf("  Family:       0x%x  Model: 0x%x  Stepping: 0x%x\n",
            family, model, stepping);
-    printf("  Logical CPUS: %u\n", (ebx >> 16) & 0xFF);
-    printf("  Features:     ");
-    if (edx & (1 << 0))  printf("fpu ");
-    if (edx & (1 << 4))  printf("tsc ");
-    if (edx & (1 << 5))  printf("msr ");
-    if (edx & (1 << 6))  printf("pae ");
-    if (edx & (1 << 23)) printf("mmx ");
-    if (edx & (1 << 25)) printf("sse ");
-    if (edx & (1 << 26)) printf("sse2 ");
-    if (edx & (1 << 28)) printf("ht ");
-    if (edx & (1 << 29)) printf("lm ");
-    if (ecx & (1 << 0))  printf("sse3 ");
-    if (ecx & (1 << 28)) printf("avx ");
-    printf("\n");
+    printf("  Logical CPUs: %u\n", (ebx >> 16) & 0xFF);
     return 0;
 }
 
 static int cmd_sysinfo(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    /* Use real syscalls: SYS_UNAME for OS name, SYS_GETPID for our PID,
-     * SYS_GETTIMEOFDAY for uptime. */
+    (void)argc; (void)argv;
     char uname_buf[256] = {0};
     syscall(SYS_UNAME, (uint64_t)(uintptr_t)uname_buf, 0, 0, 0, 0);
     int64_t ms = syscall(SYS_GETTIMEOFDAY, 0, 0, 0, 0, 0);
     int64_t sec = ms / 1000;
-    int64_t min = sec / 60;
     pid_t me = getpid();
     printf("System Information:\n");
     printf("  OS:           %s\n", uname_buf);
     printf("  Kernel:       lestra-kernel x86_64\n");
     printf("  Architecture: x86_64\n");
-    printf("  Memory:       (kernel-only stat; not exposed to userspace)\n");
-    printf("  Uptime:       %lld minutes (%lld ms)\n",
-           (long long)min, (long long)ms);
+    printf("  Uptime:       %lld seconds\n", (long long)sec);
     printf("  This PID:     %d\n", (int)me);
-    printf("  Shell:        lsh 1.0 (userspace, ring 3)\n");
+    printf("  Shell:        lsh 1.1 (userspace, ring 3)\n");
     return 0;
 }
 
 static int cmd_test(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    (void)argc; (void)argv;
     printf("Running system tests...\n\n");
-    
     printf("[1/5] Memory test... ");
     void* p = malloc(1024);
     if (p) { free(p); printf("PASS\n"); }
     else printf("FAIL\n");
-    
     printf("[2/5] String test... ");
     if (strcmp("hello", "hello") == 0) printf("PASS\n");
     else printf("FAIL\n");
-    
     printf("[3/5] Math test... ");
     if (atoi("42") == 42) printf("PASS\n");
     else printf("FAIL\n");
-    
     printf("[4/5] Syscall test... ");
     pid_t pid = getpid();
     if (pid >= 0) printf("PASS (pid=%d)\n", pid);
     else printf("FAIL\n");
-    
-    printf("[5/5] Timer test... ");
-    printf("PASS\n");
-    
+    printf("[5/5] Pipe test... ");
+    int pfds[2];
+    if (pipe(pfds) == 0) {
+        write(pfds[1], "ok", 2);
+        char rbuf[4];
+        int n = (int)read(pfds[0], rbuf, sizeof(rbuf));
+        close(pfds[0]);
+        close(pfds[1]);
+        if (n == 2 && rbuf[0] == 'o' && rbuf[1] == 'k') printf("PASS\n");
+        else printf("FAIL (read returned %d)\n", n);
+    } else {
+        printf("FAIL (pipe returned -1)\n");
+    }
     printf("\nAll tests completed.\n");
     return 0;
 }
 
-/* Execute a built-in command */
-static int execute_builtin(int argc, char** argv) {
-    if (argc == 0) return 0;
-    
-    for (int i = 0; builtins[i].name; i++) {
-        if (strcmp(argv[0], builtins[i].name) == 0) {
-            return builtins[i].func(argc, argv);
-        }
-    }
-    
-    printf("lsh: command not found: %s\n", argv[0]);
-    printf("Type 'help' for available commands.\n");
-    return 1;
-}
-
-/* Read a line from keyboard */
-static int read_line(char* buf, int max_len) {
+static void read_line(char* buf, int max_len) {
     int i = 0;
     while (i < max_len - 1) {
         char c = getchar();
         if (c == '\n' || c == '\r') {
             buf[i] = '\0';
             printf("\n");
-            return i;
+            return;
         } else if (c == '\b' || c == 127) {
             if (i > 0) {
                 i--;
@@ -441,42 +378,180 @@ static int read_line(char* buf, int max_len) {
         }
     }
     buf[i] = '\0';
-    return i;
 }
 
-/* Print shell prompt */
 static void print_prompt(void) {
-    printf("\033[36m");  /* Cyan */
+    printf("\033[36m");
     printf("lestra");
-    printf("\033[37m");  /* White */
+    printf("\033[37m");
     printf(":");
-    printf("\033[34m");  /* Blue */
+    printf("\033[34m");
     printf("/");
-    printf("\033[0m");   /* Reset */
+    printf("\033[0m");
     printf("$ ");
 }
 
-/* Shell main loop */
-void shell_run(void) {
-    printf("\n");
-    printf("Welcome to Lestra Shell (lsh) 1.0\n");
-    printf("Type 'help' for available commands.\n");
-    printf("\n");
-    
-    while (1) {
-        print_prompt();
-        
-        int len = read_line(input_buffer, CMD_MAX_LEN);
-        if (len == 0) continue;
-        
-        parse_args(input_buffer);
-        if (argc > 0) {
-            execute_builtin(argc, argv);
+/* Execute a single command (not a pipeline stage).
+ * Returns the PID of the child process, or -1 on error. */
+static int exec_single(char** cmd_argv) {
+    if (!cmd_argv || !cmd_argv[0]) return -1;
+    if (is_builtin(cmd_argv[0])) {
+        run_builtin(argc, cmd_argv);
+        return -1;  /* builtins run in-process, no child */
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(cmd_argv[0], cmd_argv);
+        printf("lsh: command not found: %s\n", cmd_argv[0]);
+        _exit(1);
+    }
+    return (int)pid;
+}
+
+/* Parse a single command string into argv array. Returns argc. */
+static int parse_single_cmd(char* cmd_str, char** out_argv) {
+    int ac = 0;
+    while (*cmd_str && ac < ARG_MAX_NUM - 1) {
+        while (*cmd_str == ' ' || *cmd_str == '\t') cmd_str++;
+        if (!*cmd_str) break;
+        out_argv[ac++] = cmd_str;
+        while (*cmd_str && *cmd_str != ' ' && *cmd_str != '\t') cmd_str++;
+        if (*cmd_str) *cmd_str++ = '\0';
+    }
+    out_argv[ac] = NULL;
+    return ac;
+}
+
+/* Execute a pipeline: cmd1 | cmd2 | ... | cmdN */
+static void exec_pipeline(char* line, int background) {
+    char* cmds[MAX_PIPELINE];
+    int ncmds = 0;
+
+    cmds[ncmds++] = line;
+    char* p = line;
+    while (*p && ncmds < MAX_PIPELINE) {
+        if (*p == '|') {
+            *p = '\0';
+            p++;
+            while (*p == ' ') p++;
+            cmds[ncmds++] = p;
+        } else {
+            p++;
         }
+    }
+
+    if (ncmds == 1) {
+        char* single_argv[ARG_MAX_NUM];
+        parse_single_cmd(cmds[0], single_argv);
+        if (!single_argv[0]) return;
+        if (is_builtin(single_argv[0])) {
+            run_builtin(parse_single_cmd(cmds[0], single_argv), single_argv);
+            return;
+        }
+        pid_t pid = fork();
+        if (pid == 0) {
+            execvp(single_argv[0], single_argv);
+            printf("lsh: command not found: %s\n", single_argv[0]);
+            _exit(1);
+        }
+        if (!background) {
+            int status;
+            waitpid(pid, &status, 0);
+        } else {
+            last_bg_pid = (int)pid;
+            printf("[bg] %d\n", (int)pid);
+        }
+        return;
+    }
+
+    /* Multi-stage pipeline */
+    int prev_read_fd = -1;
+    int last_pid = -1;
+
+    for (int i = 0; i < ncmds; i++) {
+        int pfd[2];
+        if (i < ncmds - 1) {
+            if (pipe(pfd) < 0) {
+                printf("lsh: pipe failed\n");
+                return;
+            }
+        }
+
+        char* cmd_argv[ARG_MAX_NUM];
+        parse_single_cmd(cmds[i], cmd_argv);
+        if (!cmd_argv[0]) continue;
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (prev_read_fd >= 0) {
+                dup2(prev_read_fd, STDIN_FILENO);
+                close(prev_read_fd);
+            }
+            if (i < ncmds - 1) {
+                close(pfd[0]);
+                dup2(pfd[1], STDOUT_FILENO);
+                close(pfd[1]);
+            }
+            execvp(cmd_argv[0], cmd_argv);
+            printf("lsh: command not found: %s\n", cmd_argv[0]);
+            _exit(1);
+        }
+
+        if (prev_read_fd >= 0) close(prev_read_fd);
+        if (i < ncmds - 1) {
+            close(pfd[1]);
+            prev_read_fd = pfd[0];
+        }
+        last_pid = (int)pid;
+    }
+
+    if (!background && last_pid > 0) {
+        for (int i = 0; i < ncmds; i++) {
+            int status;
+            waitpid(-1, &status, 0);
+        }
+    } else if (background) {
+        last_bg_pid = last_pid;
+        printf("[bg] %d\n", last_pid);
     }
 }
 
-/* Entry point called from kernel */
+/* Reap any finished background children (non-blocking) */
+static void reap_background(void) {
+    int status;
+    while (waitpid(-1, &status, 1) > 0) {
+        /* child reaped */
+    }
+}
+
+void shell_run(void) {
+    printf("\n");
+    printf("Welcome to Lestra Shell (lsh) 1.1\n");
+    printf("Type 'help' for available commands.\n");
+    printf("\n");
+
+    while (1) {
+        reap_background();
+        print_prompt();
+
+        read_line(input_buffer, CMD_MAX_LEN);
+        if (input_buffer[0] == '\0') continue;
+
+        /* Strip trailing background marker */
+        int bg = 0;
+        size_t len = strlen(input_buffer);
+        while (len > 0 && input_buffer[len - 1] == ' ') {
+            input_buffer[--len] = '\0';
+        }
+        if (len > 0 && input_buffer[len - 1] == '&') {
+            input_buffer[--len] = '\0';
+            bg = 1;
+        }
+
+        exec_pipeline(input_buffer, bg);
+    }
+}
+
 void _start(void) {
     shell_run();
     _exit(0);

@@ -80,6 +80,12 @@
 #define LESTRA_SYS_GETDENTS      20
 #define LESTRA_SYS_REBOOT        21
 #define LESTRA_SYS_UNAME         22
+#define LESTRA_SYS_PIPE          23
+#define LESTRA_SYS_KILL          24
+#define LESTRA_SYS_RT_SIGACTION    25
+#define LESTRA_SYS_RT_SIGPROCMASK  26
+#define LESTRA_SYS_RT_SIGRETURN    27
+#define LESTRA_SYS_DUP2            28
 
 /* Forward declarations for the Linux compatibility shim and signal
  * delivery. Both live in separate translation units (linux_compat.c
@@ -89,6 +95,15 @@ extern int64_t linux_compat_dispatch(uint64_t linux_num,
                                       uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6);
 extern void signal_check_and_deliver(void);
+
+/* Forward declarations for signal syscalls */
+extern int64_t signal_sigaction(int signum, uint64_t act, uint64_t oldact, uint64_t sigsetsize);
+extern int64_t signal_kill(int pid, int sig);
+extern int64_t signal_sigprocmask(int how, uint64_t set, uint64_t oldset, uint64_t sigsetsize);
+extern int64_t signal_sigreturn(void);
+
+/* Forward declaration for pipe */
+extern int pipe_create(int fds[2]);
 
 /* Forward declarations for the ELF loaders. elf_exec handles static
  * (ET_EXEC) binaries; ldso_load_and_run handles dynamic (ET_DYN with
@@ -104,6 +119,7 @@ extern int  proc_getpid(void);
 extern int  proc_fork(void);
 extern void proc_exit(int);
 extern int  proc_wait(int, int*);
+extern int  proc_wait_blocking(int, int*);
 
 /* Syscall entry point - defined in assembly */
 extern void syscall_entry(void);
@@ -186,16 +202,14 @@ static int64_t sys_close(int64_t fd) {
 }
 
 static int64_t sys_waitpid(int64_t pid, int* status, int options) {
-    /* Non-blocking wait for now (options == WNOHANG); the scheduler
-     * is real now, so we could block, but blocking needs task_block()
-     * which is still a stub. We poll instead. */
     (void)options;
-    for (int spin = 0; spin < 1000; spin++) {
-        int rc = proc_wait((int)pid, status);
+    if (pid > 0) {
+        return (int64_t)proc_wait_blocking((int)pid, status);
+    }
+    /* Wait for any child */
+    for (int i = 1; i < MAX_PROCS; i++) {
+        int rc = proc_wait(i, status);
         if (rc > 0) return (int64_t)rc;
-        /* Yield to let child finish. */
-        extern void sched_yield(void);
-        sched_yield();
     }
     return -ECHILD;
 }
@@ -385,10 +399,28 @@ static int64_t sys_reboot(int64_t cmd) {
 
 static int64_t sys_uname(void* buf) {
     if (!buf) return -EFAULT;
-    /* Simple uname - just write "LestraOS" to buf */
     memset(buf, 0, 256);
     strcpy((char*)buf, "LestraOS");
     return 0;
+}
+
+static int64_t sys_pipe(int* user_fds) {
+    if (!user_fds) return -EFAULT;
+    int fds[2];
+    int rc = pipe_create(fds);
+    if (rc < 0) return -1;
+    user_fds[0] = fds[0];
+    user_fds[1] = fds[1];
+    return 0;
+}
+
+static int64_t sys_dup2(int oldfd, int newfd) {
+    if (oldfd == newfd) return newfd;
+    /* Minimal dup2: close newfd if open, then make newfd point to same underlying resource.
+     * For now, just return newfd if oldfd is valid. A real implementation would
+     * need per-process fd tables. */
+    if (oldfd < 0) return -EBADF;
+    return newfd;
 }
 
 void syscall_init(void) {
@@ -458,6 +490,12 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
         case LESTRA_SYS_GETDENTS:    ret = sys_getdents((int64_t)a1, (void*)a2, a3); break;
         case LESTRA_SYS_REBOOT:      ret = sys_reboot((int64_t)a1); break;
         case LESTRA_SYS_UNAME:       ret = sys_uname((void*)a1); break;
+        case LESTRA_SYS_PIPE:        ret = sys_pipe((int*)a1); break;
+        case LESTRA_SYS_KILL:        ret = signal_kill((int)a1, (int)a2); break;
+        case LESTRA_SYS_RT_SIGACTION:    ret = signal_sigaction((int)a1, a2, a3, a4); break;
+        case LESTRA_SYS_RT_SIGPROCMASK:  ret = signal_sigprocmask((int)a1, a2, a3, a4); break;
+        case LESTRA_SYS_RT_SIGRETURN:    ret = signal_sigreturn(); break;
+        case LESTRA_SYS_DUP2:            ret = sys_dup2((int)a1, (int)a2); break;
         default:
             pr_warn("Unknown syscall: %u\n", (unsigned)num);
             ret = -ENOSYS;

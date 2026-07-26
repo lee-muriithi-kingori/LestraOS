@@ -114,6 +114,15 @@ static void keyboard_irq_handler(struct interrupt_frame* frame) {
         ascii = use_shift ? scancode_to_ascii_shift[scancode] : scancode_to_ascii[scancode];
     }
 
+    /* Ctrl+C → SIGINT */
+    if (ctrl_pressed && scancode == 0x2E) {
+        extern void signal_send_to_process(void*, int);
+        extern void* task_current(void);
+        void* cur = task_current();
+        if (cur) signal_send_to_process(cur, 2);  /* SIGINT = 2 */
+        return;
+    }
+
     /* Store in buffer */
     if (ascii) {
         uint8_t next = (key_buffer_head + 1) % KEY_BUFFER_SIZE;

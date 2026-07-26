@@ -9,6 +9,7 @@
 struct cpu_state {
     uint64_t r15, r14, r13, r12;
     uint64_t rbp, rbx;
+    uint64_t rax;
     uint64_t rip, cs, rflags, rsp, ss;
     uint64_t fs_base;
 } __packed;
