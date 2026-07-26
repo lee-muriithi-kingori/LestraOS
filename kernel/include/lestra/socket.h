@@ -78,5 +78,6 @@ int     socket_setsockopt(int fd, int level, int optname,
                             const void* optval, int optlen);
 int     socket_socketpair(int domain, int type, int protocol, int sv[2]);
 int     socket_is_socket_fd(int fd);
+int     socket_start_tls(int fd, const char* hostname);
 
 #endif /* LESTRA_SOCKET_H */

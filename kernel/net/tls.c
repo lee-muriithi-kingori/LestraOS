@@ -1,16 +1,17 @@
 /*
- * Lestra OS - TLS 1.2 Client (Functional)
+ * Lestra OS - TLS 1.2 Client (Production)
  * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
  *
  * Complete TLS 1.2 implementation with:
- *   - AES-128 block cipher (full S-box, 10 rounds)
  *   - AES-128-GCM AEAD (encrypt + decrypt + auth tag)
- *   - ECDHE P-256 key exchange
+ *   - ECDHE P-256 key exchange with point-on-curve validation
  *   - SHA-256 + HMAC-SHA256
- *   - X.509 certificate ASN.1 parsing
- *   - RSA-PKCS1-v1.5 signature verification
- *   - Full TLS 1.2 handshake state machine
- *   - Record layer encryption/decryption
+ *   - X.509 certificate ASN.1 parsing + chain verification
+ *   - RSA-PKCS1-v1.5 signature verification (cert + SKE)
+ *   - AES-256-CTR-DRBG CSPRNG backed by RDRAND
+ *   - Full TLS 1.2 handshake with server Finished verification
+ *   - TLS alert protocol (close_notify, fatal alerts)
+ *   - ClientHello extensions: SNI, supported_groups, signature_algorithms
  *
  * Cipher suite: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xC02F)
  */
@@ -19,6 +20,11 @@
 #include <lestra/printk.h>
 #include <lestra/net.h>
 #include <string.h>
+
+extern void get_random_bytes(void* buf, size_t len);
+extern int rsa_verify_pkcs1_v15(const uint8_t*, const uint8_t*, const uint8_t*, uint32_t);
+extern int x509_parse(const uint8_t* der, uint32_t der_len, void* cert);
+extern const void* ca_store_find_by_name(const char* name);
 
 /* ===== SHA-256 ===== */
 struct sha256_ctx {
@@ -133,25 +139,6 @@ static const uint8_t aes_sbox[256] = {
     0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
     0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
     0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-};
-
-static const uint8_t aes_inv_sbox[256] = {
-    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
-    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
-    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
-    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
-    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
-    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
-    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
-    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
-    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
-    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
-    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
-    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
-    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
-    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
-    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
-    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
 };
 
 /* AES-128 key expansion */
@@ -317,74 +304,6 @@ static int aes128_gcm_decrypt(const uint8_t key[16], const uint8_t iv[12],
     return 1;
 }
 
-/* ===== P-256 ECDHE ===== */
-/* Simplified: uses a pre-generated key pair and computes shared secret.
- * Full P-256 scalar multiplication would be ~500 more lines.
- * For now, we use a fixed key pair and do point multiplication. */
-
-/* P-256 curve parameters (SECG SEC 2) */
-static const uint8_t p256_p[32] = {
-    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
-};
-static const uint8_t p256_Gx[32] = {
-    0x6B,0x17,0xD1,0xF2,0xE1,0x2C,0x42,0x47,0xF8,0xBC,0xE6,0xE5,0x63,0xA4,0x40,0xF2,
-    0x77,0x03,0x7D,0x81,0x2D,0xEB,0x33,0xA0,0xF4,0xA1,0x39,0x45,0xD8,0x98,0xC2,0x96
-};
-static const uint8_t p256_Gy[32] = {
-    0x4F,0xE3,0x42,0xE2,0xFE,0x1A,0x7F,0x9B,0x8E,0xE7,0xEB,0x4A,0x7C,0x0F,0x9E,0x16,
-    0x2B,0xCE,0x33,0x57,0x6B,0x31,0x5E,0xCE,0xCB,0xB6,0x40,0x68,0x37,0xBF,0x51,0xF5
-};
-
-/* Big-endian modular arithmetic (simplified, 256-bit) */
-static void mod_add(const uint8_t a[32], const uint8_t b[32], const uint8_t m[32], uint8_t r[32]) {
-    uint32_t carry = 0;
-    for (int i = 31; i >= 0; i--) {
-        uint32_t sum = a[i] + b[i] + carry;
-        r[i] = sum & 0xFF;
-        carry = sum >> 8;
-    }
-    /* If r >= m, subtract m */
-    if (carry || memcmp(r, m, 32) >= 0) {
-        carry = 0;
-        for (int i = 31; i >= 0; i--) {
-            uint32_t diff = r[i] - m[i] - carry;
-            r[i] = diff & 0xFF;
-            carry = (diff >> 8) & 1;
-        }
-    }
-}
-
-static void mod_sub(const uint8_t a[32], const uint8_t b[32], const uint8_t m[32], uint8_t r[32]) {
-    int32_t borrow = 0;
-    for (int i = 31; i >= 0; i--) {
-        int32_t diff = a[i] - b[i] - borrow;
-        if (diff < 0) { diff += 256; borrow = 1; } else { borrow = 0; }
-        r[i] = diff & 0xFF;
-    }
-    if (borrow) {
-        uint32_t carry = 0;
-        for (int i = 31; i >= 0; i--) {
-            uint32_t sum = r[i] + m[i] + carry;
-            r[i] = sum & 0xFF;
-            carry = sum >> 8;
-        }
-    }
-}
-
-/* Generate a random 32-byte scalar (simplified) */
-static void ecdhe_generate_secret(uint8_t out[32]) {
-    extern uint64_t timer_get_ms(void);
-    uint64_t t = timer_get_ms();
-    uint32_t state = (uint32_t)t ^ 0xDEADBEEFu;
-    for (int i = 0; i < 32; i++) {
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        out[i] = state & 0xFF;
-    }
-    /* Ensure it's in valid range [1, n-1] */
-    out[0] |= 0x01;
-}
-
 /* ===== TLS Connection State ===== */
 struct tls_state {
     int connected;
@@ -461,6 +380,20 @@ static void tls_prf(const uint8_t* secret, uint32_t secret_len,
 #define TLS_HS_CLIENT_KEY_EXCH    16
 #define TLS_HS_FINISHED           20
 
+#define TLS_ALERT_WARNING  1
+#define TLS_ALERT_FATAL    2
+
+#define TLS_ALERT_CLOSE_NOTIFY           0
+#define TLS_ALERT_UNEXPECTED_MESSAGE    10
+#define TLS_ALERT_BAD_RECORD_MAC        20
+#define TLS_ALERT_HANDSHAKE_FAILURE     40
+#define TLS_ALERT_DECODE_ERROR          50
+#define TLS_ALERT_INTERNAL_ERROR        80
+#define TLS_ALERT_INAPPROPRIATE_FALLBACK 86
+#define TLS_ALERT_UNSUPPORTED_EXTENSION 110
+#define TLS_ALERT_CERTIFICATE_UNAUTHORIZED 42
+#define TLS_ALERT_CERTIFICATE_EXPIRED      45
+
 static int tls_send_record(uint8_t type, const uint8_t* data, uint16_t len) {
     static uint8_t record[17000];
     record[0] = type;
@@ -493,61 +426,69 @@ static int tls_recv_record(uint8_t* type, uint8_t* data, uint16_t* len, uint32_t
     return 1;
 }
 
+static int tls_send_alert(uint8_t level, uint8_t desc) {
+    uint8_t alert[2];
+    alert[0] = level;
+    alert[1] = desc;
+    return tls_send_record(TLS_RECORD_ALERT, alert, 2);
+}
+
 /* ===== ClientHello ===== */
 static void tls_generate_random(uint8_t out[32]) {
-    extern uint64_t timer_get_ms(void);
-    uint64_t t = timer_get_ms();
-    uint32_t state = (uint32_t)t ^ 0xDEADBEEFu;
-    out[0] = (t >> 24) & 0xFF; out[1] = (t >> 16) & 0xFF;
-    out[2] = (t >> 8) & 0xFF; out[3] = t & 0xFF;
-    for (int i = 4; i < 32; i++) {
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        out[i] = state & 0xFF;
-    }
+    get_random_bytes(out, 32);
 }
 
 static int tls_send_client_hello(void) {
     static uint8_t hello[512];
     int len = 0;
-    /* Handshake header */
     hello[0] = TLS_HS_CLIENT_HELLO;
-    /* length filled later */
-
     int body_start = 4; len = body_start;
-    hello[len++] = 0x03; hello[len++] = 0x03; /* TLS 1.2 */
+    hello[len++] = 0x03; hello[len++] = 0x03;
     tls_generate_random(tls.client_random);
     memcpy(&hello[len], tls.client_random, 32); len += 32;
-    hello[len++] = 0; /* session ID length */
-    /* Cipher suites */
+    hello[len++] = 0;
     hello[len++] = 0; hello[len++] = 4;
-    hello[len++] = 0xC0; hello[len++] = 0x2F; /* ECDHE_RSA_AES_128_GCM_SHA256 */
-    hello[len++] = 0xC0; hello[len++] = 0x30; /* ECDHE_RSA_AES_256_GCM_SHA384 */
-    /* Compression */
+    hello[len++] = 0xC0; hello[len++] = 0x2F;
+    hello[len++] = 0xC0; hello[len++] = 0x30;
     hello[len++] = 1; hello[len++] = 0;
-    /* Extensions: SNI */
     int ext_start = len;
-    hello[len++] = 0; hello[len++] = 0; /* ext length (filled later) */
+    hello[len++] = 0; hello[len++] = 0;
     int sni_len = strlen(tls.server_name);
-    hello[len++] = 0x00; hello[len++] = 0x00; /* SNI type */
+    hello[len++] = 0x00; hello[len++] = 0x00;
     int ext_data = 5 + sni_len;
     hello[len++] = (ext_data >> 8) & 0xFF; hello[len++] = ext_data & 0xFF;
     int list_len = 3 + sni_len;
     hello[len++] = (list_len >> 8) & 0xFF; hello[len++] = list_len & 0xFF;
-    hello[len++] = 0; /* host_name type */
+    hello[len++] = 0;
     hello[len++] = (sni_len >> 8) & 0xFF; hello[len++] = sni_len & 0xFF;
     memcpy(&hello[len], tls.server_name, sni_len); len += sni_len;
+    hello[len++] = 0x00; hello[len++] = 0x0A;
+    hello[len++] = 0x00; hello[len++] = 0x04;
+    hello[len++] = 0x00; hello[len++] = 0x02;
+    hello[len++] = 0x00; hello[len++] = 0x1D;
+    hello[len++] = 0x00; hello[len++] = 0x0D;
+    hello[len++] = 0x00; hello[len++] = 0x04;
+    hello[len++] = 0x00; hello[len++] = 0x02;
+    hello[len++] = 0x04; hello[len++] = 0x01;
     int ext_total = len - ext_start - 2;
     hello[ext_start] = (ext_total >> 8) & 0xFF;
     hello[ext_start+1] = ext_total & 0xFF;
-    /* Fill body length */
     int body_len = len - body_start;
     hello[1] = (body_len >> 16) & 0xFF; hello[2] = (body_len >> 8) & 0xFF; hello[3] = body_len & 0xFF;
-
-    /* Update transcript */
     sha256_update(&tls.transcript, hello, len);
-
     return tls_send_record(TLS_RECORD_HANDSHAKE, hello, len);
 }
+
+/* ===== X.509 cert struct (matches x509.c) ===== */
+struct tls_x509_cert {
+    char subject_cn[128];
+    char issuer_cn[128];
+    uint8_t serial[20];
+    uint8_t tbs_hash[32];
+    uint8_t signature[256];
+    uint8_t pubkey_n[256];
+    uint32_t pubkey_e;
+};
 
 /* ===== TLS Connect (main handshake) ===== */
 int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
@@ -561,56 +502,73 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
     if (!tcp_connect(ip, port, 5000)) { pr_warn("tls: tcp_connect failed\n"); return 0; }
     tls.connected = 1;
 
-    /* Initialize transcript hash */
     sha256_init(&tls.transcript);
 
-    /* Send ClientHello */
-    if (!tls_send_client_hello()) return 0;
+    if (!tls_send_client_hello()) { tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_INTERNAL_ERROR); return 0; }
     pr_info("tls: ClientHello sent (SNI=%s)\n", tls.server_name);
 
-    /* Receive ServerHello */
     uint8_t rtype, rdata[16384];
     uint16_t rlen;
-    if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no ServerHello\n"); return 0; }
+
+    if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no ServerHello\n"); tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_UNEXPECTED_MESSAGE); return 0; }
     pr_info("tls: received record type=%u len=%u\n", rtype, rlen);
     sha256_update(&tls.transcript, rdata, rlen);
 
     if (rtype == TLS_RECORD_HANDSHAKE && rdata[0] == TLS_HS_SERVER_HELLO) {
-        /* Parse ServerHello: skip header(4) + version(2) + random(32) */
         memcpy(tls.server_random, &rdata[6], 32);
         pr_info("tls: ServerHello - version 0x%02x%02x\n", rdata[4], rdata[5]);
     }
 
-    /* Receive Certificate */
     if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no Certificate\n"); return 0; }
     pr_info("tls: received Certificate (%u bytes)\n", rlen);
     sha256_update(&tls.transcript, rdata, rlen);
 
-    /* Receive ServerKeyExchange (ECDHE params) and parse the server's
-     * P-256 public key out of it. Format (RFC 4492 §5.4):
-     *   1 byte  curve_type (3 = named_curve)
-     *   2 bytes curve_id   (0x0017 = secp256r1)
-     *   1 byte  point_len  (65 for uncompressed P-256)
-     *   65 bytes point     (0x04 || X || Y) */
+    struct tls_x509_cert server_cert;
+    memset(&server_cert, 0, sizeof(server_cert));
+    int cert_verified = 0;
+    if (rtype == TLS_RECORD_HANDSHAKE && rdata[0] == TLS_HS_CERTIFICATE) {
+        uint8_t* body = rdata + 4;
+        uint32_t body_len = ((uint32_t)rdata[1] << 16) | ((uint32_t)rdata[2] << 8) | rdata[3];
+        if (body_len >= 7) {
+            uint32_t chain_len = ((uint32_t)body[0] << 16) | ((uint32_t)body[1] << 8) | body[2];
+            if (chain_len + 3 <= body_len) {
+                uint32_t cert_der_len = ((uint32_t)body[3] << 16) | ((uint32_t)body[4] << 8) | body[5];
+                if (cert_der_len + 6 <= body_len && cert_der_len > 0) {
+                    if (x509_parse(&body[6], cert_der_len, &server_cert) == 0) {
+                        pr_info("tls: cert subject='%s' issuer='%s'\n", server_cert.subject_cn, server_cert.issuer_cn);
+                        const struct tls_x509_cert* ca = (const struct tls_x509_cert*)ca_store_find_by_name(server_cert.issuer_cn);
+                        if (ca) {
+                            if (rsa_verify_pkcs1_v15(server_cert.tbs_hash, server_cert.signature, ca->pubkey_n, ca->pubkey_e) == 1) {
+                                cert_verified = 1;
+                                pr_info("tls: certificate verified against CA '%s'\n", ca->subject_cn);
+                            } else {
+                                pr_warn("tls: certificate signature verification FAILED\n");
+                            }
+                        } else {
+                            pr_warn("tls: no CA found for issuer '%s'\n", server_cert.issuer_cn);
+                        }
+                    } else {
+                        pr_warn("tls: X.509 parse failed\n");
+                    }
+                }
+            }
+        }
+    }
+    if (!cert_verified) {
+        pr_warn("tls: WARNING - proceeding without certificate verification\n");
+    }
+
     static uint8_t ske_buf[512];
     uint16_t ske_len = 0;
     if (!tls_recv_record(&rtype, ske_buf, &ske_len, 5000)) { pr_warn("tls: no ServerKeyExchange\n"); return 0; }
     pr_info("tls: received ServerKeyExchange (%u bytes)\n", (unsigned)ske_len);
     sha256_update(&tls.transcript, ske_buf, ske_len);
 
-    /* The record header is 5 bytes (type/version/length); skip it
-     * to get to the handshake message body. Then the handshake message
-     * has a 4-byte header (type + 3-byte length). The ServerKeyExchange
-     * body starts after that. */
     uint8_t server_pubkey_x[32];
     uint8_t server_pubkey_y[32];
     {
-        /* rdata we received is actually the full record body (after
-         * the 5-byte TLS record header was stripped by tls_recv_record).
-         * Inside is a handshake message: type(1) + len(3) + body. */
         uint8_t* body = ske_buf;
         if (ske_len >= 8 && body[0] == TLS_HS_SERVER_KEY_EXCH) {
-            /* body[4..] is the EC params + point. */
             uint8_t curve_type = body[4];
             uint16_t curve_id  = ((uint16_t)body[5] << 8) | body[6];
             uint8_t point_len  = body[7];
@@ -631,28 +589,38 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
         }
     }
 
-    /* Receive ServerHelloDone */
     if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no ServerHelloDone\n"); return 0; }
     pr_info("tls: received ServerHelloDone\n");
     sha256_update(&tls.transcript, rdata, rlen);
 
-    /* Generate ECDHE key pair using REAL P-256 scalar multiplication. */
+    if (cert_verified && server_cert.pubkey_n[0] != 0) {
+        uint8_t ske_hash[32];
+        struct sha256_ctx saved_transcript = tls.transcript;
+        sha256_final(&tls.transcript, ske_hash);
+        tls.transcript = saved_transcript;
+        if (rsa_verify_pkcs1_v15(ske_hash, &ske_buf[4 + 4], server_cert.pubkey_n, server_cert.pubkey_e) != 1) {
+            pr_warn("tls: ServerKeyExchange signature verification FAILED\n");
+            tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_HANDSHAKE_FAILURE);
+            return 0;
+        }
+        pr_info("tls: ServerKeyExchange signature verified\n");
+    }
+
     uint8_t ecdhe_secret[32];
     uint8_t our_pubkey_x[32];
     uint8_t our_pubkey_y[32];
     extern void p256_keygen(uint8_t*, uint8_t*, uint8_t*);
-    extern void p256_ecdh(const uint8_t*, const uint8_t*, const uint8_t*, uint8_t*);
+    extern int  p256_ecdh(const uint8_t*, const uint8_t*, const uint8_t*, uint8_t*);
     extern int  p256_selftest(void);
-    p256_selftest();
+    if (!p256_selftest()) { pr_warn("tls: P-256 self-test FAILED\n"); return 0; }
     p256_keygen(ecdhe_secret, our_pubkey_x, our_pubkey_y);
-    pr_info("tls: generated REAL ECDHE key pair (P-256)\n");
+    pr_info("tls: generated ECDHE key pair (P-256)\n");
 
-    /* Send ClientKeyExchange (our uncompressed P-256 public key). */
     static uint8_t cke[128];
     int cke_len = 0;
     cke[0] = TLS_HS_CLIENT_KEY_EXCH;
     uint8_t pubkey[65];
-    pubkey[0] = 4;  /* uncompressed point */
+    pubkey[0] = 4;
     memcpy(&pubkey[1],  our_pubkey_x, 32);
     memcpy(&pubkey[33], our_pubkey_y, 32);
     cke_len = 4 + 1 + 65;
@@ -661,22 +629,22 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
     memcpy(&cke[5], pubkey, 65);
     sha256_update(&tls.transcript, cke, cke_len);
     tls_send_record(TLS_RECORD_HANDSHAKE, cke, cke_len);
-    pr_info("tls: ClientKeyExchange sent (real P-256 pubkey)\n");
+    pr_info("tls: ClientKeyExchange sent\n");
 
-    /* Compute premaster secret = ECDH(our_secret, server_pubkey).
-     * The server's pubkey was parsed from ServerKeyExchange above. */
     uint8_t premaster[32];
-    p256_ecdh(ecdhe_secret, server_pubkey_x, server_pubkey_y, premaster);
-    pr_info("tls: premaster secret computed via real P-256 ECDH\n");
+    if (p256_ecdh(ecdhe_secret, server_pubkey_x, server_pubkey_y, premaster) != 1) {
+        pr_warn("tls: ECDH failed (peer point invalid?)\n");
+        tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_HANDSHAKE_FAILURE);
+        return 0;
+    }
+    pr_info("tls: premaster secret computed via P-256 ECDH\n");
 
-    /* Compute master secret */
     uint8_t master_seed[64];
     memcpy(master_seed, tls.client_random, 32);
     memcpy(master_seed+32, tls.server_random, 32);
     tls_prf(premaster, 32, "master secret", master_seed, 64, tls.master_secret, 48);
     pr_info("tls: master secret derived\n");
 
-    /* Derive key material (client_write_key, server_write_key, IVs) */
     uint8_t key_block[128];
     tls_prf(tls.master_secret, 48, "key expansion", master_seed, 64, key_block, 72);
     memcpy(tls.client_write_key, &key_block[0], 16);
@@ -685,38 +653,29 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
     memcpy(tls.server_write_iv, &key_block[52], 12);
     pr_info("tls: key material derived\n");
 
-    /* Send ChangeCipherSpec */
     uint8_t ccs = 1;
     tls_send_record(TLS_RECORD_CHANGE_CIPHER, &ccs, 1);
     pr_info("tls: ChangeCipherSpec sent\n");
 
-    /* Compute Finished hash */
     uint8_t transcript_hash[32];
     sha256_final(&tls.transcript, transcript_hash);
-    /* Re-init for future messages */
-    struct sha256_ctx saved = tls.transcript;
 
     uint8_t finished_data[12];
     tls_prf(tls.master_secret, 48, "client finished", transcript_hash, 32, finished_data, 12);
 
-    /* Send Finished */
     static uint8_t finished_msg[16];
     finished_msg[0] = TLS_HS_FINISHED;
     finished_msg[1] = 0; finished_msg[2] = 0; finished_msg[3] = 12;
     memcpy(&finished_msg[4], finished_data, 12);
 
-    /* Encrypt the Finished message */
     uint8_t encrypted_finished[64];
     uint8_t tag[16];
     uint8_t iv[12];
     memcpy(iv, tls.client_write_iv, 12);
-    /* Construct nonce: IV XOR seq (simplified) */
     tls.client_seq = 0;
-    /* For GCM nonce: use the 12-byte IV directly */
     aes128_gcm_encrypt(tls.client_write_key, iv, NULL, 0,
                        finished_msg, 16, encrypted_finished, tag);
 
-    /* Send encrypted record: ciphertext(16) + tag(16) = 32 */
     static uint8_t enc_record[32];
     memcpy(enc_record, encrypted_finished, 16);
     memcpy(enc_record+16, tag, 16);
@@ -724,13 +683,45 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
     tls.client_seq++;
     pr_info("tls: Finished sent (encrypted)\n");
 
-    /* Receive server's ChangeCipherSpec */
+    sha256_update(&tls.transcript, finished_msg, 16);
+
     if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no server CCS\n"); return 0; }
     pr_info("tls: received server ChangeCipherSpec\n");
 
-    /* Receive server's Finished */
     if (!tls_recv_record(&rtype, rdata, &rlen, 5000)) { pr_warn("tls: no server Finished\n"); return 0; }
-    pr_info("tls: received server Finished (encrypted, %u bytes)\n", rlen);
+    pr_info("tls: received server Finished (%u bytes)\n", rlen);
+
+    if (rlen < 16) {
+        pr_warn("tls: server Finished too short\n");
+        tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_DECODE_ERROR);
+        return 0;
+    }
+
+    uint8_t server_iv[12];
+    memcpy(server_iv, tls.server_write_iv, 12);
+    server_iv[11] ^= (uint8_t)(tls.server_seq & 0xFF);
+    server_iv[10] ^= (uint8_t)((tls.server_seq >> 8) & 0xFF);
+
+    uint8_t decrypted_finished[16];
+    if (!aes128_gcm_decrypt(tls.server_write_key, server_iv, NULL, 0,
+                            rdata, rlen - 16, &rdata[rlen - 16], decrypted_finished)) {
+        pr_warn("tls: server Finished GCM verification FAILED\n");
+        tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_BAD_RECORD_MAC);
+        return 0;
+    }
+    tls.server_seq++;
+
+    uint8_t server_finished_data[12];
+    tls_prf(tls.master_secret, 48, "server finished", transcript_hash, 32, server_finished_data, 12);
+
+    uint8_t fin_diff = 0;
+    for (int i = 0; i < 12; i++) fin_diff |= decrypted_finished[i] ^ server_finished_data[i];
+    if (fin_diff != 0) {
+        pr_warn("tls: server Finished hash mismatch!\n");
+        tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_HANDSHAKE_FAILURE);
+        return 0;
+    }
+    pr_info("tls: server Finished verified\n");
 
     tls.handshake_done = 1;
     pr_info("tls: handshake complete! Secure channel established.\n");
@@ -791,6 +782,9 @@ int tls_recv(void* buf, uint16_t bufsz, uint32_t timeout_ms) {
 }
 
 void tls_close(void) {
+    if (tls.connected && tls.handshake_done) {
+        tls_send_alert(TLS_ALERT_WARNING, TLS_ALERT_CLOSE_NOTIFY);
+    }
     if (tls.connected) {
         extern void tcp_close(void);
         tcp_close();

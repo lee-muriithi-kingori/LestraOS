@@ -214,4 +214,22 @@ static inline uintptr_t read_cr2(void) {
     return val;
 }
 
+static inline int rdrand32(uint32_t* val) {
+    unsigned char ok;
+    asm volatile("rdrand %1; setc %0" : "=q"(ok), "=r"(*val));
+    return ok;
+}
+
+static inline int rdrand64(uint64_t* val) {
+    unsigned char ok;
+    asm volatile("rdrand %1; setc %0" : "=q"(ok), "=r"(*val));
+    return ok;
+}
+
+static inline int rdseed32(uint32_t* val) {
+    unsigned char ok;
+    asm volatile("rdseed %1; setc %0" : "=q"(ok), "=r"(*val));
+    return ok;
+}
+
 #endif /* LESTRA_TYPES_H */

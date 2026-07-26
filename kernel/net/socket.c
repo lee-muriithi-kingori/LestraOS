@@ -72,6 +72,9 @@ struct socket {
     int so_rcvbuf;
     int so_sndbuf;
     int so_reuseaddr;
+
+    /* TLS support */
+    int use_tls;
 };
 
 static struct socket sockets[SOCKET_MAX_OPEN];
@@ -153,6 +156,19 @@ int socket_connect(int fd, const struct sockaddr* addr, int addrlen) {
     return -EOPNOTSUPP;
 }
 
+int socket_start_tls(int fd, const char* hostname) {
+    if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
+    struct socket* s = &sockets[fd - SOCKET_FD_BASE];
+    if (s->kind != SOCK_INET_TCP) return -EOPNOTSUPP;
+    if (s->state != SS_CONNECTED) return -ENOTCONN;
+
+    extern int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname);
+    int rc = tls_connect(s->peer_ip, s->peer_port, hostname);
+    if (!rc) return -ECONNREFUSED;
+    s->use_tls = 1;
+    return 0;
+}
+
 int socket_bind(int fd, const struct sockaddr* addr, int addrlen) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
     if (!addr || addrlen < (int)sizeof(uint16_t)) return -EFAULT;
@@ -188,8 +204,14 @@ ssize_t socket_sendto(int fd, const void* buf, size_t len, int flags,
         if (s->state != SS_CONNECTED) return -ENOTCONN;
         /* tcp_send accepts up to 64 KB per call. */
         if (len > 0xFFFF) len = 0xFFFF;
-        int rc = tcp_send(buf, (uint16_t)len);
-        return (rc > 0) ? (ssize_t)len : -1;
+        if (s->use_tls) {
+            extern int tls_send(const void*, uint16_t);
+            int rc = tls_send(buf, (uint16_t)len);
+            return (rc > 0) ? (ssize_t)len : -1;
+        } else {
+            int rc = tcp_send(buf, (uint16_t)len);
+            return (rc > 0) ? (ssize_t)len : -1;
+        }
     }
     if (s->kind == SOCK_UNIX_STREAM) {
         if (s->pipe_write_fd < 0) return -ENOTCONN;
@@ -212,8 +234,14 @@ ssize_t socket_recvfrom(int fd, void* buf, size_t len, int flags,
     if (s->kind == SOCK_INET_TCP) {
         if (s->state != SS_CONNECTED) return -ENOTCONN;
         if (len > 0xFFFF) len = 0xFFFF;
-        int rc = tcp_recv_wait(buf, (uint16_t)len, 30000);
-        return (rc >= 0) ? (ssize_t)rc : -1;
+        if (s->use_tls) {
+            extern int tls_recv(void*, uint16_t, uint32_t);
+            int rc = tls_recv(buf, (uint16_t)len, 30000);
+            return (rc >= 0) ? (ssize_t)rc : -1;
+        } else {
+            int rc = tcp_recv_wait(buf, (uint16_t)len, 30000);
+            return (rc >= 0) ? (ssize_t)rc : -1;
+        }
     }
     if (s->kind == SOCK_UNIX_STREAM) {
         if (s->pipe_read_fd < 0) return -ENOTCONN;
@@ -228,7 +256,12 @@ int socket_close(int fd) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
     struct socket* s = &sockets[fd - SOCKET_FD_BASE];
     if (s->kind == SOCK_INET_TCP && s->state == SS_CONNECTED) {
-        tcp_close();
+        if (s->use_tls) {
+            extern void tls_close(void);
+            tls_close();
+        } else {
+            tcp_close();
+        }
     }
     if (s->kind == SOCK_UNIX_STREAM) {
         extern int pipe_close(int fd);

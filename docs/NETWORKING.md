@@ -16,7 +16,7 @@ doesn't, and how to use the network features.
 | App | DHCP client (DORA) | ✅ auto-configures IP at boot |
 | App | DNS resolver (A records) | ✅ |
 | App | HTTP/1.0 client (GET + POST) | ✅ plain HTTP only |
-| App | HTTPS/TLS | ❌ not implemented (see below) |
+| App | HTTPS/TLS | ✅ TLS 1.2 with ECDHE-RSA-AES128-GCM-SHA256 |
 
 ## Boot sequence
 
@@ -78,12 +78,26 @@ builder that uses the OpenAI-compatible schema. This works with:
 - **llama.cpp server** (local) — `http://localhost:8080/v1/chat/completions`
 - **vLLM** (local) — `http://localhost:8000/v1/chat/completions`
 
-### The HTTPS limitation
+### The HTTPS/TLS support
 
-Cloud APIs (GLM, OpenAI, Claude) are **HTTPS-only**. LestraOS does not
-implement TLS, so you cannot connect to them directly. Two options:
+LestraOS now includes a full TLS 1.2 client with:
+- AES-128-GCM AEAD encryption/decryption
+- ECDHE P-256 key exchange with point-on-curve validation
+- SHA-256 + HMAC-SHA256
+- X.509 certificate parsing + chain verification against embedded CA store
+- RSA-PKCS#1 v1.5 signature verification (certificate + ServerKeyExchange)
+- AES-256-CTR-DRBG CSPRNG backed by RDRAND hardware entropy
+- TLS alert protocol (close_notify, fatal alerts)
+- ClientHello extensions: SNI, supported_groups, signature_algorithms
+- Server Finished message decryption and verification
 
-**Option A: Local LLM (easiest, works today)**
+**Supported cipher suite:** TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xC02F)
+
+**Embedded CA trust store:** DigiCert Global Root G2, Baltimore CyberTrust Root, GlobalSign Root CA - R3, ISRG Root X1 (fingerprint-only, RSA-4096).
+
+Cloud APIs (GLM, OpenAI, Claude) use TLS. The kernel's `http_get()`/`http_post()` detect `https://` URLs and automatically perform the TLS handshake. No proxy needed.
+
+### Option A: Local LLM (still works)
 
 Run Ollama on the host machine:
 ```bash
@@ -170,7 +184,10 @@ User shell
 HTTP client (net/http.c) ----- POST/GET
     |
     v
-TCP state machine (net/tcp.c) - SYN/SYN-ACK/ACK/FIN
+TLS layer (net/tls.c) - AES-128-GCM, ECDHE-P256, RSA verification
+    |
+    v
+TCP state machine (net/tcp.c) - SYN/SYN-ACK/ACK/FIN + retransmit
     |
     v
 IP layer + ICMP + ARP (net/net.c)
@@ -189,14 +206,12 @@ so that synchronous wait loops (e.g. `tcp_connect`) can also call
 
 ## Limitations
 
-- **No TLS/HTTPS.** Cloud AI APIs need a local proxy. See above.
 - **One TCP connection at a time.** The shell is request/response; this is
   fine for HTTP GET/POST and AI chat.
-- **No TCP retransmit timer.** If a packet is lost, the connection stalls.
-  For LAN use this is fine; for lossy WAN, add a retransmit timer in
-  `tcp_tick()`.
 - **DNS: A records only.** No AAAA, no CNAME chase, no caching beyond the
   ARP cache.
 - **No inbound connections.** QEMU SLIRP doesn't support them (without
   `-hostfwd`). The kernel also has no `listen()` syscall yet.
 - **8 KB max HTTP response body.** Larger responses are truncated.
+- **TLS limited to RSA-2048 CAs.** ISRG Root X1 (Let's Encrypt) is RSA-4096
+  and cannot be used for certificate verification yet.

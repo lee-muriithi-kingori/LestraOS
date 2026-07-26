@@ -142,10 +142,8 @@ Used by the HTTP client and AI client to build request strings.
 
 ## Known limitations (intentional)
 
-- **No HTTPS/TLS.** Cloud AI APIs are HTTPS-only. Use a local TLS-terminating
-  proxy (socat/nginx) or a local LLM (Ollama). See `docs/NETWORKING.md`.
 - **One TCP connection at a time.** Sufficient for shell request/response.
-- **No TCP retransmit timer.** LAN use is fine; WAN packet loss will stall.
+- **TLS limited to RSA-2048 CAs.** Let's Encrypt (ISRG Root X1) is RSA-4096.
 - **Scheduler is still a stub** (single-task mode).
 - **Most syscalls return -1** (read/write/getpid work).
 - **VFS is in-memory only** (no persistent storage).
@@ -165,7 +163,7 @@ LestraOS/
 │   ├── sched/          # scheduler stub
 │   ├── syscall/        # SYSCALL/SYSRET + dispatch
 │   ├── fs/             # VFS + initrd loader
-│   ├── net/            # net.c, tcp.c, http.c (ALL NEW)
+│   ├── net/            # net.c, tcp.c, http.c, tls.c, p256.c, rsa.c, x509.c, ca_store.c, csprng.c, socket.c, wifi.c, adblock.c
 │   ├── ui/             # cyberpunk UI (boot splash, menu, themes)
 │   ├── ai/             # AI client (real HTTP POST, 4 providers)
 │   └── include/lestra/ # all headers (net.h is NEW)

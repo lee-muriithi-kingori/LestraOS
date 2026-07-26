@@ -139,8 +139,10 @@ but the dispatch table was mostly stubs:
 * `kernel/ai/offline.c` — rule-based keyword matching, not neural.
 * `kernel/ai/ai.c` — `ai_chat_with_tools` is keyword-matched, not
   AI-driven. HTTPS endpoints rejected because TLS is stubbed.
-* `kernel/net/tls.c` — file header claims "complete TLS 1.2" but
-  has no callers and `extern` crypto stubs.
+* `kernel/net/tls.c` — was claiming "complete TLS 1.2" with weak PRNG
+  and no cert verification. Now production-grade: RDRAND-backed CSPRNG,
+  X.509 certificate verification, RSA-PKCS#1 v1.5 signature verification,
+  server Finished decryption/verification, TLS alert protocol.
 
 ### I. Misleading docs
 

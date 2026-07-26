@@ -99,6 +99,14 @@ static int      tcp_rx_closed = 0;   /* set when peer sends FIN */
 static int      tcp_connected = 0;
 static int      tcp_connect_failed = 0;
 
+/* Retransmit state */
+static uint8_t  last_seg_buf[sizeof(struct tcp_hdr) + 1500];
+static uint16_t last_seg_len = 0;
+static uint64_t last_seg_time = 0;
+static int      retransmit_count = 0;
+#define TCP_RETRANSMIT_TIMEOUT_MS  2000
+#define TCP_MAX_RETRANSMITS        5
+
 /* Extern from net.c */
 extern int eth_send_ipv4_pub(ipv4_addr_t dst_ip, uint8_t proto,
                               const void* payload, uint16_t payload_len);
@@ -149,6 +157,11 @@ static int tcp_send_seg(uint8_t flags, const void* payload, uint16_t payload_len
     }
     uint16_t seg_len = sizeof(struct tcp_hdr) + payload_len;
     h->checksum = htons16(tcp_checksum(my_ip, tcp_peer_ip, buf, seg_len));
+
+    memcpy(last_seg_buf, buf, seg_len);
+    last_seg_len = seg_len;
+    last_seg_time = timer_get_ms();
+    retransmit_count = 0;
 
     int r = eth_send_ipv4_pub(tcp_peer_ip, 6 /* TCP */, buf, seg_len);
     /* Advance our seq by payload bytes + 1 if SYN or FIN (they consume a seq) */
@@ -263,6 +276,7 @@ void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
         pr_warn("tcp: RST received, aborting connection\n");
         tcp_state = TCP_CLOSED;
         tcp_connect_failed = 1;
+        last_seg_len = 0;
         return;
     }
 
@@ -274,6 +288,7 @@ void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
         tcp_send_seg(TCP_ACK, NULL, 0);
         tcp_state = TCP_ESTABLISHED;
         tcp_connected = 1;
+        last_seg_len = 0;
         return;
     }
 
@@ -312,6 +327,7 @@ void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
             if (tcp_state == TCP_ESTABLISHED) {
                 tcp_state = TCP_CLOSE_WAIT;
                 tcp_rx_closed = 1;
+                last_seg_len = 0;
                 /* We'll send our own FIN when tcp_close() is called */
                 tcp_send_seg(TCP_FIN | TCP_ACK, NULL, 0);
                 tcp_state = TCP_LAST_ACK;
@@ -327,12 +343,33 @@ void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
     if (tcp_state == TCP_LAST_ACK && (flags & TCP_ACK)) {
         /* Our FIN was ACK'd - we're done */
         tcp_state = TCP_CLOSED;
+        last_seg_len = 0;
     }
 }
 
-/* Called from net_tick() to advance retransmit timers (currently a no-op
- * because we rely on the peer to retransmit; we'll add real retransmits
- * if/when needed). */
+/* Called from net_tick() to advance retransmit timers. */
 void tcp_tick(void) {
-    /* nothing for now */
+    if (tcp_state == TCP_CLOSED) return;
+    if (last_seg_len == 0) return;
+
+    uint64_t now = timer_get_ms();
+    uint32_t rto = TCP_RETRANSMIT_TIMEOUT_MS;
+    for (int i = 0; i < retransmit_count && rto < 30000; i++) rto *= 2;
+
+    if (now - last_seg_time >= rto) {
+        if (retransmit_count >= TCP_MAX_RETRANSMITS) {
+            pr_warn("tcp: max retransmits, aborting\n");
+            tcp_state = TCP_CLOSED;
+            tcp_connect_failed = 1;
+            last_seg_len = 0;
+            return;
+        }
+        pr_info("tcp: retransmit #%d\n", retransmit_count + 1);
+        struct tcp_hdr* h = (struct tcp_hdr*)last_seg_buf;
+        h->checksum = 0;
+        h->checksum = htons16(tcp_checksum(my_ip, tcp_peer_ip, last_seg_buf, last_seg_len));
+        eth_send_ipv4_pub(tcp_peer_ip, 6, last_seg_buf, last_seg_len);
+        last_seg_time = now;
+        retransmit_count++;
+    }
 }

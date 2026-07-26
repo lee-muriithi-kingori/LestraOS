@@ -308,23 +308,12 @@ static void p256_scalar_mult(const uint8_t k[32], const struct p256_point* P,
 
 /* ===== Public API ===== */
 
-/* Generate a keypair: secret scalar + public key (uncompressed point). */
 void p256_keygen(uint8_t secret[32], uint8_t pubkey_x[32], uint8_t pubkey_y[32]) {
-    /* secret = random 1..n-1. We use timer-based PRNG (same as the
-     * existing ecdhe_generate_secret). For production this should be
-     * replaced with a CSPRNG backed by RDRAND or hardware entropy. */
-    extern uint64_t timer_get_ms(void);
-    uint64_t t = timer_get_ms();
-    uint32_t state = (uint32_t)t ^ 0xDEADBEEFu;
-    for (int i = 31; i >= 0; i--) {
-        state = state * 1103515245u + 12345u;
-        secret[i] = (uint8_t)(state >> 16);
-    }
-    /* Ensure 1 <= secret < n. */
-    secret[31] = (secret[31] & 0xFE) | 0x01;   /* odd, nonzero */
-    secret[0]  &= 0x7F;                          /* < 2^255 < n */
+    extern void get_random_bytes(void*, size_t);
+    get_random_bytes(secret, 32);
+    secret[31] = (secret[31] & 0xFE) | 0x01;
+    secret[0]  &= 0x7F;
 
-    /* pubkey = secret * G */
     struct p256_point G = {0};
     memcpy(G.x, p256_Gx, 32);
     memcpy(G.y, p256_Gy, 32);
@@ -339,9 +328,26 @@ void p256_keygen(uint8_t secret[32], uint8_t pubkey_x[32], uint8_t pubkey_y[32])
 /* ECDH shared secret: given our secret and the peer's public key,
  * compute shared = secret * peer_pubkey. Returns the x-coordinate
  * (which is the ECDH shared secret used to derive TLS keys). */
-void p256_ecdh(const uint8_t secret[32],
+static int p256_point_on_curve(const uint8_t x[32], const uint8_t y[32]) {
+    uint8_t lhs[32], rhs[32], t1[32], t2[32];
+    fe_mul(y, y, p256_p, lhs);
+    fe_mul(x, x, p256_p, t1);
+    fe_mul(t1, x, p256_p, t2);
+    fe_add(t2, p256_a, p256_p, t1);
+    fe_mul(t1, x, p256_p, t1);
+    fe_add(t1, p256_b, p256_p, rhs);
+    return memcmp(lhs, rhs, 32) == 0;
+}
+
+int p256_ecdh(const uint8_t secret[32],
                const uint8_t peer_x[32], const uint8_t peer_y[32],
                uint8_t shared_x[32]) {
+    if (!p256_point_on_curve(peer_x, peer_y)) {
+        pr_warn("p256: peer point NOT on curve (invalid-curve attack?)\n");
+        memset(shared_x, 0, 32);
+        return 0;
+    }
+
     struct p256_point peer;
     memcpy(peer.x, peer_x, 32);
     memcpy(peer.y, peer_y, 32);
@@ -350,12 +356,12 @@ void p256_ecdh(const uint8_t secret[32],
     struct p256_point R;
     p256_scalar_mult(secret, &peer, &R);
     if (R.is_infinity) {
-        /* Should never happen with a valid peer key. */
         memset(shared_x, 0, 32);
         pr_warn("p256: ECDH produced point at infinity\n");
-        return;
+        return 0;
     }
     memcpy(shared_x, R.x, 32);
+    return 1;
 }
 
 /* Self-test using NIST test vector.
@@ -380,9 +386,7 @@ int p256_selftest(void) {
     if (ok) {
         pr_info("p256: self-test passed (2*G matches NIST vector)\n");
     } else {
-        pr_warn("p256: self-test FAILED (2*G mismatch)\n");
-        /* Still return success so TLS doesn't refuse to run — but log
-         * a warning. Real production would refuse to run. */
+        pr_warn("p256: self-test FAILED\n");
     }
-    return 1;
+    return ok;
 }

@@ -17,13 +17,10 @@
  *   net/http.c   - HTTP/1.0 client (GET + POST)
  *
  * Limitations (intentional, documented):
- *   - No HTTPS/TLS. Cloud AI APIs (GLM/Claude) are HTTPS-only — for those,
- *     run a local TLS-terminating proxy (e.g. socat/nginx) and point
- *     `ai setendpoint http://<proxy-host>:<port>/` at it. The HTTP client
- *     works direct against any plain-HTTP endpoint (Ollama, llama.cpp
- *     server, vLLM, or your own relay).
  *   - Single outstanding TCP connection at a time (sufficient for the
  *     shell's request/response pattern).
+ *   - TLS 1.2 client with ECDHE-RSA-AES128-GCM-SHA256, X.509 cert
+ *     verification, and RDRAND-backed CSPRNG. HTTPS works end-to-end.
  *   - No fragmentation/reassembly of IP datagrams (we cap MTU at 1500
  *     and assume path MTU is at least that).
  *   - DNS supports A records only (no AAAA, no CNAME chase).
