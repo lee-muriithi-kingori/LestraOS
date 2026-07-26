@@ -8,11 +8,16 @@
  *
  * Protocol (LESTRA_SSH/1.0):
  *   S->C: LESTRA_SSH/1.0\n
+ *   S->C: Welcome to LestraOS. Please authenticate.\n
+ *   S->C: login:\n
+ *   C->S: <username>\n
  *   S->C: CHALLENGE <32-byte-hex-random>\n
+ *   S->C: password:\n
  *   C->S: AUTH <username> <response-hex>\n
  *   S->C: OK\n  or  DENIED\n
+ *   S->C: LestraOS Shell (lsh) - type 'help' for commands\n> 
  *   C->S: <shell command>\n
- *   S->C: <command output>\n
+ *   S->C: <command output>\n> 
  *   ... repeat command/output ...
  *   C->S: exit\n  (or client disconnects)
  *
@@ -21,6 +26,11 @@
  * djb2(challenge_hex + ":" + password). Backward-compatible with
  * old clients that send AUTH without a prior CHALLENGE.
  * Default credentials: root / lestra
+ *
+ * Cloud/VPS mode: when the kernel boots with "cloud" on the cmdline,
+ * the SSH server auto-starts. It provides remote shell access over TCP
+ * which is essential for VPS/cloud operation where there is no VGA
+ * display or keyboard.
  */
 
 #include <lestra/types.h>
@@ -260,6 +270,20 @@ static void ssh_handle_line(int session_idx, struct tcp_conn* c,
                             const char* line) {
     struct ssh_session* s = &sessions[session_idx];
 
+    /* Phase 1: awaiting username input from the login prompt.
+     * The user typed their username — store it and prompt for password. */
+    if (s->awaiting_username && !s->authenticated) {
+        /* Store the username the client just entered */
+        strncpy(s->username, line, 31);
+        s->username[31] = '\0';
+        s->awaiting_username = 0;
+
+        /* Prompt for AUTH response (password hash) */
+        const char* pw_prompt = "password: ";
+        tcp_send_conn(c, pw_prompt, (uint16_t)strlen(pw_prompt));
+        return;
+    }
+
     if (!s->authenticated) {
         /* Expect: AUTH <username> <response_hex> */
         if (strncmp(line, "AUTH ", 5) != 0) {
@@ -314,13 +338,23 @@ static void ssh_handle_line(int session_idx, struct tcp_conn* c,
             s->authenticated = 1;
             strncpy(s->username, username, 31);
             s->username[31] = '\0';
+            s->awaiting_username = 0;
             const char* ok = "OK\n";
             tcp_send_conn(c, ok, 3);
+            /* Send shell welcome and first prompt */
+            const char* shell_welcome = "\nLestraOS Shell (lsh) - type 'help' for commands\n";
+            tcp_send_conn(c, shell_welcome, (uint16_t)strlen(shell_welcome));
+            const char* first_prompt = "> ";
+            tcp_send_conn(c, first_prompt, 2);
             pr_info("ssh: user '%s' authenticated (session %d)\n",
                     username, session_idx);
         } else {
             const char* denied = "DENIED\n";
             tcp_send_conn(c, denied, 7);
+            /* Re-prompt for login */
+            const char* retry = "login: ";
+            tcp_send_conn(c, retry, (uint16_t)strlen(retry));
+            s->awaiting_username = 1;
             pr_info("ssh: auth failed for '%s'\n", username);
         }
         return;
@@ -402,6 +436,14 @@ void ssh_server_tick(void) {
             generate_challenge(sessions[slot].challenge, 32);
             bytes_to_hex(sessions[slot].challenge, 32,
                          sessions[slot].challenge_hex);
+
+            /* Send welcome banner and login prompt */
+            const char* welcome1 = "LESTRA_SSH/1.0\n";
+            tcp_send_conn(new_conn, welcome1, (uint16_t)strlen(welcome1));
+            const char* welcome2 = "Welcome to LestraOS. Please authenticate.\n";
+            tcp_send_conn(new_conn, welcome2, (uint16_t)strlen(welcome2));
+
+            /* Send challenge */
             char challenge_msg[136]; /* "CHALLENGE " + 64 hex + "\n" + NUL */
             int pos = 0;
             const char* prefix = "CHALLENGE ";
@@ -411,7 +453,13 @@ void ssh_server_tick(void) {
             challenge_msg[pos++] = '\n';
             challenge_msg[pos] = '\0';
             tcp_send_conn(new_conn, challenge_msg, (uint16_t)pos);
+
+            /* Send login prompt */
+            const char* login_prompt = "login: ";
+            tcp_send_conn(new_conn, login_prompt, (uint16_t)strlen(login_prompt));
+
             sessions[slot].challenge_sent = 1;
+            sessions[slot].awaiting_username = 1;
         }
     }
 

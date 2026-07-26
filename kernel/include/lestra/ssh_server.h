@@ -18,6 +18,7 @@ struct ssh_session {
     int in_use;
     int conn_idx;       /* index into tcp_get_conn() array */
     int authenticated;
+    int awaiting_username;  /* 1 if waiting for username input (interactive login) */
     int pid;            /* shell process PID */
     char username[32];
     uint64_t last_activity;

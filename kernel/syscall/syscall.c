@@ -33,6 +33,7 @@
 #include <lestra/sched.h>
 #include <lestra/vfs.h>
 #include <lestra/pipe.h>
+#include <lestra/socket.h>
 #include <string.h>
 
 /* errno constants used by syscalls. Mirror libc/include/errno.h if
@@ -55,6 +56,20 @@
 #define EAGAIN         11
 #define ESPIPE         29   /* Illegal seek (on pipe/terminal) */
 #define EMFILE         24   /* Too many open files */
+#define ENOTTY         25   /* Inappropriate ioctl for device */
+#define ENOTEMPTY      39   /* Directory not empty */
+#define EPROTONOSUPPORT 93  /* Protocol not supported */
+#define EAFNOSUPPORT    97  /* Address family not supported */
+#define ENOTSOCK        88  /* Socket operation on non-socket */
+#define EOPNOTSUPP     102  /* Operation not supported */
+#define EADDRINUSE      98  /* Address already in use */
+#define EISCONN        106  /* Transport endpoint already connected */
+#define ENOTCONN       107  /* Transport endpoint not connected */
+#define ECONNREFUSED   111  /* Connection refused */
+
+/* Extra stat mode type bits not in vfs.h */
+#define S_IFCHR   0020000   /* character device */
+#define S_IFIFO   0010000   /* FIFO (named pipe) */
 
 /* LestraOS syscall numbers — must match kernel/include/lestra/syscall.h
  * and libc/include/unistd.h. Declared here as well so the linux_compat
@@ -90,6 +105,29 @@
 #define LESTRA_SYS_RT_SIGRETURN    27
 #define LESTRA_SYS_DUP2            28
 #define LESTRA_SYS_UNLINK           29
+#define LESTRA_SYS_CHMOD            30
+#define LESTRA_SYS_FSTAT            31
+#define LESTRA_SYS_ACCESS           32
+#define LESTRA_SYS_RENAME           33
+#define LESTRA_SYS_IOCTL            34
+#define LESTRA_SYS_GETUID           35
+#define LESTRA_SYS_GETGID           36
+#define LESTRA_SYS_GETPPID          37
+#define LESTRA_SYS_SETUID           38
+#define LESTRA_SYS_TIMES            39
+#define LESTRA_SYS_CLOCK_GETTIME    40
+#define LESTRA_SYS_GETRLIMIT        41
+#define LESTRA_SYS_SETRLIMIT        42
+#define LESTRA_SYS_FUTEX            43
+#define LESTRA_SYS_SOCKET           44
+#define LESTRA_SYS_BIND             45
+#define LESTRA_SYS_CONNECT          46
+#define LESTRA_SYS_LISTEN           47
+#define LESTRA_SYS_ACCEPT           48
+#define LESTRA_SYS_SEND             49
+#define LESTRA_SYS_RECV             50
+#define LESTRA_SYS_POLL             51
+#define LESTRA_SYS_SELECT           52
 
 /* Forward declarations for the Linux compatibility shim and signal
  * delivery. Both live in separate translation units (linux_compat.c
@@ -127,6 +165,68 @@ extern int  proc_wait_blocking(int, int*);
 
 /* Syscall entry point - defined in assembly */
 extern void syscall_entry(void);
+
+/* ioctl request codes (must match Linux layout for compat). */
+#define TCGETS     0x5401
+#define TCSETS     0x5402
+#define FIONREAD   0x541B
+
+/* Clock IDs for clock_gettime */
+#define CLOCK_REALTIME           0
+#define CLOCK_MONOTONIC          1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+
+/* Resource limit IDs for getrlimit/setrlimit */
+#define RLIMIT_CPU       0
+#define RLIMIT_FSIZE     1
+#define RLIMIT_DATA      2
+#define RLIMIT_STACK     3
+#define RLIMIT_CORE      4
+#define RLIMIT_RSS       5
+#define RLIMIT_NOFILE    7
+#define RLIMIT_AS        9
+#define RLIMIT_NPROC     6
+
+/* futex op codes */
+#define FUTEX_WAIT      0
+#define FUTEX_WAKE      1
+
+/* poll event flags */
+#define POLLIN      0x0001
+#define POLLOUT     0x0004
+#define POLLERR     0x0008
+#define POLLHUP     0x0010
+
+/* select: max fds per set (FD_SETSIZE, must be power of 2 divisible by 8) */
+#define FD_SETSIZE_L  128
+#define FD_SETSIZE_BYTES (FD_SETSIZE_L / 8)
+
+/* timespec structure for clock_gettime */
+struct timespec64 {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+/* tms structure for times() */
+struct tms {
+    int64_t tms_utime;
+    int64_t tms_stime;
+    int64_t tms_cutime;
+    int64_t tms_cstime;
+};
+
+/* rlimit structure for getrlimit/setrlimit */
+struct rlimit {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+};
+
+/* pollfd structure for poll() */
+struct pollfd {
+    int fd;
+    short events;
+    short revents;
+};
 
 /* GDT selectors (must match kernel/include/lestra/gdt.h)
  * FIX: USER_CS was 0x23 (which is USER_DS | RPL3). The correct
@@ -258,6 +358,9 @@ static int64_t sys_write(int64_t fd_num, const void* buf, size_t count) {
             return -EBADF;
     }
 }
+
+/* Per-process CWD. Single static buffer for now. */
+static char cwd[MAX_PATH_LEN] = "/";
 
 static int64_t sys_open(const char* path, int flags) {
     if (!path) return -EFAULT;
@@ -428,10 +531,6 @@ static int64_t sys_sleep(uint64_t ms) {
     }
     return 0;
 }
-
-/* Per-process CWD. Single static buffer for now. */
-static char cwd[MAX_PATH_LEN] = "/";
-static int  cwd_set = 1;
 
 static int64_t sys_getcwd(char* buf, size_t size) {
     if (!buf || size == 0) return -EFAULT;
@@ -630,6 +729,503 @@ static int64_t sys_dup2(int oldfd, int newfd) {
     return (int64_t)newfd;
 }
 
+/* ── New syscalls (30–52) ─────────────────────────────────────── */
+
+static int64_t sys_chmod(const char* path, uint32_t mode) {
+    if (!path) return -EFAULT;
+    /* VFS doesn't have a chmod operation yet. Return -ENOSYS so
+     * callers know the feature isn't implemented rather than
+     * silently succeeding with no effect. */
+    (void)mode;
+    return -ENOSYS;
+}
+
+static int64_t sys_fstat(int64_t fd_num, void* st) {
+    if (!st) return -EFAULT;
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    /* For VFS fds, stat the underlying VFS resource by fd number.
+     * We don't have vfs_fstat(), so we construct a stat from what
+     * we know (offset = file position, no real inode data). */
+    struct stat* s = (struct stat*)st;
+    memset(s, 0, sizeof(*s));
+
+    if (entry->type == FD_SPECIAL) {
+        /* stdin/stdout/stderr — treat as character device */
+        s->mode = S_IFCHR | 0666;
+        s->uid = 0;
+        s->gid = 0;
+        s->size = 0;
+        return 0;
+    }
+
+    if (entry->type == FD_VFS) {
+        /* Try to get stat via vfs_stat on the open resource.
+         * Since vfs_stat takes a path and we only have a fd,
+         * we fill in what we can. For memfs files, lseek
+         * SEEK_END gives the file size. */
+        off_t end = vfs_lseek(entry->resource, 0, 2);
+        if (end >= 0) {
+            s->mode = S_IFREG | 0644;
+            s->size = (uint64_t)end;
+        } else {
+            /* Unsupported VFS fd type (ext2, procfs, devfs) —
+             * provide a generic stat. */
+            s->mode = S_IFREG | 0644;
+            s->size = 0;
+        }
+        s->uid = 0;
+        s->gid = 0;
+        s->atime = timer_get_ms();
+        s->mtime = timer_get_ms();
+        s->ctime = timer_get_ms();
+        return 0;
+    }
+
+    if (entry->type == FD_PIPE) {
+        s->mode = S_IFIFO | 0666;
+        s->uid = 0;
+        s->gid = 0;
+        s->size = 0;
+        return 0;
+    }
+
+    return -EBADF;
+}
+
+static int64_t sys_access(const char* path, int mode) {
+    if (!path) return -EFAULT;
+    /* access() checks whether the calling process can access a file.
+     * In our single-user root system, any existing file is accessible.
+     * Check that the file exists via VFS lookup; if it does, return 0.
+     * mode bits (R_OK, W_OK, X_OK) are ignored since we're root. */
+    (void)mode;
+    /* Resolve relative path against cwd like sys_open does. */
+    char resolved[MAX_PATH_LEN];
+    const char* check_path = path;
+    if (path[0] != '/') {
+        size_t cwd_len = strlen(cwd);
+        size_t path_len = strlen(path);
+        if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+        memcpy(resolved, cwd, cwd_len);
+        if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
+            resolved[cwd_len] = '/';
+            cwd_len++;
+        }
+        memcpy(resolved + cwd_len, path, path_len + 1);
+        check_path = resolved;
+    }
+    struct vnode* vn = vfs_lookup(check_path);
+    if (!vn) return -ENOENT;
+    return 0;
+}
+
+static int64_t sys_rename(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -EFAULT;
+    /* VFS doesn't support rename yet. Return -ENOSYS. */
+    return -ENOSYS;
+}
+
+static int64_t sys_ioctl(int64_t fd_num, uint64_t request, uint64_t arg) {
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    /* Socket fds — delegate to socket layer */
+    if (socket_is_socket_fd(fd_num)) {
+        /* Sockets don't support ioctl; return -ENOTTY */
+        return -ENOTTY;
+    }
+
+    switch (request) {
+        case TCGETS:
+        case TCSETS:
+            /* Terminal get/set attributes. For FD_SPECIAL (stdin/stdout)
+             * and any tty-like fd, just return success. arg points to
+             * a struct termios in userspace; we accept it silently. */
+            if (entry->type == FD_SPECIAL) return 0;
+            /* Pipes can also be treated as tty-like for ioctl */
+            if (entry->type == FD_PIPE) return 0;
+            return -ENOTTY;
+
+        case FIONREAD:
+            /* Number of bytes readable. For stdin (fd 0), check the
+             * keyboard buffer. For other fds, return 0. */
+            if (entry->type == FD_SPECIAL && fd_num == 0) {
+                int count = keyboard_has_key() ? 1 : 0;
+                if (arg) *(int*)(uintptr_t)arg = count;
+                return 0;
+            }
+            if (entry->type == FD_PIPE) {
+                /* We don't have a pipe_readable_count helper yet;
+                 * return 0 as a safe default. */
+                if (arg) *(int*)(uintptr_t)arg = 0;
+                return 0;
+            }
+            if (entry->type == FD_VFS) {
+                /* For VFS files, readable = file_size - current_offset */
+                off_t end = vfs_lseek(entry->resource, 0, 2);
+                off_t readable = (end >= 0 && end > entry->offset)
+                    ? end - entry->offset : 0;
+                if (arg) *(int*)(uintptr_t)arg = (int)readable;
+                return 0;
+            }
+            return -ENOTTY;
+
+        default:
+            return -ENOTTY;
+    }
+}
+
+static int64_t sys_getuid(void) {
+    /* Single-user system: we are root (uid 0). */
+    return 0;
+}
+
+static int64_t sys_getgid(void) {
+    /* Single-user system: we are root (gid 0). */
+    return 0;
+}
+
+static int64_t sys_getppid(void) {
+    struct process* cur = task_current();
+    if (!cur) return 0;
+    return (int64_t)cur->parent_pid;
+}
+
+static int64_t sys_setuid(uint32_t uid) {
+    /* Only root (uid 0) can setuid. If caller tries to set uid to
+     * anything non-zero, return -EPERM. Setting to 0 is fine. */
+    if (uid != 0) return -EPERM;
+    return 0;
+}
+
+static int64_t sys_times(void* buf) {
+    /* Return elapsed ticks in milliseconds. Fill in tms struct if
+     * the caller provided a buffer. Since we don't track per-process
+     * CPU time separately, all fields are approximate. */
+    struct tms* t = (struct tms*)buf;
+    if (t) {
+        uint64_t ms = timer_get_ms();
+        t->tms_utime  = (int64_t)ms;   /* user time ≈ wall clock */
+        t->tms_stime  = 0;              /* kernel time not tracked */
+        t->tms_cutime = 0;              /* children not tracked */
+        t->tms_cstime = 0;
+    }
+    return (int64_t)timer_get_ms();
+}
+
+static int64_t sys_clock_gettime(int clk_id, void* tp) {
+    if (!tp) return -EFAULT;
+    struct timespec64* ts = (struct timespec64*)tp;
+    uint64_t ms = timer_get_ms();
+
+    switch (clk_id) {
+        case CLOCK_REALTIME:
+            /* Real-time clock: ms since boot (no RTC yet). */
+            ts->tv_sec  = (int64_t)(ms / 1000);
+            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            return 0;
+
+        case CLOCK_MONOTONIC:
+            /* Monotonic clock: same as realtime for now (no RTC). */
+            ts->tv_sec  = (int64_t)(ms / 1000);
+            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            return 0;
+
+        case CLOCK_PROCESS_CPUTIME_ID:
+            /* Per-process CPU time: approximate with wall clock. */
+            ts->tv_sec  = (int64_t)(ms / 1000);
+            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            return 0;
+
+        default:
+            return -EINVAL;
+    }
+}
+
+static int64_t sys_getrlimit(int resource, void* rlim_ptr) {
+    if (!rlim_ptr) return -EFAULT;
+    struct rlimit* rl = (struct rlimit*)rlim_ptr;
+
+    /* Return sensible defaults for each resource limit. In our
+     * minimal OS, most limits are essentially unlimited. */
+    switch (resource) {
+        case RLIMIT_NOFILE:
+            rl->rlim_cur = MAX_FD_PER_PROC;
+            rl->rlim_max = MAX_FD_PER_PROC;
+            return 0;
+        case RLIMIT_STACK:
+            rl->rlim_cur = 8 * 1024 * 1024;   /* 8 MB */
+            rl->rlim_max = 8 * 1024 * 1024;
+            return 0;
+        case RLIMIT_DATA:
+            rl->rlim_cur = 16 * 1024 * 1024;  /* 16 MB (matches brk cap) */
+            rl->rlim_max = 16 * 1024 * 1024;
+            return 0;
+        case RLIMIT_AS:
+            rl->rlim_cur = 256 * 1024 * 1024; /* 256 MB */
+            rl->rlim_max = 256 * 1024 * 1024;
+            return 0;
+        case RLIMIT_CPU:
+            rl->rlim_cur = 0xFFFFFFFF;         /* unlimited */
+            rl->rlim_max = 0xFFFFFFFF;
+            return 0;
+        case RLIMIT_FSIZE:
+            rl->rlim_cur = 0xFFFFFFFF;
+            rl->rlim_max = 0xFFFFFFFF;
+            return 0;
+        case RLIMIT_CORE:
+            rl->rlim_cur = 0;                  /* no core dumps */
+            rl->rlim_max = 0;
+            return 0;
+        case RLIMIT_RSS:
+            rl->rlim_cur = 0xFFFFFFFF;
+            rl->rlim_max = 0xFFFFFFFF;
+            return 0;
+        case RLIMIT_NPROC:
+            rl->rlim_cur = MAX_PROCS;
+            rl->rlim_max = MAX_PROCS;
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
+static int64_t sys_setrlimit(int resource, const void* rlim_ptr) {
+    if (!rlim_ptr) return -EFAULT;
+    (void)resource;
+    /* We don't allow changing resource limits yet. Return -EPERM
+     * to indicate the operation is not permitted. */
+    return -EPERM;
+}
+
+static int64_t sys_futex(uint32_t* uaddr, int op, uint32_t val,
+                          uint64_t timeout, uint32_t* uaddr2, uint32_t val3) {
+    (void)uaddr2; (void)val3; (void)timeout;
+    if (!uaddr) return -EFAULT;
+
+    switch (op) {
+        case FUTEX_WAIT:
+            /* Wait until *uaddr == val. In our single-threaded kernel
+             * we can't truly block on a userspace word changing, so we
+             * check once and either return 0 (match) or -EAGAIN (mismatch).
+             * A real implementation would sleep and schedule, but for now
+             * this basic stub is sufficient for simple futex usage. */
+            if (*uaddr != val) return -EAGAIN;
+            /* Value matches — nothing to wait for, return success. */
+            return 0;
+
+        case FUTEX_WAKE:
+            /* Wake up to 'val' waiters on this futex. Since we don't
+             * have a wait queue, just return 0 (no waiters woken). */
+            return 0;
+
+        default:
+            return -ENOSYS;
+    }
+}
+
+static int64_t sys_socket(int domain, int type, int protocol) {
+    return (int64_t)socket_create(domain, type, protocol);
+}
+
+static int64_t sys_bind(int64_t fd, const void* addr, int addrlen) {
+    return (int64_t)socket_bind((int)fd, (const struct sockaddr*)addr, addrlen);
+}
+
+static int64_t sys_connect(int64_t fd, const void* addr, int addrlen) {
+    return (int64_t)socket_connect((int)fd, (const struct sockaddr*)addr, addrlen);
+}
+
+static int64_t sys_listen(int64_t fd, int backlog) {
+    return (int64_t)socket_listen((int)fd, backlog);
+}
+
+static int64_t sys_accept(int64_t fd, void* addr, void* addrlen) {
+    return (int64_t)socket_accept((int)fd, (struct sockaddr*)addr, (int*)addrlen);
+}
+
+static int64_t sys_send(int64_t fd, const void* buf, size_t len, int flags) {
+    return (int64_t)socket_sendto((int)fd, buf, len, flags, NULL, 0);
+}
+
+static int64_t sys_recv(int64_t fd, void* buf, size_t len, int flags) {
+    return (int64_t)socket_recvfrom((int)fd, buf, len, flags, NULL, NULL);
+}
+
+static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
+    struct pollfd* pfds = (struct pollfd*)fds_ptr;
+    if (!pfds && nfds > 0) return -EFAULT;
+
+    /* Basic poll: check each fd for readability/writability.
+     * This is a synchronous check — we don't block since we have
+     * no async I/O notification yet. If timeout > 0, we sleep
+     * briefly then re-check once. */
+    int ready = 0;
+    struct process* cur = task_current();
+
+    for (uint64_t i = 0; i < nfds; i++) {
+        pfds[i].revents = 0;
+
+        if (pfds[i].fd < 0) {
+            /* Negative fd: ignore (revents stays 0) */
+            continue;
+        }
+
+        /* Check socket fds */
+        if (socket_is_socket_fd(pfds[i].fd)) {
+            /* Socket is always writable if connected, readable
+             * if data is available. We assume both for now. */
+            if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
+            if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
+            if (pfds[i].revents) ready++;
+            continue;
+        }
+
+        /* Check local process fds */
+        if (cur && pfds[i].fd >= 0 && pfds[i].fd < MAX_FD_PER_PROC) {
+            struct fd_entry* entry = &cur->fds[pfds[i].fd];
+            if (entry->type == FD_UNUSED) {
+                pfds[i].revents |= POLLERR;
+                ready++;
+                continue;
+            }
+
+            if (entry->type == FD_SPECIAL) {
+                /* stdin: check keyboard buffer */
+                if (pfds[i].fd == 0 && (pfds[i].events & POLLIN)) {
+                    if (keyboard_has_key()) {
+                        pfds[i].revents |= POLLIN;
+                    }
+                }
+                /* stdout/stderr: always writable */
+                if ((pfds[i].fd == 1 || pfds[i].fd == 2)
+                    && (pfds[i].events & POLLOUT)) {
+                    pfds[i].revents |= POLLOUT;
+                }
+            } else {
+                /* VFS/pipe fds: assume readable+writable for now */
+                if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
+                if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
+            }
+
+            if (pfds[i].revents) ready++;
+        }
+    }
+
+    /* If nothing is ready and timeout > 0, sleep briefly and
+     * re-check once. This gives a crude approximation of blocking
+     * poll behavior. */
+    if (ready == 0 && timeout_ms > 0) {
+        if (timeout_ms > 100) timeout_ms = 100; /* cap at 100ms */
+        task_sleep((uint64_t)timeout_ms);
+        /* Re-scan after waking */
+        for (uint64_t i = 0; i < nfds; i++) {
+            if (pfds[i].fd < 0) continue;
+            if (socket_is_socket_fd(pfds[i].fd)) {
+                if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
+                if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
+                if (pfds[i].revents) ready++;
+                continue;
+            }
+            if (cur && pfds[i].fd >= 0 && pfds[i].fd < MAX_FD_PER_PROC) {
+                struct fd_entry* entry = &cur->fds[pfds[i].fd];
+                if (entry->type == FD_UNUSED) {
+                    if (!(pfds[i].revents & POLLERR)) {
+                        pfds[i].revents |= POLLERR;
+                        ready++;
+                    }
+                    continue;
+                }
+                if (entry->type == FD_SPECIAL && pfds[i].fd == 0
+                    && (pfds[i].events & POLLIN)) {
+                    if (keyboard_has_key() && !(pfds[i].revents & POLLIN)) {
+                        pfds[i].revents |= POLLIN;
+                        ready++;
+                    }
+                }
+            }
+        }
+    }
+
+    return (int64_t)ready;
+}
+
+static int64_t sys_select(int nfds, void* readfds, void* writefds,
+                           void* exceptfds, const void* timeout) {
+    (void)timeout;
+    if (nfds < 0) return -EINVAL;
+    if (nfds > FD_SETSIZE_L) nfds = FD_SETSIZE_L;
+
+    /* select() uses bit-sets (fd_set). Each fd_set is an array of
+     * longs where bit N corresponds to fd N. FD_SETSIZE_BYTES is
+     * the size in bytes. */
+    uint8_t* rset = (uint8_t*)readfds;
+    uint8_t* wset = (uint8_t*)writefds;
+    uint8_t* eset = (uint8_t*)exceptfds;
+    struct process* cur = task_current();
+    int ready = 0;
+
+    for (int fd = 0; fd < nfds; fd++) {
+        int fd_byte = fd / 8;
+        int fd_bit  = fd % 8;
+        int watching_r = rset && (rset[fd_byte] & (1 << fd_bit));
+        int watching_w = wset && (wset[fd_byte] & (1 << fd_bit));
+        int watching_e = eset && (eset[fd_byte] & (1 << fd_bit));
+
+        if (!watching_r && !watching_w && !watching_e) continue;
+
+        /* Clear the bits first (we'll set them if ready) */
+        if (rset) rset[fd_byte] &= ~(1 << fd_bit);
+        if (wset) wset[fd_byte] &= ~(1 << fd_bit);
+        if (eset) eset[fd_byte] &= ~(1 << fd_bit);
+
+        /* Check socket fds */
+        if (socket_is_socket_fd(fd)) {
+            if (watching_r) { rset[fd_byte] |= (1 << fd_bit); ready++; }
+            if (watching_w) { wset[fd_byte] |= (1 << fd_bit); ready++; }
+            continue;
+        }
+
+        /* Check local process fds */
+        if (cur && fd >= 0 && fd < MAX_FD_PER_PROC) {
+            struct fd_entry* entry = &cur->fds[fd];
+            if (entry->type == FD_UNUSED) {
+                if (watching_e) { eset[fd_byte] |= (1 << fd_bit); ready++; }
+                continue;
+            }
+
+            if (entry->type == FD_SPECIAL) {
+                if (fd == 0 && watching_r) {
+                    if (keyboard_has_key()) {
+                        rset[fd_byte] |= (1 << fd_bit);
+                        ready++;
+                    }
+                }
+                if ((fd == 1 || fd == 2) && watching_w) {
+                    wset[fd_byte] |= (1 << fd_bit);
+                    ready++;
+                }
+            } else {
+                /* VFS/pipe: assume readable+writable */
+                if (watching_r) { rset[fd_byte] |= (1 << fd_bit); ready++; }
+                if (watching_w) { wset[fd_byte] |= (1 << fd_bit); ready++; }
+            }
+        }
+    }
+
+    return (int64_t)ready;
+}
+
 void syscall_init(void) {
     /* Enable SCE (SYSCALL Enable) in EFER MSR */
     uint64_t efer = rdmsr(0xC0000080);
@@ -704,6 +1300,29 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
         case LESTRA_SYS_RT_SIGRETURN:    ret = signal_sigreturn(); break;
         case LESTRA_SYS_DUP2:            ret = sys_dup2((int)a1, (int)a2); break;
         case LESTRA_SYS_UNLINK:       ret = sys_unlink((const char*)a1); break;
+        case LESTRA_SYS_CHMOD:        ret = sys_chmod((const char*)a1, (uint32_t)a2); break;
+        case LESTRA_SYS_FSTAT:        ret = sys_fstat((int64_t)a1, (void*)a2); break;
+        case LESTRA_SYS_ACCESS:       ret = sys_access((const char*)a1, (int)a2); break;
+        case LESTRA_SYS_RENAME:       ret = sys_rename((const char*)a1, (const char*)a2); break;
+        case LESTRA_SYS_IOCTL:        ret = sys_ioctl((int64_t)a1, a2, a3); break;
+        case LESTRA_SYS_GETUID:       ret = sys_getuid(); break;
+        case LESTRA_SYS_GETGID:       ret = sys_getgid(); break;
+        case LESTRA_SYS_GETPPID:      ret = sys_getppid(); break;
+        case LESTRA_SYS_SETUID:       ret = sys_setuid((uint32_t)a1); break;
+        case LESTRA_SYS_TIMES:        ret = sys_times((void*)a1); break;
+        case LESTRA_SYS_CLOCK_GETTIME: ret = sys_clock_gettime((int)a1, (void*)a2); break;
+        case LESTRA_SYS_GETRLIMIT:    ret = sys_getrlimit((int)a1, (void*)a2); break;
+        case LESTRA_SYS_SETRLIMIT:    ret = sys_setrlimit((int)a1, (const void*)a2); break;
+        case LESTRA_SYS_FUTEX:        ret = sys_futex((uint32_t*)a1, (int)a2, (uint32_t)a3, a4, (uint32_t*)a5, 0); break;
+        case LESTRA_SYS_SOCKET:       ret = sys_socket((int)a1, (int)a2, (int)a3); break;
+        case LESTRA_SYS_BIND:         ret = sys_bind((int64_t)a1, (const void*)a2, (int)a3); break;
+        case LESTRA_SYS_CONNECT:      ret = sys_connect((int64_t)a1, (const void*)a2, (int)a3); break;
+        case LESTRA_SYS_LISTEN:       ret = sys_listen((int64_t)a1, (int)a2); break;
+        case LESTRA_SYS_ACCEPT:       ret = sys_accept((int64_t)a1, (void*)a2, (void*)a3); break;
+        case LESTRA_SYS_SEND:         ret = sys_send((int64_t)a1, (const void*)a2, a3, (int)a4); break;
+        case LESTRA_SYS_RECV:         ret = sys_recv((int64_t)a1, (void*)a2, a3, (int)a4); break;
+        case LESTRA_SYS_POLL:         ret = sys_poll((void*)a1, a2, (int64_t)a3); break;
+        case LESTRA_SYS_SELECT:       ret = sys_select((int)a1, (void*)a2, (void*)a3, (void*)a4, (const void*)a5); break;
         default:
             pr_warn("Unknown syscall: %u\n", (unsigned)num);
             ret = -ENOSYS;

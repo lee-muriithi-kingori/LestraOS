@@ -39,7 +39,30 @@
 #define SYS_RT_SIGRETURN    27
 #define SYS_DUP2            28
 #define SYS_UNLINK           29
-#define SYS_MAX             30
+#define SYS_CHMOD            30
+#define SYS_FSTAT            31
+#define SYS_ACCESS           32
+#define SYS_RENAME           33
+#define SYS_IOCTL            34
+#define SYS_GETUID           35
+#define SYS_GETGID           36
+#define SYS_GETPPID          37
+#define SYS_SETUID           38
+#define SYS_TIMES            39
+#define SYS_CLOCK_GETTIME    40
+#define SYS_GETRLIMIT        41
+#define SYS_SETRLIMIT        42
+#define SYS_FUTEX            43
+#define SYS_SOCKET           44
+#define SYS_BIND             45
+#define SYS_CONNECT          46
+#define SYS_LISTEN           47
+#define SYS_ACCEPT           48
+#define SYS_SEND             49
+#define SYS_RECV             50
+#define SYS_POLL             51
+#define SYS_SELECT           52
+#define SYS_MAX             53
 
 /* Syscall handler */
 void syscall_init(void);

@@ -54,13 +54,32 @@ static int try_exec_init(const char* path) {
     }
 
     /* If the binary is dynamically linked, run it via the dynamic
-     * linker. ldso_is_dynamic peeks PT_INTERP / PT_DYNAMIC. */
+     * linker. ldso_is_dynamic peeks PT_INTERP / PT_DYNAMIC.
+     * FIX: If ldso_load_and_run fails (e.g. because the interpreter
+     * doesn't exist on the VFS), fall back to elf_exec. This handles
+     * the case where /init was accidentally built as a dynamic ELF
+     * on the host system (with a PT_INTERP pointing to glibc's
+     * ld-linux.so.2) but should really be treated as a static binary
+     * since we don't have glibc. elf_exec will still fail for truly
+     * dynamic binaries (unresolved symbols), but for binaries that
+     * are effectively static (all symbols resolved at link time) it
+     * works fine. */
     if (ldso_is_dynamic(path)) {
         pr_info("userspace_boot: %s is dynamic — ldso_load_and_run\n", path);
         int rc = ldso_load_and_run(path, 1, (char*[]){ (char*)path, NULL }, NULL);
         if (rc < 0) {
-            pr_warn("userspace_boot: ldso_load_and_run(%s) failed\n", path);
-            return -1;
+            pr_warn("userspace_boot: ldso_load_and_run(%s) failed — "
+                    "falling back to elf_exec\n", path);
+            /* Try elf_exec as fallback. For a binary that has PT_INTERP
+             * but is otherwise self-contained (all code in PT_LOAD
+             * segments, no unresolved DT_NEEDED), elf_exec can still
+             * load and run the segments directly. */
+            int rc2 = elf_exec(path);
+            if (rc2 < 0) {
+                pr_warn("userspace_boot: elf_exec(%s) also failed\n", path);
+                return -1;
+            }
+            return 0;
         }
         return 0;
     }

@@ -45,6 +45,7 @@
 #include <lestra/input.h>
 #include <lestra/gui.h>
 #include <lestra/splash.h>
+#include <lestra/ssh_server.h>
 #include <string.h>
 
 /* Real initrd_init is provided by fs/vfs.c */
@@ -103,6 +104,21 @@ static void print_banner(void) {
 
 /* Forward declarations */
 extern void shell_run(void);
+extern void shell_run_serial(void);  /* serial-only shell (no VGA needed) */
+
+/* Global cloud boot flag — set when cmdline contains "cloud".
+ * Other subsystems (SSH server, HTTP management API) can check this
+ * to decide whether to auto-start. */
+int boot_cloud = 0;
+int boot_serial = 0;
+
+/* Return cloud boot flag for other subsystems */
+int cloud_mode_active(void) {
+    return boot_cloud;
+}
+int serial_mode_active(void) {
+    return boot_serial;
+}
 
 /* Parse multiboot2 info: extract mmap + initrd + rootfs.tar modules
  * in one pass.
@@ -402,11 +418,14 @@ void kernel_main(void* mb2_info) {
     pr_info("\n");
 
     /* Parse the multiboot2 cmdline to determine boot mode.
-     * GRUB passes the kernel cmdline (e.g. "gui" or "legacy" or "recovery").
-     * Default is "gui" if framebuffer is available, else "legacy". */
+     * GRUB passes the kernel cmdline (e.g. "gui" or "legacy" or "recovery"
+     * or "cloud serial"). Default is "gui" if framebuffer is available,
+     * else "legacy". */
     int boot_gui = 0;
     int boot_legacy = 0;
     int boot_recovery = 0;
+    boot_cloud = 0;
+    boot_serial = 0;
     {
         /* Re-parse mb2_info for the cmdline tag */
         uint32_t total_size = *(uint32_t*)mb2_info;
@@ -421,6 +440,8 @@ void kernel_main(void* mb2_info) {
                 if (strstr(cmdline, "gui")) boot_gui = 1;
                 if (strstr(cmdline, "legacy")) { boot_gui = 0; boot_legacy = 1; }
                 if (strstr(cmdline, "recovery")) boot_recovery = 1;
+                if (strstr(cmdline, "cloud")) { boot_cloud = 1; boot_gui = 0; boot_legacy = 0; boot_recovery = 0; }
+                if (strstr(cmdline, "serial")) boot_serial = 1;
                 pr_info("Boot cmdline: '%s'\n", cmdline);
                 break;
             }
@@ -435,11 +456,44 @@ void kernel_main(void* mb2_info) {
      * We'll check fb_available AFTER fb_init() and fall back to text
      * mode if the framebuffer is invalid (e.g. on VirtualBox). */
     extern int fb_available;
-    if (!boot_recovery && !boot_gui && !boot_legacy) {
+    if (!boot_recovery && !boot_gui && !boot_legacy && !boot_cloud) {
         boot_gui = 1;
     }
 
-    if (boot_recovery) {
+    /* === CLOUD/VPS BOOT MODE ===
+     * Skip GUI entirely. Go straight to serial-only shell.
+     * Start SSH server and HTTP management API automatically.
+     * This is the headless server boot path. */
+    if (boot_cloud) {
+        pr_info("\n=== CLOUD/VPS SERVER MODE ===\n");
+        pr_info("LestraOS Cloud/VPS Mode activated\n");
+        pr_info("Serial console (COM1) is primary I/O\n");
+        pr_info("Skipping GUI, framebuffer, and compositor\n");
+
+        /* Start SSH server for remote access */
+        pr_info("Starting SSH remote shell server...\n");
+        extern void ssh_server_init(void);
+        extern int  ssh_server_start(uint16_t);
+        ssh_server_init();
+        if (ssh_server_start(SSH_DEFAULT_PORT) == 0) {
+            pr_info("LestraOS Cloud/VPS Mode - SSH server starting on port %u\n",
+                    (unsigned)SSH_DEFAULT_PORT);
+            printk("SSH server listening on port %u\n", (unsigned)SSH_DEFAULT_PORT);
+        } else {
+            pr_warn("SSH server failed to start (network not up?)\n");
+        }
+
+        /* Start HTTP management API */
+        pr_info("Starting HTTP management API on port 8080...\n");
+        extern void http_mgmt_start(uint16_t);
+        http_mgmt_start(8080);
+        pr_info("HTTP management API listening on port 8080\n");
+        printk("HTTP management API on port 8080\n");
+
+        /* Enter serial-only shell — no VGA needed */
+        pr_info("Entering serial shell...\n");
+        shell_run_serial();
+    } else if (boot_recovery) {
         pr_info("\n=== RECOVERY MODE ===\n");
         shell_run();
     } else if (boot_gui) {

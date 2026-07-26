@@ -33,6 +33,7 @@
 #include <lestra/service.h>
 #include <lestra/ssh_server.h>
 #include <lestra/firewall.h>
+#include <lestra/serial.h>
 #include <string.h>
 
 #define CMD_MAX_LEN  512
@@ -247,6 +248,14 @@ void cmd_reboot(void) {
     printk("Rebooting system...\n");
     /* 8042 keyboard-controller reset = warm reboot. Works on QEMU
      * and on most real PC hardware. This is the right call for reboot. */
+    outb(0x64, 0xFE);
+    while (1) { hlt(); }
+}
+
+/* Global reboot/shutdown functions callable from other modules
+ * (HTTP management API, SSH server, etc.) */
+void reboot_system(void) {
+    pr_info("System reboot requested (via management API)\n");
     outb(0x64, 0xFE);
     while (1) { hlt(); }
 }
@@ -708,6 +717,12 @@ void cmd_shutdown(void) {
     printk("ACPI shutdown failed; falling back to 8042 reset (reboot).\n");
     outb(0x64, 0xFE);
     while (1) { hlt(); }
+}
+
+/* Global shutdown function callable from other modules */
+void shutdown_system(void) {
+    pr_info("System shutdown requested (via management API)\n");
+    cmd_shutdown();
 }
 
 static void cmd_uptime(void) {
@@ -2251,6 +2266,40 @@ static int read_line(void) {
     return i;
 }
 
+/* ----- serial-only input (cloud/VPS mode) ----------------------------- */
+/* Reads a line from the serial port (COM1). No VGA or keyboard needed.
+ * This is the primary I/O path in cloud/VPS mode where there is no
+ * monitor or keyboard attached. All stdin/stdout/stderr goes through
+ * COM1 (0x3F8). */
+static int read_line_serial(void) {
+    int i = 0;
+    while (i < CMD_MAX_LEN - 1) {
+        char c = serial_getchar(COM1);
+        if (c == '\n' || c == '\r') {
+            input_buffer[i] = '\0';
+            serial_puts(COM1, "\r\n");
+            return i;
+        } else if (c == '\b' || c == 127) {
+            if (i > 0) {
+                i--;
+                serial_puts(COM1, "\b \b");
+            }
+        } else if (c >= ' ' && c < 127) {
+            input_buffer[i++] = c;
+            serial_putchar(COM1, c);
+        }
+    }
+    input_buffer[i] = '\0';
+    return i;
+}
+
+/* Print prompt over serial only (no VGA color codes) */
+static void print_prompt_serial(void) {
+    serial_puts(COM1, "lestra:");
+    serial_puts(COM1, cwd);
+    serial_puts(COM1, "$ ");
+}
+
 /* ----- shell entry ---------------------------------------------------- */
 void shell_run(void) {
     printk("\n");
@@ -2266,6 +2315,53 @@ void shell_run(void) {
         if (argc > 0) {
             execute_command();
         }
+    }
+}
+
+/* ----- serial-only shell entry (cloud/VPS mode) ----------------------- */
+/* Runs the shell entirely through the serial port (COM1, 0x3F8).
+ * No VGA, no keyboard, no framebuffer needed. This is the primary
+ * interactive shell in cloud/VPS mode where the system is headless.
+ *
+ * stdin:  COM1 serial input
+ * stdout: COM1 serial output (also goes through printk to serial)
+ * stderr: COM1 serial output
+ *
+ * The shell also runs a tick loop that services SSH sessions and
+ * the HTTP management API, since in cloud mode these are essential
+ * background services that need regular polling. */
+void shell_run_serial(void) {
+    serial_puts(COM1, "\r\n");
+    serial_puts(COM1, "Lestra Shell (lsh) 1.0 - Cloud/VPS Serial Mode\r\n");
+    serial_puts(COM1, "Type 'help' for available commands.\r\n");
+    serial_puts(COM1, "\r\n");
+
+    while (1) {
+        print_prompt_serial();
+        int len = read_line_serial();
+        if (len == 0) continue;
+        parse_args(input_buffer);
+        if (argc > 0) {
+            /* Execute the command — output goes through printk which
+             * writes to both VGA (if available) and serial. In cloud
+             * mode, serial is the primary output. */
+            execute_command();
+        }
+
+        /* Service background tasks needed for cloud mode:
+         * SSH server tick (processes remote sessions)
+         * HTTP management API tick (processes management requests)
+         * Network tick (keeps TCP/IP stack alive)
+         * Service manager tick (restarts failed services) */
+        extern void ssh_server_tick(void);
+        extern void http_mgmt_tick(void);
+        extern void net_tick(void);
+        extern void service_tick(void);
+
+        if (ssh_server_is_running()) ssh_server_tick();
+        http_mgmt_tick();
+        net_tick();
+        service_tick();
     }
 }
 

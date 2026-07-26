@@ -10,6 +10,7 @@
 #include <lestra/mm.h>
 #include <lestra/printk.h>
 #include <lestra/panic.h>
+#include <string.h>
 
 /* Bitmap allocator - each bit represents one 4KB page */
 static uint64_t* bitmap = NULL;

@@ -11,7 +11,13 @@ CFLAGS ?= -ffreestanding -O2 -Wall -Wextra \
           -fno-pie -fno-stack-protector \
           -mno-red-zone -mcmodel=large \
           -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer
-LDFLAGS ?= -nostdlib -nostartfiles -nodefaultlibs -no-pie
+# FIX: Add -static and --no-dynamic-linker to ensure user ELFs are
+# truly static. Without these, gcc on modern Linux defaults to producing
+# PIE executables with PT_INTERP pointing to the host's ld-linux.so,
+# which doesn't exist on LestraOS. This causes ldso_load_and_run to
+# crash when trying to load a "dynamic" /init that references glibc.
+LDFLAGS ?= -nostdlib -nostartfiles -nodefaultlibs -no-pie -static \
+           -Wl,--no-dynamic-linker -Wl,--build-id=none -Wl,-z,max-page-size=0x1000
 BUILD_DIR ?= ../build/user
 LIBC_DIR ?= ../build/libc
 
@@ -24,18 +30,15 @@ all: $(TARGETS)
 # helper function). All three sources now define _start themselves.
 $(BUILD_DIR)/init: init/init.c $(LIBC_DIR)/libc.a | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I../libc/include -Wl,-Ttext=0x400000 -Wl,-e,_start \
-	    init/init.c $(LIBC_DIR)/libc.a -o $@
+	@$(CC) $(CFLAGS) $(LDFLAGS) -I../libc/include -Wl,-e,_start init/init.c $(LIBC_DIR)/libc.a -o $@
 
 $(BUILD_DIR)/shell: shell/shell.c $(LIBC_DIR)/libc.a | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I../libc/include -Wl,-Ttext=0x400000 -Wl,-e,_start \
-	    shell/shell.c $(LIBC_DIR)/libc.a -o $@
+	@$(CC) $(CFLAGS) $(LDFLAGS) -I../libc/include -Wl,-e,_start shell/shell.c $(LIBC_DIR)/libc.a -o $@
 
 $(BUILD_DIR)/sysinfo: bin/sysinfo.c $(LIBC_DIR)/libc.a | $(BUILD_DIR)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I../libc/include -Wl,-Ttext=0x400000 -Wl,-e,_start \
-	    bin/sysinfo.c $(LIBC_DIR)/libc.a -o $@
+	@$(CC) $(CFLAGS) $(LDFLAGS) -I../libc/include -Wl,-e,_start bin/sysinfo.c $(LIBC_DIR)/libc.a -o $@
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

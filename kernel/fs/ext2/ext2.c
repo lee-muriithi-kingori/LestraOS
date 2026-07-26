@@ -191,6 +191,10 @@ int ext2_is_mounted(void) {
     return ext2_mounted;
 }
 
+/* Forward declarations (defined later in this file) */
+static int ext2_read_inode(uint32_t inode_num, struct ext2_inode* out);
+uint32_t ext2_resolve_path(const char* path);
+
 /* ext2_get_inode_mode: return the i_mode field of the inode at `path`.
  * This allows callers (like the ext2_shim) to determine whether a
  * path is a regular file, directory, etc. without reading the entire

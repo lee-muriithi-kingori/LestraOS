@@ -367,15 +367,22 @@ int temp_init(void) {
             tj_max = 95;
         }
     } else {
-        /* Unknown vendor — try Intel-style MSR as last resort */
+        /* Unknown vendor — try Intel-style MSR as last resort, but
+         * only trust it if the raw value is not 0 (0 means the MSR
+         * doesn't actually exist or isn't populated — QEMU and many
+         * VMs return 0 for thermal MSRs). */
         uint64_t therm = rdmsr(MSR_IA32_PACKAGE_THERM_STATUS);
         uint8_t raw = (uint8_t)((therm >> 24) & 0xFF);
-        if (raw != 0xFF) {
+        if (raw != 0xFF && raw != 0) {
             int temp = 100 - (int)raw;   /* assume TjMax=100 */
             if (temp >= 0 && temp <= 150) {
                 pr_info("temp: unknown CPU, guessed temperature = %d°C\n", temp);
                 real_readings = 1;
             }
+        }
+        if (!real_readings) {
+            pr_info("temp: unknown CPU, MSR returned %d (no thermal sensor)\n", (int)raw);
+            pr_info("temp: using simulated readings (CPU=%d°C)\n", SIM_CPU_TEMP);
         }
     }
 

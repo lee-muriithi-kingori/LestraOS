@@ -269,4 +269,8 @@ void service_tick(void) {
     if (ssh_server_is_running()) {
         ssh_server_tick();
     }
+
+    /* Poll HTTP management API (active in cloud/VPS mode) */
+    extern void http_mgmt_tick(void);
+    http_mgmt_tick();
 }

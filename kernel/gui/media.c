@@ -25,6 +25,7 @@
 #include <lestra/keyboard.h>
 #include <lestra/timer.h>
 #include <lestra/vfs.h>
+#include <lestra/printk.h>
 #include <string.h>
 
 #define MEDIA_W  480

@@ -240,19 +240,39 @@ static void* lib_alloc_pages(size_t bytes) {
                 (unsigned)(lib_va_ptr - LIB_VA_START));
         return NULL;
     }
-    /* For each page, allocate a physical page and map it.
-     * We use the kernel's pmm_alloc_page + vmm_map_page. */
-    extern phys_addr_t pmm_alloc_page(void);
-    extern void vmm_map_page(uint64_t* pml4, uint64_t vaddr, uint64_t phys, uint64_t flags);
-    extern uint64_t* current_pml4;   /* the kernel's active PML4 — assume identity map for now */
 
-    /* Since the kernel runs identity-mapped, we can use any free
-     * physical region. We just bump the pointer. */
-    void* p = (void*)lib_va_ptr;
+    /* FIX: Previously this function just bumped a virtual address pointer
+     * and assumed the first 4 GB was identity-mapped. That assumption is
+     * wrong — as documented in mm.h, boot.asm only identity-maps the
+     * first 1 GB (512 × 2 MB huge pages). Addresses >= 0x40000000 are
+     * NOT mapped and will page-fault on access. Now we actually allocate
+     * physical pages and map them via vmm_map_page() into boot_pml4.
+     * (pmm_alloc_page, vmm_map_page etc. come from <lestra/mm.h>.) */
+    extern uint64_t boot_pml4[];
+
+    uintptr_t start = lib_va_ptr;
+    uintptr_t end   = start + bytes;
+    for (uintptr_t va = start; va < end; va += 4096) {
+        phys_addr_t phys = pmm_alloc_page();
+        if (!phys) {
+            pr_warn("ldso: out of physical memory for lib mapping at 0x%x\n",
+                    (unsigned)va);
+            /* Rollback already-mapped pages for this allocation. */
+            for (uintptr_t rollback = start; rollback < va; rollback += 4096) {
+                phys_addr_t rb_phys = vmm_get_phys(boot_pml4, rollback);
+                if (rb_phys) {
+                    vmm_unmap_page(boot_pml4, rollback);
+                    pmm_free_page(rb_phys);
+                }
+            }
+            return NULL;
+        }
+        memset((void*)(uintptr_t)phys, 0, 4096);
+        vmm_map_page(boot_pml4, va, phys, PAGE_PRESENT | PAGE_WRITABLE);
+    }
+
+    void* p = (void*)start;
     lib_va_ptr += bytes;
-    /* For simplicity, return the raw pointer — the kernel already
-     * has the first 4 GB identity-mapped (see boot.asm). So lib
-     * loading works without explicit page mapping. */
     return p;
 }
 
@@ -397,7 +417,15 @@ static int load_lib_segments(const uint8_t* file_data, size_t file_size,
     memset(mapped, 0, total_bytes);
     lib->base = (uintptr_t)mapped - lowest_vaddr;
 
-    /* Copy each PT_LOAD segment's file contents. */
+    /* Copy each PT_LOAD segment's file contents.
+     * FIX: Use offset-based addressing instead of lib->base + ph->p_vaddr.
+     * When lowest_vaddr is very high (e.g. near 0xffdfff00), the
+     * subtraction (mapped - lowest_vaddr) can wrap around, producing
+     * a huge base value. Adding ph->p_vaddr back should theoretically
+     * give the correct address in 64-bit modular arithmetic, but some
+     * compilers or ABI edge cases may truncate the intermediate result.
+     * Using mapped + (ph->p_vaddr - lowest_vaddr) always stays within
+     * the allocated region, avoiding any wrap-around risk. */
     for (int i = 0; i < ehdr->e_phnum; i++) {
         const elf64_phdr_t* ph = &phdrs[i];
         if (ph->p_type != PT_LOAD) continue;
@@ -405,7 +433,15 @@ static int load_lib_segments(const uint8_t* file_data, size_t file_size,
             pr_warn("ldso: PT_LOAD out of bounds\n");
             continue;
         }
-        uint8_t* dst = (uint8_t*)(lib->base + ph->p_vaddr);
+        uint64_t seg_offset = ph->p_vaddr - lowest_vaddr;
+        if (seg_offset + ph->p_filesz > total_bytes) {
+            pr_warn("ldso: PT_LOAD segment exceeds mapped region "
+                    "(vaddr=0x%x offset=0x%x filesz=%u total=%u)\n",
+                    (unsigned)ph->p_vaddr, (unsigned)seg_offset,
+                    (unsigned)ph->p_filesz, (unsigned)total_bytes);
+            continue;
+        }
+        uint8_t* dst = (uint8_t*)mapped + seg_offset;
         memcpy(dst, file_data + ph->p_offset, ph->p_filesz);
         /* BSS is already zeroed by the memset above. */
     }
@@ -867,17 +903,33 @@ int ldso_load_and_run(const char* exe_path, int argc, char** argv, char** envp) 
 
     parse_dynamic(exe);
 
-    /* Check for PT_INTERP — verify it's us. */
+    /* Check for PT_INTERP — verify the interpreter exists on VFS.
+     * FIX: Previously this just logged the interpreter path and moved on.
+     * If the interpreter (e.g. /lib64/ld-linux-x86-64.so.2) doesn't exist
+     * on our VFS, we can't run a dynamically-linked binary. Instead of
+     * crashing later on unresolved symbols or missing pages, fail early
+     * and let userspace_boot fall back to elf_exec for static ELFs. */
     const elf64_ehdr_t* ehdr = (const elf64_ehdr_t*)file_data;
     const elf64_phdr_t* phdrs = (const elf64_phdr_t*)((uint8_t*)file_data + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type == PT_INTERP) {
             const char* interp = (const char*)(file_data + phdrs[i].p_offset);
             pr_info("ldso: PT_INTERP = %s\n", interp);
-            /* We don't strictly need to load ourselves — we ARE the
-             * interpreter. But we do need to make sure any symbols
-             * the exe expects from ld.so (like __libc_start_main) are
-             * resolvable. For now we skip self-loading. */
+            /* Check if the interpreter actually exists on the VFS. */
+            int interp_fd = vfs_open(interp, 0);
+            if (interp_fd < 0) {
+                pr_warn("ldso: interpreter %s not found — "
+                        "cannot run dynamic binary %s\n", interp, exe_path);
+                exe->in_use = 0;
+                kfree(file_data);
+                return -1;
+            }
+            vfs_close(interp_fd);
+            /* The interpreter exists. We don't strictly need to load
+             * ourselves — we ARE the interpreter. But we do need to make
+             * sure any symbols the exe expects from ld.so (like
+             * __libc_start_main) are resolvable. For now we skip
+             * self-loading. */
         }
     }
 

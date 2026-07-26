@@ -30,6 +30,9 @@
 #include <lestra/net.h>
 #include <string.h>
 
+/* Forward declaration for offline AI engine (kernel/ai/offline.c) */
+extern int offline_ai_respond(const char* prompt, char* response, size_t response_size);
+
 /* ----- provider metadata ----------------------------------------------
  * Default endpoints are the cloud HTTPS URLs. Since the kernel HTTP
  * client speaks plain HTTP only (no TLS), to use a cloud provider you
@@ -905,7 +908,7 @@ int ai_chat_with_tools(const char* prompt, char* response,
     } else {
         /* Fall back to offline rule engine. */
         char offline_resp[512];
-        int rc = offline_chat(prompt, offline_resp, sizeof(offline_resp));
+        int rc = offline_ai_respond(prompt, offline_resp, sizeof(offline_resp));
         p = "Assistant: ";
         while (*p && n < (int)response_size - 1) response[n++] = *p++;
         if (rc == 0) {
