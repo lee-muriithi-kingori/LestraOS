@@ -23,11 +23,7 @@
 #include <lestra/vfs.h>
 #include <string.h>
 
-/* ext2 driver entry points (from kernel/fs/ext2/ext2.c). */
-extern int  ext2_is_mounted(void);
-extern int  ext2_read_file(const char* path, void* buf, uint32_t bufsize);
-extern void ext2_list_root(void (*callback)(const char* name, uint32_t inode, uint8_t type));
-extern uint32_t ext2_resolve_path(const char* path);
+#include <lestra/ext2.h>
 
 #define MAX_EXT2_FDS  16
 #define EXT2_MAX_FILE  (256 * 1024)   /* 256 KB cap per open file (cache) */

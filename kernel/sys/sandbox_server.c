@@ -17,14 +17,25 @@
  */
 
 #include <lestra/types.h>
+#include <lestra/net.h>
 #include <lestra/printk.h>
 #include <lestra/sandbox.h>
 #include <lestra/timer.h>
 #include <string.h>
 
+#define SB_MAX_CONNS 4
+
+struct sb_http_conn {
+    struct tcp_conn* tcp;
+    int active;
+    char req[2048];
+    int req_len;
+};
+
 static int server_running = 0;
 static int server_port    = 8080;
-static int server_socket  = -1;
+static int listen_idx     = -1;
+static struct sb_http_conn sb_conns[SB_MAX_CONNS];
 
 /* Output buffer per sandbox for capturing stdout */
 #define OUTPUT_BUF_SIZE 4096
@@ -413,19 +424,113 @@ void sandbox_server_start(int port) {
         return;
     }
     server_port = port > 0 ? port : 8080;
-    server_running = 1;
     memset(output_buf, 0, sizeof(output_buf));
     memset(output_len, 0, sizeof(output_len));
-    pr_info("sandbox_server: started on port %d\n", server_port);
-    /* TCP listener setup will be wired when the TCP server API is ready.
-     * For now, handle_request() is callable from the TCP accept callback. */
+    memset(sb_conns, 0, sizeof(sb_conns));
+
+    listen_idx = tcp_listen((uint16_t)server_port, SB_MAX_CONNS);
+    if (listen_idx < 0) {
+        pr_warn("sandbox_server: failed to listen on port %d\n", server_port);
+        return;
+    }
+    server_running = 1;
+    pr_info("sandbox_server: listening on port %d\n", server_port);
 }
 
 void sandbox_server_stop(void) {
     if (!server_running) return;
+
+    for (int i = 0; i < SB_MAX_CONNS; i++) {
+        if (sb_conns[i].active && sb_conns[i].tcp) {
+            tcp_close_conn(sb_conns[i].tcp);
+            sb_conns[i].active = 0;
+        }
+    }
+
+    if (listen_idx >= 0) {
+        struct tcp_conn* lc = tcp_get_conn(listen_idx);
+        if (lc) {
+            lc->in_use = 0;
+            lc->state = TCP_CLOSED;
+        }
+        listen_idx = -1;
+    }
+
     server_running = 0;
-    server_socket = -1;
     pr_info("sandbox_server: stopped\n");
+}
+
+void sandbox_server_tick(void) {
+    if (!server_running || listen_idx < 0) return;
+
+    struct tcp_conn* lc = tcp_get_conn(listen_idx);
+    if (!lc) return;
+
+    if (lc->pending_accept && lc->accepted) {
+        struct tcp_conn* ac = lc->accepted;
+        lc->pending_accept = 0;
+        lc->accepted = NULL;
+
+        int slot = -1;
+        for (int i = 0; i < SB_MAX_CONNS; i++) {
+            if (!sb_conns[i].active) { slot = i; break; }
+        }
+        if (slot >= 0) {
+            sb_conns[slot].tcp = ac;
+            sb_conns[slot].active = 1;
+            sb_conns[slot].req_len = 0;
+            pr_info("sandbox_server: new client on slot %d\n", slot);
+        } else {
+            pr_warn("sandbox_server: connection slots full, dropping\n");
+            tcp_close_conn(ac);
+        }
+    }
+
+    for (int i = 0; i < SB_MAX_CONNS; i++) {
+        if (!sb_conns[i].active) continue;
+        struct sb_http_conn* hc = &sb_conns[i];
+        struct tcp_conn* tc = hc->tcp;
+
+        if (!tc->in_use || tc->state == TCP_CLOSED) {
+            hc->active = 0;
+            continue;
+        }
+
+        if (tc->rx_len > 0) {
+            int space = (int)sizeof(hc->req) - hc->req_len - 1;
+            if (space > 0 && tc->rx_len > 0) {
+                int n = tc->rx_len;
+                if (n > space) n = space;
+                memcpy(&hc->req[hc->req_len], tc->rx_buf, n);
+                hc->req_len += n;
+                memmove(tc->rx_buf, &tc->rx_buf[n], tc->rx_len - n);
+                tc->rx_len -= n;
+            }
+
+            int complete = 0;
+            for (int j = 0; j + 3 < hc->req_len; j++) {
+                if (hc->req[j] == '\r' && hc->req[j+1] == '\n' &&
+                    hc->req[j+2] == '\r' && hc->req[j+3] == '\n') {
+                    complete = 1;
+                    break;
+                }
+            }
+
+            if (complete) {
+                char resp[8192];
+                int rlen = handle_request(hc->req, hc->req_len,
+                                          resp, sizeof(resp));
+                if (rlen > 0)
+                    tcp_send_conn(tc, resp, (uint16_t)rlen);
+                tcp_close_conn(tc);
+                hc->active = 0;
+            }
+        }
+
+        if (tc->rx_closed && !hc->active) {
+            hc->active = 0;
+        }
+    }
 }
 
 int sandbox_server_is_running(void) {

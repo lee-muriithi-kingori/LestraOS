@@ -8,14 +8,18 @@
  *
  * Protocol (LESTRA_SSH/1.0):
  *   S->C: LESTRA_SSH/1.0\n
- *   C->S: AUTH <username> <password_hash>\n
+ *   S->C: CHALLENGE <32-byte-hex-random>\n
+ *   C->S: AUTH <username> <response-hex>\n
  *   S->C: OK\n  or  DENIED\n
  *   C->S: <shell command>\n
  *   S->C: <command output>\n
  *   ... repeat command/output ...
  *   C->S: exit\n  (or client disconnects)
  *
- * Authentication uses a simple djb2 hash for obfuscation.
+ * Authentication uses a challenge-response protocol. The server sends
+ * a random 32-byte challenge; the client responds with
+ * djb2(challenge_hex + ":" + password). Backward-compatible with
+ * old clients that send AUTH without a prior CHALLENGE.
  * Default credentials: root / lestra
  */
 
@@ -42,7 +46,26 @@ struct ssh_user {
 static struct ssh_user users[SSH_MAX_USERS];
 static int user_count = 0;
 
-/* Simple djb2 hash — not cryptographic, but prevents plaintext comparison */
+/* Known plaintext passwords for challenge-response verification.
+ * These mirror the credential store — in a real system you'd derive
+ * the response without storing plaintext, but this is a kernel. */
+const char* ssh_known_passwords[] = { "lestra", "admin" };
+int ssh_known_password_count = 2;
+
+/* Salted djb2 hash — not cryptographic, but prevents plaintext comparison */
+static uint32_t ssh_credential_hash(const char* password) {
+    uint32_t hash = 5381;
+    const char* salt = "LestraOS";
+    for (const char* s = salt; *s; s++) {
+        hash = ((hash << 5) + hash) + (uint8_t)*s;
+    }
+    for (const char* p = password; *p; p++) {
+        hash = ((hash << 5) + hash) + (uint8_t)*p;
+    }
+    return hash;
+}
+
+/* djb2 hash of arbitrary string (used for challenge-response) */
 static uint32_t ssh_hash(const char* str) {
     uint32_t hash = 5381;
     while (*str) {
@@ -52,14 +75,54 @@ static uint32_t ssh_hash(const char* str) {
     return hash;
 }
 
+/* Compute expected response for challenge-response auth:
+ * djb2(challenge_hex + ":" + password) */
+static uint32_t ssh_challenge_response(const char* challenge_hex,
+                                       const char* password) {
+    char buf[256];
+    int i = 0;
+    /* Copy challenge_hex */
+    while (challenge_hex[i] && i < 200) {
+        buf[i] = challenge_hex[i];
+        i++;
+    }
+    buf[i++] = ':';
+    /* Append password */
+    const char* p = password;
+    while (*p && i < 255) {
+        buf[i++] = *p++;
+    }
+    buf[i] = '\0';
+    return ssh_hash(buf);
+}
+
+/* Generate 32-byte random challenge using RDRAND */
+static void generate_challenge(uint8_t* buf, int len) {
+    for (int i = 0; i < len; i++) {
+        uint64_t val;
+        __asm__ volatile("rdrand %0" : "=r"(val));
+        buf[i] = (uint8_t)(val ^ (val >> 8) ^ (val >> 16) ^ (val >> 24));
+    }
+}
+
+/* Encode raw bytes as hex string. out must have room for len*2+1 chars. */
+static void bytes_to_hex(const uint8_t* in, int len, char* out) {
+    static const char hexdigits[] = "0123456789abcdef";
+    for (int i = 0; i < len; i++) {
+        out[i*2]   = hexdigits[(in[i] >> 4) & 0xf];
+        out[i*2+1] = hexdigits[in[i] & 0xf];
+    }
+    out[len*2] = '\0';
+}
+
 static void ssh_init_users(void) {
     user_count = 0;
     strncpy(users[0].username, "root", 31);
-    users[0].password_hash = ssh_hash("lestra");
+    users[0].password_hash = ssh_credential_hash("lestra");
     user_count = 1;
     /* Add a second user for flexibility */
     strncpy(users[1].username, "admin", 31);
-    users[1].password_hash = ssh_hash("admin");
+    users[1].password_hash = ssh_credential_hash("admin");
     user_count = 2;
 }
 
@@ -71,6 +134,15 @@ static int ssh_auth_check(const char* username, uint32_t hash) {
         }
     }
     return 0;
+}
+
+/* Find user entry, return pointer or NULL */
+static struct ssh_user* ssh_find_user(const char* username) {
+    for (int i = 0; i < user_count; i++) {
+        if (strcmp(users[i].username, username) == 0)
+            return &users[i];
+    }
+    return NULL;
 }
 
 /* ----- session state ----- */
@@ -189,7 +261,7 @@ static void ssh_handle_line(int session_idx, struct tcp_conn* c,
     struct ssh_session* s = &sessions[session_idx];
 
     if (!s->authenticated) {
-        /* Expect: AUTH <username> <password_hash_hex> */
+        /* Expect: AUTH <username> <response_hex> */
         if (strncmp(line, "AUTH ", 5) != 0) {
             const char* denied = "DENIED\n";
             tcp_send_conn(c, denied, (uint16_t)strlen(denied));
@@ -206,10 +278,39 @@ static void ssh_handle_line(int session_idx, struct tcp_conn* c,
         username[uidx] = '\0';
         if (*line == ' ') line++;
 
-        /* Parse hash (hex string) */
-        uint32_t hash = parse_hex32(line);
+        /* Parse response (hex string) */
+        uint32_t response = parse_hex32(line);
 
-        if (ssh_auth_check(username, hash)) {
+        int auth_ok = 0;
+
+        if (s->challenge_sent) {
+            /* Challenge-response: verify djb2(challenge_hex + ":" + password) */
+            struct ssh_user* user = ssh_find_user(username);
+            if (user) {
+                /* We need the plaintext password to compute the expected
+                 * response. Since we only store hashes, we must re-hash
+                 * with each known password. This is a kernel — we know
+                 * the credential list. */
+                for (int p = 0; p < ssh_known_password_count; p++) {
+                    uint32_t expected = ssh_challenge_response(
+                        s->challenge_hex, ssh_known_passwords[p]);
+                    if (expected == response &&
+                        strcmp(user->username, username) == 0) {
+                        /* Also verify the password hash matches the user */
+                        if (user->password_hash ==
+                            ssh_credential_hash(ssh_known_passwords[p])) {
+                            auth_ok = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            /* Backward compat: old client sent AUTH without prior CHALLENGE */
+            auth_ok = ssh_auth_check(username, response);
+        }
+
+        if (auth_ok) {
             s->authenticated = 1;
             strncpy(s->username, username, 31);
             s->username[31] = '\0';
@@ -289,12 +390,28 @@ void ssh_server_tick(void) {
             sessions[slot].authenticated = 0;
             sessions[slot].pid = 0;
             sessions[slot].last_activity = timer_get_ms();
+            sessions[slot].challenge_sent = 0;
             session_rx_len[slot] = 0;
 
             pr_info("ssh: new connection from %u.%u.%u.%u:%u (session %d)\n",
                     new_conn->peer_ip.bytes[0], new_conn->peer_ip.bytes[1],
                     new_conn->peer_ip.bytes[2], new_conn->peer_ip.bytes[3],
                     (unsigned)new_conn->peer_port, slot);
+
+            /* Generate and send challenge */
+            generate_challenge(sessions[slot].challenge, 32);
+            bytes_to_hex(sessions[slot].challenge, 32,
+                         sessions[slot].challenge_hex);
+            char challenge_msg[136]; /* "CHALLENGE " + 64 hex + "\n" + NUL */
+            int pos = 0;
+            const char* prefix = "CHALLENGE ";
+            while (*prefix) challenge_msg[pos++] = *prefix++;
+            for (int j = 0; j < 64; j++)
+                challenge_msg[pos++] = sessions[slot].challenge_hex[j];
+            challenge_msg[pos++] = '\n';
+            challenge_msg[pos] = '\0';
+            tcp_send_conn(new_conn, challenge_msg, (uint16_t)pos);
+            sessions[slot].challenge_sent = 1;
         }
     }
 

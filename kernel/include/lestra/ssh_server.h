@@ -21,6 +21,10 @@ struct ssh_session {
     int pid;            /* shell process PID */
     char username[32];
     uint64_t last_activity;
+    /* Challenge-response fields */
+    uint8_t challenge[32];  /* raw challenge bytes */
+    char challenge_hex[65]; /* hex-encoded challenge (64 hex chars + NUL) */
+    int challenge_sent;     /* 1 if CHALLENGE has been sent to client */
 };
 
 void ssh_server_init(void);

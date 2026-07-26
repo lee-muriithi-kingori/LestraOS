@@ -31,9 +31,13 @@ extern mac_addr_t e1000_get_mac(void);
 extern int        e1000_send(const void* data, uint16_t len);
 extern int        e1000_recv(void* buf, uint16_t bufsz);
 
+/* WiFi frame handler (defined in net/wifi.c) */
+extern void wifi_handle_frame(const uint8_t* data, uint16_t len);
+
 /* ----- Ethernet header ----- */
-#define ETH_TYPE_IPV4  0x0800
-#define ETH_TYPE_ARP   0x0806
+#define ETH_TYPE_IPV4       0x0800
+#define ETH_TYPE_ARP        0x0806
+#define ETH_TYPE_WLAN_MGMT  0x88B4  /* 802.11 management frames over Ethernet */
 
 struct eth_hdr {
     mac_addr_t  dst;
@@ -225,6 +229,9 @@ extern void tcp_tick(void);
 
 /* HTTP server (defined in http_server.c) */
 extern void http_server_tick(void);
+
+/* Sandbox HTTP server (defined in sys/sandbox_server.c) */
+extern void sandbox_server_tick(void);
 
 /* ----- checksum (Internet 16-bit one's complement) ----- */
 static uint16_t inet_checksum(const void* data, uint16_t len, uint32_t init_sum) {
@@ -966,6 +973,9 @@ static void handle_ethernet(uint8_t* data, uint16_t len) {
         case ETH_TYPE_IPV4:
             handle_ipv4(payload, payload_len);
             break;
+        case ETH_TYPE_WLAN_MGMT:
+            wifi_handle_frame(payload, payload_len);
+            break;
         /* ignore other protocols */
     }
 }
@@ -1028,6 +1038,7 @@ void net_tick(void) {
     dhcp_tick();
     tcp_tick();
     http_server_tick();
+    sandbox_server_tick();
 
     in_net_tick = 0;
 }
