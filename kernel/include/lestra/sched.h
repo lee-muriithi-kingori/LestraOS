@@ -5,6 +5,23 @@
 
 #define MAX_PROCS       32
 #define MAX_SIGNALS     32
+#define MAX_FD_PER_PROC 128
+
+/* Per-process file descriptor entry.
+ * Maps a process-local fd number to an underlying resource.
+ * FD types: FD_UNUSED (free slot), FD_SPECIAL (stdin/stdout/stderr),
+ * FD_VFS (VFS file — memfs or ext2), FD_PIPE (pipe endpoint). */
+#define FD_UNUSED   0
+#define FD_SPECIAL  1
+#define FD_VFS      2
+#define FD_PIPE     3
+
+struct fd_entry {
+    int type;               /* FD_UNUSED / FD_SPECIAL / FD_VFS / FD_PIPE */
+    int resource;           /* global VFS fd or pipe fd (unused for FD_SPECIAL) */
+    int64_t offset;         /* per-process read/write offset */
+    int flags;              /* open flags (O_RDONLY, O_WRONLY, O_RDWR, …) */
+};
 
 struct cpu_state {
     uint64_t r15, r14, r13, r12;
@@ -43,6 +60,8 @@ struct process {
     int is_linux_process;
     char exe_path[256];
     uint64_t brk;
+    uint64_t stack_bottom;               /* bottom of mapped stack region (grows downward) */
+    struct fd_entry fds[MAX_FD_PER_PROC]; /* per-process file descriptor table */
 };
 
 #define PROC_FREE      0
@@ -69,6 +88,10 @@ void sched_kill_and_unload(int pid, int exit_status);
 void sched_set_clear_child_tid(int pid, void* addr);
 void proc_set_linux_process(int is_linux);
 int proc_is_linux_process(void);
+void fd_table_init(struct process* p);
+void fd_table_copy(struct process* parent, struct process* child);
+void fd_table_close_all(struct process* p);
+void proc_reap(struct process* p);
 
 void task_block(void);
 void task_unblock(void* task);

@@ -687,15 +687,147 @@ int ai_chat_with_tools(const char* prompt, char* response,
                        size_t response_size, int max_iterations) {
     if (!prompt || !response || response_size == 0) return -1;
 
-    /* Simulated agentic loop:
-     *   1. Detect tool requests in the prompt
-     *   2. Execute the tool
-     *   3. Format tool output as part of the response
+    /* Agentic loop:
+     * When an API key is set (ai_any_key_set()), use real HTTP+TLS to
+     * call the provider. The AI's response may contain tool calls
+     * (formatted as JSON). We parse those, execute the tools, and
+     * feed results back in the next iteration.
      *
-     * In a real implementation, this would be driven by the AI's
-     * tool_calls array in the response. */
+     * When no key is set (offline mode), we fall back to keyword-based
+     * tool dispatch + the offline rule engine. This is explicitly NOT
+     * neural, but it keeps the UX functional for demonstration. */
+
+    /* If a real API key is available, try the HTTP+TLS path first.
+     * Build a messages array with tool definitions and the user prompt,
+     * then POST to the provider. Parse the response for tool_calls,
+     * execute them, and loop. */
+    if (ai_any_key_set() && net_is_up()) {
+        /* Build the initial messages payload with system prompt + tools. */
+        char messages_buf[4096];
+        int mlen = 0;
+
+        /* System message: instruct the AI to use tools when appropriate. */
+        const char* sys_msg = "{\"role\":\"system\",\"content\":\"You are an AI assistant running inside "
+            "LestraOS. You have access to these tools: shell (run commands), file_read, file_write, "
+            "pkg_install, pkg_list, meminfo, uptime. When the user asks you to perform an action, "
+            "call the appropriate tool. When just chatting, respond normally.\"}";
+        mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
+                          "%s", sys_msg);
+
+        /* User message. */
+        mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
+                          ",{\"role\":\"user\",\"content\":\"");
+
+        /* Escape double quotes in prompt for JSON. */
+        const char* src = prompt;
+        while (*src && mlen < (int)sizeof(messages_buf) - 4) {
+            if (*src == '"') { messages_buf[mlen++] = '\\'; messages_buf[mlen++] = '"'; src++; }
+            else if (*src == '\n') { messages_buf[mlen++] = '\\'; messages_buf[mlen++] = 'n'; src++; }
+            else { messages_buf[mlen++] = *src++; }
+        }
+        mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen, "\"}");
+
+        int iteration = 0;
+        int total_written = 0;
+
+        while (iteration < max_iterations) {
+            iteration++;
+
+            /* Call the AI provider via HTTP. */
+            char ai_resp[AI_RESPONSE_MAX];
+            int rc = ai_chat(messages_buf, ai_resp, sizeof(ai_resp));
+
+            if (rc != 0) {
+                /* HTTP call failed — fall through to offline mode. */
+                break;
+            }
+
+            /* Check if the AI response contains a tool call pattern.
+             * We look for "tool_call:" or "[call tool: name]" patterns
+             * in the response. A more robust impl would parse the
+             * OpenAI-format tool_calls JSON array, but our JSON parser
+             * is minimal so we use a simple pattern match. */
+            const char* tool_marker = strstr(ai_resp, "tool_call:");
+            const char* tool_bracket = strstr(ai_resp, "[call tool:");
+
+            if (tool_marker || tool_bracket) {
+                /* Extract tool name from the marker. */
+                const char* tool_start = tool_marker ? tool_marker + 10 : tool_bracket + 11;
+                /* Skip whitespace. */
+                while (*tool_start == ' ' || *tool_start == '\t') tool_start++;
+
+                /* Read tool name until space/bracket/newline. */
+                char tool_name[64] = {0};
+                int ti = 0;
+                while (*tool_start && *tool_start != ' ' && *tool_start != ']'
+                       && *tool_start != '\n' && ti < 63) {
+                    tool_name[ti++] = *tool_start++;
+                }
+                tool_name[ti] = '\0';
+
+                /* Extract tool arguments (everything after tool name). */
+                while (*tool_start == ' ' || *tool_start == ']') tool_start++;
+                char tool_args[256] = {0};
+                int ai = 0;
+                while (*tool_start && *tool_start != '\n' && ai < 255) {
+                    tool_args[ai++] = *tool_start++;
+                }
+                tool_args[ai] = '\0';
+
+                /* Find and execute the tool. */
+                const struct ai_tool* tool = ai_tool_find(tool_name);
+                char tool_out[512];
+                tool_out[0] = 0;
+
+                if (tool) {
+                    tool->handler(tool_args, tool_out, sizeof(tool_out));
+
+                    /* Append the AI's partial response + tool result to output. */
+                    int resp_len = 0;
+                    while (ai_resp[resp_len] && resp_len < 200
+                           && total_written < (int)response_size - 1) {
+                        response[total_written++] = ai_resp[resp_len++];
+                    }
+                    const char* sep = "\n[tool result: ";
+                    while (*sep && total_written < (int)response_size - 1)
+                        response[total_written++] = *sep++;
+                    const char* to = tool_out;
+                    while (*to && total_written < (int)response_size - 1)
+                        response[total_written++] = *to++;
+                    const char* close = "]\n";
+                    while (*close && total_written < (int)response_size - 1)
+                        response[total_written++] = *close++;
+
+                    /* Feed tool result back as assistant message + tool result. */
+                    mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
+                                      ",{\"role\":\"assistant\",\"content\":\"%s\"}"
+                                      ",{\"role\":\"user\",\"content\":\"Tool %s returned: %s. "
+                                      "Continue the conversation based on this result.\"}",
+                                      tool_name, tool_name, tool_out);
+
+                    /* Continue the loop — the AI can call more tools. */
+                    continue;
+                }
+            }
+
+            /* No tool call detected — this is the final response.
+             * Copy the entire AI response to the output buffer. */
+            const char* rp = ai_resp;
+            while (*rp && total_written < (int)response_size - 1) {
+                response[total_written++] = *rp++;
+            }
+            response[total_written] = 0;
+            return 0;
+        }
+
+        /* If we exhausted iterations, return whatever we accumulated. */
+        response[total_written] = 0;
+        if (total_written > 0) return 0;
+    }
+
+    /* OFFLINE MODE: keyword-based tool dispatch (not neural). */
     int n = 0;
-    const char* header = "=== Agentic Chat (simulated) ===\n\n";
+    const char* header = "=== Agentic Chat (offline — keyword-based) ===\n\n";
     while (*header && n < (int)response_size - 1) response[n++] = *header++;
 
     const char* p = "User: ";
@@ -706,7 +838,7 @@ int ai_chat_with_tools(const char* prompt, char* response,
     response[n++] = '\n';
     response[n++] = '\n';
 
-    /* Tool dispatch */
+    /* Tool dispatch — keyword matching fallback. */
     char tool_out[512];
     int iterations = 0;
     int dispatched = 0;
@@ -726,6 +858,9 @@ int ai_chat_with_tools(const char* prompt, char* response,
             tool_args = strstr(prompt, "install ") + 8;
         } else if (strstr(prompt, "list packages") || strstr(prompt, "pkg list")) {
             tool_name = "pkg_list";
+        } else if (strstr(prompt, "shell ") || strstr(prompt, "run ")) {
+            tool_name = "shell";
+            tool_args = strstr(prompt, "shell ") ? strstr(prompt, "shell ") + 7 : strstr(prompt, "run ") + 4;
         }
 
         if (!tool_name) break;
@@ -754,7 +889,7 @@ int ai_chat_with_tools(const char* prompt, char* response,
         response[n++] = '\n';
 
         dispatched++;
-        break;  /* one tool per simulated iteration */
+        break;  /* one tool per offline iteration */
     }
 
     /* Final message */
@@ -765,19 +900,19 @@ int ai_chat_with_tools(const char* prompt, char* response,
             p = "s";
             while (*p && n < (int)response_size - 1) response[n++] = *p++;
         }
-        p = " and reported the result above.\n";
+        p = " and reported the result above. (offline mode — keyword matching, not neural)\n";
         while (*p && n < (int)response_size - 1) response[n++] = *p++;
     } else {
-        /* Fall back to plain chat */
-        char chat_resp[AI_RESPONSE_MAX];
-        int rc = ai_chat(prompt, chat_resp, sizeof(chat_resp));
+        /* Fall back to offline rule engine. */
+        char offline_resp[512];
+        int rc = offline_chat(prompt, offline_resp, sizeof(offline_resp));
         p = "Assistant: ";
         while (*p && n < (int)response_size - 1) response[n++] = *p++;
         if (rc == 0) {
-            p = chat_resp;
-            while (*p && n < (int)response_size - 1) response[n++] = *p++;
+            const char* op = offline_resp;
+            while (*op && n < (int)response_size - 1) response[n++] = *op++;
         } else {
-            p = "(no response)";
+            p = "(no response from offline engine)";
             while (*p && n < (int)response_size - 1) response[n++] = *p++;
         }
         response[n++] = '\n';

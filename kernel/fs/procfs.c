@@ -13,6 +13,7 @@
  *   /proc/self/cmdline    - NUL-separated argv
  *   /proc/meminfo         - kernel memory stats
  *   /proc/cpuinfo         - real CPU info via CPUID
+ *   /proc/ps              - process listing (PID, state, name)
  *   /proc/version         - "LestraOS 1.0.0-alpha ..."
  *
  * FDs live in [300..399] so they don't collide with VFS (3..66),
@@ -43,6 +44,7 @@ enum procfs_kind {
     PROC_MEMINFO,
     PROC_CPUINFO,
     PROC_VERSION,
+    PROC_PS,        /* process listing (like /proc/ps) */
 };
 
 struct procfs_open {
@@ -263,6 +265,30 @@ static size_t gen_version(struct procfs_open* o) {
     return (size_t)n;
 }
 
+/* Generate a process listing in ps-style tabular format. */
+static size_t gen_ps(struct procfs_open* o) {
+    /* State names for display. */
+    static const char* state_names[] = {
+        "free", "runnable", "running", "blocked", "zombie"
+    };
+    int off = 0;
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "  PID  PPID  STATE        NAME\n");
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (procs[i].state == PROC_FREE) continue;
+        const char* sname = (procs[i].state >= 0 && procs[i].state <= 4)
+                            ? state_names[procs[i].state] : "???";
+        off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                         " %4d  %4d  %-12s %s\n",
+                         procs[i].pid,
+                         procs[i].parent_pid,
+                         sname,
+                         procs[i].name);
+        if (off >= (int)sizeof(o->buf) - 64) break;
+    }
+    return (size_t)off;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -274,6 +300,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/meminfo")      == 0) return PROC_MEMINFO;
     if (strcmp(path, "/proc/cpuinfo")      == 0) return PROC_CPUINFO;
     if (strcmp(path, "/proc/version")      == 0) return PROC_VERSION;
+    if (strcmp(path, "/proc/ps")           == 0) return PROC_PS;
     return PROC_NONE;
 }
 
@@ -295,6 +322,7 @@ int procfs_open(const char* path) {
                 case PROC_MEMINFO:      o->size = gen_meminfo(o);      break;
                 case PROC_CPUINFO:      o->size = gen_cpuinfo(o);      break;
                 case PROC_VERSION:      o->size = gen_version(o);      break;
+                case PROC_PS:           o->size = gen_ps(o);           break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

@@ -18,6 +18,7 @@
 #define PAGE_DIRTY      0x040
 #define PAGE_HUGE       0x080
 #define PAGE_GLOBAL     0x100
+#define PAGE_COW        0x200  /* Bit 9: software-use COW marker (x86_64 bits 9-11 are available to OS) */
 #define PAGE_NX         (1ULL << 63)
 
 #define PAGE_KERNEL     (PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL)
@@ -91,6 +92,20 @@ void* krealloc(void* ptr, size_t size);
 void kfree(void* ptr);
 size_t ksize(void* ptr);
 uintptr_t heap_get_used(void);
+
+/* Physical page reference counting (for COW fork) */
+void pmm_refcount_init(void);
+void pmm_refcount_inc(phys_addr_t addr);
+uint32_t pmm_refcount_dec(phys_addr_t addr);   /* returns new refcount; 0 means last ref dropped */
+uint32_t pmm_refcount_get(phys_addr_t addr);
+
+/* Page fault handler — called from ISR 14 dispatcher in idt.c.
+ * Receives faulting address (CR2), error code, and the saved interrupt
+ * frame for diagnostic info (RIP etc). Returns on successful resolution
+ * (COW, stack growth); panics on unhandled faults. */
+struct interrupt_frame;
+void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
+                        struct interrupt_frame* frame);
 
 /* Memory info */
 void mm_print_stats(void);

@@ -554,10 +554,35 @@ void compositor_quit(void) {
     compositor_running = 0;
 }
 
+/* ----- z-order focus tracking ----- */
+static int focus_idx = -1;  /* index into widgets[] of the focused widget */
+
+/* Find the next visible widget after the current focus, wrapping around. */
 void compositor_focus_next(void) {
-    /* Stub: cycle focus through widgets. Real impl needs z-order traversal. */
+    if (n_widgets == 0) { focus_idx = -1; return; }
+    int start = (focus_idx >= 0) ? focus_idx : 0;
+    for (int i = 1; i <= n_widgets; i++) {
+        int idx = (start + i) % n_widgets;
+        if (widgets[idx] && widgets[idx]->visible) {
+            focus_idx = idx;
+            pr_info("compositor: focus -> widget %d '%s'\n", idx, widgets[idx]->title);
+            return;
+        }
+    }
+    focus_idx = -1;
 }
 
+/* Close/destroy the currently focused widget, then focus the next one. */
 void compositor_close_focused(void) {
-    /* Stub: remove the currently-focused widget. Real impl needs focus tracking. */
+    if (focus_idx < 0 || focus_idx >= n_widgets || !widgets[focus_idx]) return;
+    pr_info("compositor: closing focused widget %d '%s'\n", focus_idx, widgets[focus_idx]->title);
+    /* Mark the widget as invisible (it stays in the array but won't render). */
+    widgets[focus_idx]->visible = 0;
+    /* Shift remaining widgets down to fill the gap (maintains z-order). */
+    for (int i = focus_idx; i < n_widgets - 1; i++) {
+        widgets[i] = widgets[i + 1];
+    }
+    n_widgets--;
+    /* Focus the next widget. */
+    compositor_focus_next();
 }

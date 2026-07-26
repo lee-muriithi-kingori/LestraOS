@@ -7,4 +7,5 @@ const char* battery_get_status_str(void);
 int temp_init(void);
 int temp_get_cpu(void);
 int temp_get_gpu(void);
+int temp_is_simulated(void);
 #endif

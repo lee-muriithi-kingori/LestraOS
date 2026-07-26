@@ -130,9 +130,8 @@ int access(const char* pathname, int mode) {
 }
 
 int unlink(const char* pathname) {
-    /* No syscall; return -1 to indicate "not supported". */
-    (void)pathname;
-    return -1;
+    /* SYS_UNLINK (29) — now implemented in the kernel for memfs files. */
+    return (int)syscall(29, (uint64_t)pathname, 0, 0, 0, 0);
 }
 
 int rename(const char* oldpath, const char* newpath) {

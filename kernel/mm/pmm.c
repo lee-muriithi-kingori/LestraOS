@@ -18,6 +18,14 @@ static size_t total_pages = 0;
 static size_t used_pages = 0;
 static uintptr_t highest_pfn = 0;   /* Highest page frame number */
 
+/* Physical page reference-count array (for COW fork).
+ * Indexed by page frame number; each entry tracks how many PTEs
+ * currently reference that physical page. When refcount drops to 0
+ * via pmm_refcount_dec(), the page can be freed by pmm_free_page().
+ * Set to 1 by pmm_alloc_page() for freshly allocated pages. */
+static uint32_t* phys_refcount = NULL;
+static size_t refcount_size = 0;   /* Size of refcount array in bytes */
+
 /* Convert physical address to page frame number */
 static inline size_t addr_to_pfn(phys_addr_t addr) {
     return addr / PAGE_SIZE;
@@ -139,10 +147,17 @@ void pmm_init(struct mmap_entry* mmap, uint32_t mmap_entries) {
         }
     }
 
-    /* Reserve the kernel and bitmap area */
+    /* Reserve the kernel, bitmap, and refcount area */
     extern char __kernel_start[];
     phys_addr_t kernel_phys_start = (phys_addr_t)__kernel_start;
-    phys_addr_t kernel_phys_end = ALIGN_UP(kernel_end + bitmap_size, PAGE_SIZE);
+
+    /* Allocate refcount array right after the bitmap.
+     * Each PFN needs a uint32_t (4 bytes). */
+    refcount_size = ALIGN_UP(highest_pfn * sizeof(uint32_t), PAGE_SIZE);
+    phys_refcount = (uint32_t*)(kernel_end + bitmap_size);
+    memset(phys_refcount, 0, refcount_size);
+
+    phys_addr_t kernel_phys_end = ALIGN_UP(kernel_end + bitmap_size + refcount_size, PAGE_SIZE);
     mark_region(kernel_phys_start, kernel_phys_end);
 
     /* Reserve first page (NULL pointer protection) */
@@ -162,6 +177,12 @@ phys_addr_t pmm_alloc_page(void) {
                 if (!bitmap_test(pfn)) {
                     bitmap_set(pfn);
                     used_pages++;
+                    /* Set initial refcount to 1: the freshly allocated
+                     * page has one owner (whatever called pmm_alloc_page).
+                     * For pages that end up in user PTEs, this refcount
+                     * will be incremented during COW fork and decremented
+                     * during COW fault resolution or process exit. */
+                    if (phys_refcount) phys_refcount[pfn] = 1;
                     return pfn * PAGE_SIZE;
                 }
             }
@@ -203,6 +224,9 @@ void pmm_free_page(phys_addr_t addr) {
     if (pfn < highest_pfn && bitmap_test(pfn)) {
         bitmap_clear(pfn);
         used_pages--;
+        /* Clear refcount when freeing: ensures consistency if the page
+         * is later re-allocated (pmm_alloc_page will set it to 1). */
+        if (phys_refcount) phys_refcount[pfn] = 0;
     }
 }
 
@@ -232,4 +256,45 @@ void pmm_reserve_region(uintptr_t start, uintptr_t end) {
     pr_info("PMM: reserved region 0x%x - 0x%x (%u MB)\n",
             (unsigned)start, (unsigned)end,
             (unsigned)((end - start) / MiB));
+}
+
+/* ---- Physical page reference-count functions (for COW fork) ---- */
+
+void pmm_refcount_init(void) {
+    /* The array was already placed and zeroed during pmm_init().
+     * This function exists for explicit initialization if needed,
+     * but is currently a no-op since pmm_init handles it. */
+    pr_info("PMM: refcount array at 0x%x, size %u KB (%u entries)\n",
+            (unsigned)(uintptr_t)phys_refcount,
+            (unsigned)(refcount_size / 1024),
+            (unsigned)highest_pfn);
+}
+
+void pmm_refcount_inc(phys_addr_t addr) {
+    if (!phys_refcount || addr == 0) return;
+    size_t pfn = addr_to_pfn(addr);
+    if (pfn < highest_pfn) {
+        phys_refcount[pfn]++;
+    }
+}
+
+/* Decrement refcount for a physical page. Returns the new refcount.
+ * If it returns 0, the caller should free the page via pmm_free_page()
+ * (unless they are the sole owner just clearing COW, in which case
+ * the page stays allocated with refcount implicitly reset to 1). */
+uint32_t pmm_refcount_dec(phys_addr_t addr) {
+    if (!phys_refcount || addr == 0) return 0;
+    size_t pfn = addr_to_pfn(addr);
+    if (pfn < highest_pfn && phys_refcount[pfn] > 0) {
+        phys_refcount[pfn]--;
+        return phys_refcount[pfn];
+    }
+    return 0;
+}
+
+uint32_t pmm_refcount_get(phys_addr_t addr) {
+    if (!phys_refcount || addr == 0) return 0;
+    size_t pfn = addr_to_pfn(addr);
+    if (pfn < highest_pfn) return phys_refcount[pfn];
+    return 0;
 }

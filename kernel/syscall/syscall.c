@@ -32,6 +32,7 @@
 #include <lestra/mm.h>
 #include <lestra/sched.h>
 #include <lestra/vfs.h>
+#include <lestra/pipe.h>
 #include <string.h>
 
 /* errno constants used by syscalls. Mirror libc/include/errno.h if
@@ -52,6 +53,8 @@
 #define EROFS          30
 #define ECHILD         10
 #define EAGAIN         11
+#define ESPIPE         29   /* Illegal seek (on pipe/terminal) */
+#define EMFILE         24   /* Too many open files */
 
 /* LestraOS syscall numbers — must match kernel/include/lestra/syscall.h
  * and libc/include/unistd.h. Declared here as well so the linux_compat
@@ -86,6 +89,7 @@
 #define LESTRA_SYS_RT_SIGPROCMASK  26
 #define LESTRA_SYS_RT_SIGRETURN    27
 #define LESTRA_SYS_DUP2            28
+#define LESTRA_SYS_UNLINK           29
 
 /* Forward declarations for the Linux compatibility shim and signal
  * delivery. Both live in separate translation units (linux_compat.c
@@ -156,48 +160,178 @@ static int64_t sys_fork(void) {
     return (int64_t)proc_fork();
 }
 
-static int64_t sys_read(int64_t fd, void* buf, size_t count) {
+static int64_t sys_read(int64_t fd_num, void* buf, size_t count) {
     if (!buf || count == 0) return -EFAULT;
-    /* stdin (fd 0) reads from keyboard — same as before. */
-    if (fd == 0) {
-        char* cbuf = (char*)buf;
-        for (size_t i = 0; i < count; i++) {
-            cbuf[i] = keyboard_getchar();
-        }
-        return (int64_t)count;
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    switch (entry->type) {
+        case FD_SPECIAL:
+            /* stdin (fd 0) reads from keyboard */
+            if (fd_num == 0) {
+                char* cbuf = (char*)buf;
+                for (size_t i = 0; i < count; i++) {
+                    cbuf[i] = keyboard_getchar();
+                }
+                return (int64_t)count;
+            }
+            /* stdout/stderr cannot be read */
+            return -EBADF;
+
+        case FD_VFS:
+            /* Try positional read (memfs). Falls back to sequential
+             * read for ext2/procfs/devfs that don't support offsets. */
+            ssize_t n = vfs_read_at(entry->resource, buf, count, entry->offset);
+            if (n >= 0) {
+                entry->offset += n;
+                return (int64_t)n;
+            }
+            /* vfs_read_at returned -1 (unsupported fd type or EOF on
+             * empty file). Try vfs_read which handles ext2/procfs/devfs. */
+            n = vfs_read(entry->resource, buf, count);
+            return (n < 0) ? -EIO : (int64_t)n;
+
+        case FD_PIPE:
+            /* pipe: read from pipe endpoint (blocking I/O) */
+            return (int64_t)pipe_read(entry->resource, buf, count);
+
+        default:
+            return -EBADF;
     }
-    /* Any other fd routes through VFS. */
-    ssize_t n = vfs_read((int)fd, buf, count);
-    return (n < 0) ? -EIO : (int64_t)n;
 }
 
-static int64_t sys_write(int64_t fd, const void* buf, size_t count) {
+static int64_t sys_write(int64_t fd_num, const void* buf, size_t count) {
     if (!buf || count == 0) return -EFAULT;
-    /* stdout/stderr go to VGA+serial. */
-    if (fd == 1 || fd == 2) {
-        const char* cbuf = (const char*)buf;
-        for (size_t i = 0; i < count; i++) {
-            if (cbuf[i] == '\n') {
-                vga_putchar('\r');
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    switch (entry->type) {
+        case FD_SPECIAL:
+            /* stdout/stderr go to VGA+serial */
+            if (fd_num == 1 || fd_num == 2) {
+                const char* cbuf = (const char*)buf;
+                for (size_t i = 0; i < count; i++) {
+                    if (cbuf[i] == '\n') {
+                        vga_putchar('\r');
+                    }
+                    vga_putchar(cbuf[i]);
+                    serial_default_putchar(cbuf[i]);
+                }
+                return (int64_t)count;
             }
-            vga_putchar(cbuf[i]);
-            serial_default_putchar(cbuf[i]);
-        }
-        return (int64_t)count;
+            /* stdin cannot be written */
+            return -EBADF;
+
+        case FD_VFS:
+            /* O_APPEND: if the fd was opened with O_APPEND, seek to
+             * end before writing (POSIX semantics). For memfs files we
+             * can use vfs_lseek to get the file size. */
+            if (entry->flags & O_APPEND) {
+                off_t end = vfs_lseek(entry->resource, 0, 2);  /* SEEK_END */
+                if (end >= 0) entry->offset = end;
+            }
+            /* Try positional write (memfs). Falls back to sequential
+             * write for ext2/procfs/devfs that don't support offsets. */
+            ssize_t n = vfs_write_at(entry->resource, buf, count, entry->offset);
+            if (n >= 0) {
+                entry->offset += n;
+                return (int64_t)n;
+            }
+            /* vfs_write_at returned -1 (unsupported fd type). Try
+             * vfs_write which handles ext2/procfs/devfs. */
+            n = vfs_write(entry->resource, buf, count);
+            return (n < 0) ? -EIO : (int64_t)n;
+
+        case FD_PIPE:
+            /* pipe: write to pipe endpoint (blocking I/O) */
+            return (int64_t)pipe_write(entry->resource, buf, count);
+
+        default:
+            return -EBADF;
     }
-    /* Any other fd routes through VFS. */
-    ssize_t n = vfs_write((int)fd, buf, count);
-    return (n < 0) ? -EIO : (int64_t)n;
 }
 
 static int64_t sys_open(const char* path, int flags) {
     if (!path) return -EFAULT;
-    int fd = vfs_open(path, flags);
-    return (fd < 0) ? -ENOENT : (int64_t)fd;
+    struct process* cur = task_current();
+    if (!cur) return -EFAULT;
+
+    /* Resolve relative paths against the per-process CWD.
+     * If the path doesn't start with '/', prepend the CWD. */
+    char resolved[MAX_PATH_LEN];
+    if (path[0] != '/') {
+        /* Relative path: prepend cwd */
+        size_t cwd_len = strlen(cwd);
+        size_t path_len = strlen(path);
+        /* Handle "./" prefix — just strip it */
+        if (path[0] == '.' && (path[1] == '/' || path[1] == '\0')) {
+            path += 1;
+            if (*path == '/') path++;
+            path_len = strlen(path);
+        }
+        if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+        memcpy(resolved, cwd, cwd_len);
+        if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
+            resolved[cwd_len] = '/';
+            cwd_len++;
+        }
+        memcpy(resolved + cwd_len, path, path_len + 1);
+        path = resolved;
+    }
+
+    /* Find a free fd slot (starting from 3, since 0-2 are reserved) */
+    int local_fd = -1;
+    for (int i = 3; i < MAX_FD_PER_PROC; i++) {
+        if (cur->fds[i].type == FD_UNUSED) {
+            local_fd = i;
+            break;
+        }
+    }
+    if (local_fd < 0) return -EMFILE;
+
+    /* Open the file in VFS to get a global VFS fd */
+    int vfs_fd = vfs_open(path, flags);
+    if (vfs_fd < 0) return -ENOENT;
+
+    /* Set up the per-process fd entry */
+    cur->fds[local_fd].type = FD_VFS;
+    cur->fds[local_fd].resource = vfs_fd;
+    cur->fds[local_fd].offset = 0;
+    cur->fds[local_fd].flags = flags;
+
+    return (int64_t)local_fd;
 }
 
-static int64_t sys_close(int64_t fd) {
-    vfs_close((int)fd);
+static int64_t sys_close(int64_t fd_num) {
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    /* Close the underlying resource */
+    if (entry->type == FD_VFS) {
+        vfs_close(entry->resource);
+    } else if (entry->type == FD_PIPE) {
+        pipe_close(entry->resource);
+    }
+    /* FD_SPECIAL (stdin/stdout/stderr) has no underlying resource to close */
+
+    /* Mark fd as unused */
+    entry->type = FD_UNUSED;
+    entry->resource = 0;
+    entry->offset = 0;
+    entry->flags = 0;
+
     return 0;
 }
 
@@ -331,8 +465,7 @@ static int64_t sys_chdir(const char* path) {
 }
 
 static int64_t sys_mkdir(const char* path, uint32_t mode) {
-    (void)mode;
-    int rc = vfs_mkdir(path, 0755);
+    int rc = vfs_mkdir(path, mode ? (mode & 0777) : 0755);
     return (rc < 0) ? -EROFS : 0;
 }
 
@@ -348,38 +481,66 @@ static int64_t sys_stat(const char* path, void* st) {
     return (rc < 0) ? -ENOENT : 0;
 }
 
-static int64_t sys_lseek(int64_t fd, off_t offset, int whence) {
-    /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
-     * We track per-fd offsets in a small static array because the
-     * current VFS implementation reads from offset 0 every time.
-     * Future: thread the offset through vfs_read/vfs_write. */
-    static off_t fd_offsets[128];
-    int idx = (int)fd;
-    if (idx < 0 || idx >= 128) return -EBADF;
-    /* VFS files don't expose their size to us here, so SEEK_END
-     * approximates by reading until EOF (slow but correct). For now
-     * we just treat SEEK_END as a no-op returning current offset. */
+static int64_t sys_lseek(int64_t fd_num, off_t offset, int whence) {
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+
+    /* Pipes and special fds don't support seeking */
+    if (entry->type == FD_SPECIAL || entry->type == FD_PIPE) return -ESPIPE;
+
+    /* For VFS files, compute new offset from per-process entry */
     off_t base;
     switch (whence) {
-        case 0: base = 0; break;
-        case 1: base = fd_offsets[idx]; break;
-        case 2: base = 0; offset = 0; break;  /* see comment above */
+        case 0: base = 0; break;                /* SEEK_SET */
+        case 1: base = entry->offset; break;    /* SEEK_CUR */
+        case 2: /* SEEK_END — need file size from VFS */
+            base = vfs_lseek(entry->resource, 0, 2);
+            if (base < 0) return -EINVAL;
+            break;
         default: return -EINVAL;
     }
-    fd_offsets[idx] = base + offset;
-    return (int64_t)fd_offsets[idx];
+
+    off_t new_off = base + offset;
+    if (new_off < 0) return -EINVAL;
+    entry->offset = new_off;
+    return (int64_t)new_off;
 }
 
-static int64_t sys_getdents(int64_t fd, void* dirp, size_t count) {
+static int64_t sys_unlink(const char* path) {
+    if (!path) return -EFAULT;
+    int rc = vfs_unlink(path);
+    return (rc < 0) ? -ENOENT : 0;
+}
+
+static int64_t sys_getdents(int64_t fd_num, void* dirp, size_t count) {
     /* VFS exposes vfs_readdir one entry at a time. We pack as many
-     * struct dirent entries as fit in the user buffer. */
+     * struct dirent entries as fit in the user buffer.
+     *
+     * With the per-process fd table, the local fd must be mapped to
+     * the VFS resource via cur->fds[fd_num].resource. */
     if (!dirp || count == 0) return -EINVAL;
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
+
+    struct fd_entry* entry = &cur->fds[fd_num];
+    if (entry->type == FD_UNUSED) return -EBADF;
+    if (entry->type != FD_VFS) return -EINVAL;  /* only VFS fds support getdents */
+
+    int vfs_fd = entry->resource;
     struct dirent* out = (struct dirent*)dirp;
     size_t bytes = 0;
     int idx = 0;
     while (bytes + sizeof(struct dirent) <= count) {
-        int rc = vfs_readdir((int)fd, &out[idx]);
-        if (rc <= 0) break;
+        int rc = vfs_readdir(vfs_fd, &out[idx]);
+        /* vfs_readdir returns 0 on success, -1 on end-of-directory.
+         * The old code used "rc <= 0" which treated success (0) as
+         * end-of-directory — that was a bug. Fixed to "rc < 0". */
+        if (rc < 0) break;
         idx++;
         bytes += sizeof(struct dirent);
     }
@@ -406,21 +567,67 @@ static int64_t sys_uname(void* buf) {
 
 static int64_t sys_pipe(int* user_fds) {
     if (!user_fds) return -EFAULT;
-    int fds[2];
-    int rc = pipe_create(fds);
+    struct process* cur = task_current();
+    if (!cur) return -EFAULT;
+
+    /* Find two free fd slots for the pipe read and write ends */
+    int fd_read = -1, fd_write = -1;
+    for (int i = 0; i < MAX_FD_PER_PROC; i++) {
+        if (cur->fds[i].type == FD_UNUSED) {
+            if (fd_read < 0) fd_read = i;
+            else if (fd_write < 0) { fd_write = i; break; }
+        }
+    }
+    if (fd_read < 0 || fd_write < 0) return -EMFILE;
+
+    /* Create the pipe (returns global pipe fds in pipe_fds[2]) */
+    int pipe_fds[2];
+    int rc = pipe_create(pipe_fds);
     if (rc < 0) return -1;
-    user_fds[0] = fds[0];
-    user_fds[1] = fds[1];
+
+    /* Set up per-process fd entries */
+    cur->fds[fd_read].type = FD_PIPE;
+    cur->fds[fd_read].resource = pipe_fds[0];  /* read end */
+    cur->fds[fd_read].offset = 0;
+    cur->fds[fd_read].flags = O_RDONLY;
+
+    cur->fds[fd_write].type = FD_PIPE;
+    cur->fds[fd_write].resource = pipe_fds[1];  /* write end */
+    cur->fds[fd_write].offset = 0;
+    cur->fds[fd_write].flags = O_WRONLY;
+
+    user_fds[0] = fd_read;
+    user_fds[1] = fd_write;
     return 0;
 }
 
 static int64_t sys_dup2(int oldfd, int newfd) {
-    if (oldfd == newfd) return newfd;
-    /* Minimal dup2: close newfd if open, then make newfd point to same underlying resource.
-     * For now, just return newfd if oldfd is valid. A real implementation would
-     * need per-process fd tables. */
-    if (oldfd < 0) return -EBADF;
-    return newfd;
+    struct process* cur = task_current();
+    if (!cur) return -EBADF;
+    if (oldfd < 0 || oldfd >= MAX_FD_PER_PROC) return -EBADF;
+    if (newfd < 0 || newfd >= MAX_FD_PER_PROC) return -EBADF;
+    if (oldfd == newfd) {
+        /* POSIX: if oldfd is valid, return newfd without closing it */
+        if (cur->fds[oldfd].type == FD_UNUSED) return -EBADF;
+        return (int64_t)newfd;
+    }
+
+    struct fd_entry* old_entry = &cur->fds[oldfd];
+    if (old_entry->type == FD_UNUSED) return -EBADF;
+
+    /* Close newfd if it's currently open */
+    if (cur->fds[newfd].type != FD_UNUSED) {
+        if (cur->fds[newfd].type == FD_VFS) {
+            vfs_close(cur->fds[newfd].resource);
+        } else if (cur->fds[newfd].type == FD_PIPE) {
+            pipe_close(cur->fds[newfd].resource);
+        }
+    }
+
+    /* Copy oldfd's fd entry to newfd (both now share the same resource) */
+    cur->fds[newfd] = *old_entry;
+
+    return (int64_t)newfd;
 }
 
 void syscall_init(void) {
@@ -496,6 +703,7 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
         case LESTRA_SYS_RT_SIGPROCMASK:  ret = signal_sigprocmask((int)a1, a2, a3, a4); break;
         case LESTRA_SYS_RT_SIGRETURN:    ret = signal_sigreturn(); break;
         case LESTRA_SYS_DUP2:            ret = sys_dup2((int)a1, (int)a2); break;
+        case LESTRA_SYS_UNLINK:       ret = sys_unlink((const char*)a1); break;
         default:
             pr_warn("Unknown syscall: %u\n", (unsigned)num);
             ret = -ENOSYS;

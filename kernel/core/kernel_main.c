@@ -283,6 +283,9 @@ void kernel_main(void* mb2_info) {
     vmm_init();
     heap_init();
 
+    /* Initialize physical page reference counting (for COW fork) */
+    pmm_refcount_init();
+
     /* Initialize scheduler */
     sched_init();
 

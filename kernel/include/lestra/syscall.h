@@ -38,7 +38,8 @@
 #define SYS_RT_SIGPROCMASK  26
 #define SYS_RT_SIGRETURN    27
 #define SYS_DUP2            28
-#define SYS_MAX             29
+#define SYS_UNLINK           29
+#define SYS_MAX             30
 
 /* Syscall handler */
 void syscall_init(void);

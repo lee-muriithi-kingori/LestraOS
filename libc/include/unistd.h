@@ -52,7 +52,8 @@ typedef int32_t pid_t;
 #define SYS_RT_SIGPROCMASK  26
 #define SYS_RT_SIGRETURN    27
 #define SYS_DUP2            28
-#define SYS_MAX             29
+#define SYS_UNLINK           29
+#define SYS_MAX             30
 
 /* Process */
 pid_t fork(void);
@@ -82,6 +83,11 @@ int rmdir(const char* pathname);
 /* Sleep */
 unsigned int sleep(unsigned int seconds);
 int usleep(unsigned int usec);
+
+/* Seek constants (whence values for lseek) */
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
 
 /* Misc */
 int access(const char* pathname, int mode);

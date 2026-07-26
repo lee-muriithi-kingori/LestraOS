@@ -9,7 +9,7 @@
  *   cpuinfo, meminfo, neofetch, ui, theme, install, test
  *   pkg install/remove/list/search/info
  *   ai keys set/list/clear, ai chat, ai tools, ai agents
- *   file ls/cat/write/rm
+ *   file ls/cat/write/mkdir/rm/stat
  *   exec <user-binary-name>  (looks up in VFS)
  */
 
@@ -107,6 +107,7 @@ static void cmd_help(void) {
     printk("    clear        Clear screen\n");
     printk("    reboot       Reboot system\n");
     printk("    shutdown     Shutdown system\n");
+    printk("    mount        Show mounted filesystems / mount ext2\n");
     printk("\n");
     printk("  UI:\n");
     printk("    ui           Launch UI menu\n");
@@ -160,9 +161,12 @@ static void cmd_help(void) {
     printk("    lee net dhcp                      Switch to DHCP\n");
     printk("\n");
     printk("  Files (file):\n");
-    printk("    file ls                 List files in VFS\n");
+    printk("    file ls [path]          List files in directory (default: /)\n");
     printk("    file cat <path>         Show file contents\n");
     printk("    file write <p> <text>   Write text to a file\n");
+    printk("    file mkdir <path>       Create a directory\n");
+    printk("    file rm <path>          Remove a file\n");
+    printk("    file stat <path>        Show file info\n");
     printk("\n");
     printk("  Other:\n");
     printk("    lee          Sandbox and service manager\n");
@@ -247,17 +251,460 @@ void cmd_reboot(void) {
     while (1) { hlt(); }
 }
 
+/* ----- ACPI shutdown helpers ------------------------------------------- */
+
+/*
+ * Real ACPI shutdown: scan PCI bus for PIIX4 PM device, search memory
+ * for the ACPI RSDP, walk RSDT/XSDT → FACP → extract PM1a_CNT_BLK
+ * port address, then write SLP_EN + SLP_TYP(S5) to trigger soft-off.
+ *
+ * If ACPI tables are not found (e.g. very old hardware), fall back to
+ * the QEMU/Bochs-specific port writes that the previous code used.
+ */
+
+/* PCI config space access (type 1 mechanism) */
+#define PCI_CONFIG_ADDR  0xCF8
+#define PCI_CONFIG_DATA  0xCFC
+
+static uint32_t pci_read_config(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
+    uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (reg & 0xFC);
+    outl(PCI_CONFIG_ADDR, addr);
+    return inl(PCI_CONFIG_DATA);
+}
+
+static void pci_write_config(uint8_t bus, uint8_t dev, uint8_t func,
+                             uint8_t reg, uint32_t val) {
+    uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (reg & 0xFC);
+    outl(PCI_CONFIG_ADDR, addr);
+    outl(PCI_CONFIG_DATA, val);
+}
+
+/* Scan PCI bus 0 for ACPI PM device (Intel PIIX4/ICH).
+ * Vendor 8086, device 7000 (PIIX4) or 7113 (PIIX4E/ICH0 ACPI).
+ * Returns: PM base I/O address from config register, or 0 if not found. */
+static uint16_t pci_find_acpi_pm_base(void) {
+    for (uint8_t dev = 0; dev < 32; dev++) {
+        for (uint8_t func = 0; func < 8; func++) {
+            uint32_t id = pci_read_config(0, dev, func, 0);
+            uint16_t vendor = id & 0xFFFF;
+            uint16_t device = (id >> 16) & 0xFFFF;
+
+            /* Intel PIIX4 / ICH ACPI PM device */
+            if (vendor == 0x8086 && (device == 0x7000 || device == 0x7113)) {
+                /* PM base is in PCI config register 0x40 (PIIX4) or 0x48 (ICH).
+                 * Bits [15:7] = base address, bits [6:0] = reserved/zero.
+                 * Mask out the low bits to get the I/O port base. */
+                uint32_t pm_reg = pci_read_config(0, dev, func, 0x40);
+                uint16_t pm_base = (uint16_t)((pm_reg & 0xFF80) >> 0);
+                /* PIIX4 PM1a_CNT_BLK = pm_base + 0x04 */
+                pr_info("acpi: found Intel PIIX4 ACPI (bus=0,dev=%d,func=%d,dev_id=0x%x)\n",
+                        dev, func, device);
+                pr_info("acpi: PM base = 0x%x, PM1a_CNT = 0x%x\n",
+                        pm_base, pm_base + 4);
+                return pm_base;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ----- ACPI table structures ----- */
+
+/* RSDP (Root System Description Pointer) — signature "RSD PTR " */
+struct acpi_rsdp {
+    char     signature[8];      /* "RSD PTR " */
+    uint8_t  checksum;
+    char     oem_id[6];
+    uint8_t  revision;          /* 0 = ACPI 1.0 (RSDT), 2+ = ACPI 2.0+ (XSDT) */
+    uint32_t rsdt_address;      /* 32-bit physical address of RSDT */
+    uint32_t length;            /* XSDT length (ACPI 2.0+) */
+    uint64_t xsdt_address;      /* 64-bit physical address of XSDT (ACPI 2.0+) */
+    uint8_t  ext_checksum;
+    uint8_t  reserved[3];
+} __packed;
+
+/* Common ACPI table header (first 36 bytes of every ACPI table) */
+struct acpi_header {
+    char     signature[4];      /* e.g. "FACP" */
+    uint32_t length;
+    uint8_t  revision;
+    uint8_t  checksum;
+    char     oem_id[6];
+    char     oem_table_id[8];
+    uint32_t oem_revision;
+    char     creator_id[4];
+    uint32_t creator_revision;
+} __packed;
+
+/* FACP (Fixed ACPI Description Table) — signature "FACP"
+ *
+ * Byte layout must match the ACPI spec exactly (see ACPI spec §5.2.9).
+ * All offsets are relative to the start of the table:
+ *   0-35:   Standard ACPI header (36 bytes)
+ *   36-39:  FIRMWARE_CTRL (uint32_t)
+ *   40-43:  DSDT (uint32_t)
+ *   44:     PREFERRED_PM_PROFILE (uint8_t, was "model" in ACPI 1.0)
+ *   45:     Reserved (uint8_t, must be 0)
+ *   46-47:  SCI_INT (uint16_t)
+ *   48-51:  SMI_CMD (uint32_t)
+ *   52:     ACPI_ENABLE (uint8_t)
+ *   53:     ACPI_DISABLE (uint8_t)
+ *   54:     S4BIOS_REQ (uint8_t)
+ *   55:     PSTATE_CNT (uint8_t)
+ *   56-59:  PM1a_EVT_BLK (uint32_t)
+ *   60-63:  PM1b_EVT_BLK (uint32_t)
+ *   64-67:  PM1a_CNT_BLK (uint32_t)
+ *   ... (rest of FACP fields follow)
+ */
+struct acpi_fadt {
+    struct acpi_header header;
+    uint32_t firmware_ctrl;      /* FACS address (32-bit) */
+    uint32_t dsdt;               /* DSDT address (32-bit) */
+    uint8_t  preferred_pm_profile; /* ACPI 1.0 model / 2.0+ preferred profile */
+    uint8_t  reserved1;          /* Reserved (must be 0) */
+    uint16_t sci_int;            /* SCI interrupt vector */
+    uint32_t smi_cmd;            /* SMI command port */
+    uint8_t  acpi_enable;        /* Value to write to SMI_CMD to enable ACPI */
+    uint8_t  acpi_disable;       /* Value to write to SMI_CMD to disable ACPI */
+    uint8_t  s4bios_req;
+    uint8_t  pstate_cnt;
+    uint32_t pm1a_evt_blk;       /* PM1a Event Block I/O port */
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;       /* PM1a Control Block I/O port — THIS IS WHAT WE NEED */
+    uint32_t pm1b_cnt_blk;
+    uint32_t pm2_cnt_blk;
+    uint32_t pm_tmr_blk;
+    uint32_t gpe0_blk;
+    uint32_t gpe1_blk;
+    uint8_t  pm1_evt_len;
+    uint8_t  pm1_cnt_len;        /* Width of PM1_CNT register (usually 2) */
+    uint8_t  pm2_cnt_len;
+    uint8_t  pm_tmr_len;
+    uint8_t  gpe0_blk_len;
+    uint8_t  gpe1_blk_len;
+    uint8_t  gpe1_base;
+    uint8_t  cst_cnt;
+    uint16_t p_lvl2_lat;
+    uint16_t p_lvl3_lat;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t  duty_offset;
+    uint8_t  duty_width;
+    uint8_t  day_alrm;
+    uint8_t  mon_alrm;
+    uint8_t  century;
+    /* ACPI 2.0+ extensions */
+    uint16_t iapc_boot_arch;
+    uint8_t  reserved2;
+    uint32_t flags;
+    /* More fields for ACPI 2.0+ (RESET_REG, RESET_VALUE, etc.) that we don't need */
+} __packed;
+
+/* Calculate simple ACPI checksum (sum of all bytes must be 0 mod 256) */
+static int acpi_checksum_valid(const void* table, uint32_t len) {
+    const uint8_t* p = (const uint8_t*)table;
+    uint8_t sum = 0;
+    for (uint32_t i = 0; i < len; i++)
+        sum += p[i];
+    return (sum == 0);
+}
+
+/* Search for RSDP in memory.
+ * Standard locations: (1) first 1KB of EBDA, (2) BIOS ROM 0xE0000–0xFFFFF.
+ * The EBDA base address is stored as a 16-bit segment at real-mode address 0x40E.
+ * In our flat memory model, that segment << 4 gives the physical address. */
+static const struct acpi_rsdp* find_rsdp(void) {
+    /* Method 1: Search EBDA (Extended BIOS Data Area) */
+    /* Address 0x40E contains the EBDA segment (real-mode). Convert to physical:
+     * physical = segment << 4. We read the 16-bit value at 0x40E. */
+    uint16_t ebda_seg = *(volatile uint16_t*)(uintptr_t)0x40E;
+    uintptr_t ebda_base = (uintptr_t)ebda_seg << 4;
+    if (ebda_base >= 0x400 && ebda_base < 0xA0000) {
+        /* Search first 1KB of EBDA for "RSD PTR " signature */
+        for (uintptr_t addr = ebda_base; addr < ebda_base + 1024; addr += 16) {
+            const struct acpi_rsdp* rsdp = (const struct acpi_rsdp*)addr;
+            if (rsdp->signature[0] == 'R' && rsdp->signature[1] == 'S' &&
+                rsdp->signature[2] == 'D' && rsdp->signature[3] == ' ' &&
+                rsdp->signature[4] == 'P' && rsdp->signature[5] == 'T' &&
+                rsdp->signature[6] == 'R' && rsdp->signature[7] == ' ') {
+                /* Verify checksum (first 20 bytes for ACPI 1.0) */
+                if (acpi_checksum_valid(rsdp, 20)) {
+                    pr_info("acpi: RSDP found in EBDA at 0x%x (rev=%d)\n",
+                            (unsigned)addr, rsdp->revision);
+                    return rsdp;
+                }
+            }
+        }
+    }
+
+    /* Method 2: Search BIOS ROM area (0xE0000 – 0xFFFFF) */
+    for (uintptr_t addr = 0xE0000; addr < 0xFFFFF; addr += 16) {
+        const struct acpi_rsdp* rsdp = (const struct acpi_rsdp*)addr;
+        if (rsdp->signature[0] == 'R' && rsdp->signature[1] == 'S' &&
+            rsdp->signature[2] == 'D' && rsdp->signature[3] == ' ' &&
+            rsdp->signature[4] == 'P' && rsdp->signature[5] == 'T' &&
+            rsdp->signature[6] == 'R' && rsdp->signature[7] == ' ') {
+            if (acpi_checksum_valid(rsdp, 20)) {
+                pr_info("acpi: RSDP found in BIOS ROM at 0x%x (rev=%d)\n",
+                        (unsigned)addr, rsdp->revision);
+                return rsdp;
+            }
+        }
+    }
+
+    pr_info("acpi: RSDP not found in memory\n");
+    return NULL;
+}
+
+/* Walk RSDT/XSDT to find the FACP table.
+ * Returns pointer to FACP (in physical memory), or NULL. */
+static const struct acpi_fadt* find_fadt(const struct acpi_rsdp* rsdp) {
+    if (!rsdp) return NULL;
+
+    const struct acpi_header* table = NULL;
+
+    if (rsdp->revision >= 2 && rsdp->xsdt_address) {
+        /* ACPI 2.0+: use XSDT (64-bit address) */
+        table = (const struct acpi_header*)(uintptr_t)rsdp->xsdt_address;
+        if (table->signature[0] != 'X' || table->signature[1] != 'S' ||
+            table->signature[2] != 'D' || table->signature[3] != 'T') {
+            pr_warn("acpi: XSDT signature mismatch, trying RSDT\n");
+            table = NULL;
+        }
+    }
+
+    if (!table && rsdp->rsdt_address) {
+        /* ACPI 1.0 or fallback: use RSDT (32-bit address) */
+        table = (const struct acpi_header*)(uintptr_t)rsdp->rsdt_address;
+        if (table->signature[0] != 'R' || table->signature[1] != 'S' ||
+            table->signature[2] != 'D' || table->signature[3] != 'T') {
+            pr_warn("acpi: RSDT signature mismatch\n");
+            return NULL;
+        }
+    }
+
+    if (!table) {
+        pr_warn("acpi: no RSDT/XSDT address in RSDP\n");
+        return NULL;
+    }
+
+    /* Verify table checksum */
+    if (!acpi_checksum_valid(table, table->length)) {
+        pr_warn("acpi: RSDT/XSDT checksum invalid\n");
+        return NULL;
+    }
+
+    /* Walk entries: RSDT has 32-bit entries, XSDT has 64-bit entries */
+    uint32_t entry_size = (rsdp->revision >= 2 && rsdp->xsdt_address) ? 8 : 4;
+    uint32_t entry_count = (table->length - sizeof(struct acpi_header)) / entry_size;
+
+    pr_info("acpi: walking %u entries in %s (len=%u)\n",
+            entry_count,
+            (entry_size == 8) ? "XSDT" : "RSDT",
+            table->length);
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uintptr_t entry_addr;
+        if (entry_size == 8) {
+            /* XSDT: 64-bit entries (we only use low 32 bits for safety) */
+            const uint64_t* entries = (const uint64_t*)(table + 1);
+            entry_addr = (uintptr_t)entries[i];
+        } else {
+            /* RSDT: 32-bit entries */
+            const uint32_t* entries = (const uint32_t*)(table + 1);
+            entry_addr = (uintptr_t)entries[i];
+        }
+
+        const struct acpi_header* hdr = (const struct acpi_header*)entry_addr;
+        if (hdr->signature[0] == 'F' && hdr->signature[1] == 'A' &&
+            hdr->signature[2] == 'C' && hdr->signature[3] == 'P') {
+            pr_info("acpi: FACP found at 0x%x (len=%u)\n",
+                    (unsigned)entry_addr, hdr->length);
+            return (const struct acpi_fadt*)hdr;
+        }
+    }
+
+    pr_warn("acpi: FACP table not found in RSDT/XSDT\n");
+    return NULL;
+}
+
+/* Attempt to extract S5 sleep type from DSDT by searching for the _S5
+ * package in the raw AML bytecode. This is a heuristic approach that
+ * avoids needing a full AML interpreter.
+ *
+ * The _S5 package typically looks like:
+ *   Name (_S5, Package () { <sleep_type>, <sleep_type>, 0, 0 })
+ * In AML bytecode this appears as:
+ *   08 5F 53 35 5F 12 ... (NameOp "_S5_" PackageOp ...)
+ *
+ * Returns: SLP_TYP value for S5 (typically 0-7), or -1 if not found. */
+static int find_s5_slp_type(const struct acpi_fadt* fadt) {
+    if (!fadt || !fadt->dsdt) return -1;
+
+    const struct acpi_header* dsdt = (const struct acpi_header*)(uintptr_t)fadt->dsdt;
+    if (dsdt->signature[0] != 'D' || dsdt->signature[1] != 'S' ||
+        dsdt->signature[2] != 'D' || dsdt->signature[3] != 'T') {
+        pr_info("acpi: DSDT signature mismatch\n");
+        return -1;
+    }
+
+    uint32_t dsdt_len = dsdt->length;
+    const uint8_t* aml = (const uint8_t*)((uintptr_t)dsdt + sizeof(struct acpi_header));
+    uint32_t aml_len = dsdt_len - sizeof(struct acpi_header);
+
+    /* Search for "_S5_" name in AML: 08 5F 53 35 5F (NameOp + "_S5_") */
+    for (uint32_t i = 0; i < aml_len - 5; i++) {
+        if (aml[i]   == 0x08 &&  /* NameOp */
+            aml[i+1] == 0x5F &&  /* '_' */
+            aml[i+2] == 0x53 &&  /* 'S' */
+            aml[i+3] == 0x35 &&  /* '5' */
+            aml[i+4] == 0x5F) {  /* '_' */
+            /* Found "_S5_" name. Next should be a Package:
+             * 0x12 (PackageOp) followed by encoded elements.
+             * The first element is the SLP_TYP value for S5. */
+            uint32_t j = i + 5;
+            if (j < aml_len && aml[j] == 0x12) {
+                /* PackageOp: skip package length encoding, find first data element.
+                 * AML package length encoding varies:
+                 *   If high 2 bits of byte P are 00: length = P & 0x3F, 1 byte total
+                 *   If 01: length = (P & 0x0F) | next_byte << 4, 2 bytes total
+                 *   If 10: length = next 2 bytes as little-endian + (P & 0x0F) << 16, 3 bytes
+                 *   If 11: length = next 4 bytes as little-endian, 5 bytes total
+                 */
+                j++;
+                uint8_t pkg_lead = aml[j];
+                uint8_t num_elements = aml[j+1];  /* element count */
+                uint32_t pkg_hdr_size = 2;  /* lead byte + element count byte */
+
+                /* Determine package length encoding */
+                uint8_t lead_high = (pkg_lead >> 6) & 3;
+                if (lead_high == 0) {
+                    /* 1-byte length */
+                    pkg_hdr_size = 2;
+                } else if (lead_high == 1) {
+                    /* 2-byte length */
+                    pkg_hdr_size = 3;
+                } else if (lead_high == 2) {
+                    /* 3-byte length */
+                    pkg_hdr_size = 4;
+                } else {
+                    /* 5-byte length */
+                    pkg_hdr_size = 6;
+                }
+
+                /* Skip past the package header to the first element */
+                j += pkg_hdr_size;
+
+                /* The first element is the SLP_TYP for S5.
+                 * AML encoding for a small integer (0-63): 0x00 | value
+                 * For a byte value (0-255): 0x0A then byte
+                 * The common values are 0, 1, 2, 5, 7. */
+                if (j < aml_len) {
+                    uint8_t elem = aml[j];
+                    if (elem <= 0x3F) {
+                        /* Small integer: value = elem itself */
+                        int slp_type = (int)elem;
+                        pr_info("acpi: _S5 SLP_TYP = %d (from DSDT AML)\n", slp_type);
+                        return slp_type;
+                    } else if (elem == 0x0A && j + 1 < aml_len) {
+                        /* Byte prefix: value is next byte */
+                        int slp_type = (int)aml[j+1];
+                        pr_info("acpi: _S5 SLP_TYP = %d (from DSDT AML byte)\n", slp_type);
+                        return slp_type;
+                    }
+                }
+            }
+        }
+    }
+
+    pr_info("acpi: _S5 package not found in DSDT\n");
+    return -1;
+}
+
+/* ----- ACPI shutdown implementation ----- */
+
 void cmd_shutdown(void) {
     printk("Shutting down...\n");
-    /* Try ACPI shutdown first (QEMU/Bochs/VirtualBox + most real HW
-     * since ~2005). The 16-bit PIIX4 PM control register at I/O 0x604
-     * accepts a write of 0x2000 to trigger S5 (soft-off). On older
-     * boxes (no ACPI), we fall back to the 8042 keyboard-controller
-     * reset — which reboots instead of powering off, but at least
-     * gets the user back to the bootloader. */
-    outw(0x604, 0x2000);          /* QEMU/Bochs ACPI shutdown */
-    outw(0xB004, 0x2000);         /* older ACPI shutdown register */
+
+    /* Strategy 1: Find ACPI tables and use proper PM1a_CNT_BLK shutdown.
+     * This works on real hardware with proper ACPI implementation. */
+
+    /* First try PCI scan for Intel PIIX4/ICH PM device */
+    uint16_t pci_pm_base = pci_find_acpi_pm_base();
+
+    /* Then try full ACPI RSDP → FACP path */
+    const struct acpi_rsdp* rsdp = find_rsdp();
+    const struct acpi_fadt* fadt = find_fadt(rsdp);
+
+    if (fadt && fadt->pm1a_cnt_blk) {
+        /* We found the real PM1a_CNT port from the ACPI FACP table! */
+        uint16_t pm1a_cnt = (uint16_t)fadt->pm1a_cnt_blk;
+        uint8_t  pm1_cnt_len = fadt->pm1_cnt_len;
+
+        /* Determine S5 sleep type.
+         * Try DSDT _S5 package first, then fall back to common defaults. */
+        int slp_type_s5 = find_s5_slp_type(fadt);
+        if (slp_type_s5 < 0) {
+            /* Common defaults per chipset:
+             * - Intel PIIX4/ICH: S5 SLP_TYP = 0
+             * - Most modern Intel: S5 SLP_TYP = 0 or 5
+             * - Some chipsets: S5 SLP_TYP = 1, 2, 7
+             * We'll try 0 first (covers most Intel + QEMU). */
+            slp_type_s5 = 0;
+            pr_info("acpi: using default S5 SLP_TYP = 0\n");
+        }
+
+        /* ACPI shutdown formula:
+         * PM1a_CNT value = (SLP_TYP << SLP_TYP_BIT_POSITION) | SLP_EN_BIT
+         * SLP_TYP_BIT_POSITION = 10 (bits [12:10] in PM1_CNT register)
+         * SLP_EN_BIT = bit 13
+         *
+         * For 16-bit PM1_CNT: value = (slp_type << 10) | (1 << 13)
+         * For 32-bit PM1_CNT (pm1_cnt_len == 4): same formula but write 32-bit.
+         */
+        uint16_t sleep_val = (uint16_t)((slp_type_s5 << 10) | (1 << 13));
+        pr_info("acpi: PM1a_CNT_BLK = 0x%x, writing 0x%x (SLP_TYP=%d, SLP_EN)\n",
+                pm1a_cnt, sleep_val, slp_type_s5);
+
+        /* Write to PM1a_CNT_BLK to trigger S5 shutdown */
+        if (pm1_cnt_len == 4) {
+            outl(pm1a_cnt, (uint32_t)sleep_val);
+        } else {
+            outw(pm1a_cnt, sleep_val);
+        }
+
+        /* Also write to PM1b_CNT_BLK if present */
+        if (fadt->pm1b_cnt_blk) {
+            uint16_t pm1b_cnt = (uint16_t)fadt->pm1b_cnt_blk;
+            if (pm1_cnt_len == 4)
+                outl(pm1b_cnt, (uint32_t)sleep_val);
+            else
+                outw(pm1b_cnt, sleep_val);
+        }
+
+        /* Wait a moment for the power-off to take effect */
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+
+    if (pci_pm_base) {
+        /* PCI-found PM base: PIIX4 PM1a_CNT = pm_base + 4.
+         * Try S5 shutdown via the PCI-discovered port. */
+        uint16_t pm1a_cnt = pci_pm_base + 4;
+        uint16_t sleep_val = (0 << 10) | (1 << 13);  /* SLP_TYP=0, SLP_EN */
+        pr_info("acpi: PCI PIIX4 PM1a_CNT = 0x%x, writing 0x%x\n",
+                pm1a_cnt, sleep_val);
+        outw(pm1a_cnt, sleep_val);
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+
+    /* Strategy 2: QEMU/Bochs/VirtualBox-specific port writes.
+     * These are the old hardcoded ports that work in emulators. */
+    outw(0x604, 0x2000);          /* QEMU/Bochs PIIX4 ACPI shutdown */
+    outw(0xB004, 0x2000);         /* older VirtualBox ACPI shutdown register */
     outw(0x4004, 0x3400);         /* Bochs/QEMU older ACPI */
+
     printk("ACPI shutdown failed; falling back to 8042 reset (reboot).\n");
     outb(0x64, 0xFE);
     while (1) { hlt(); }
@@ -805,56 +1252,115 @@ void cmd_disk(int argc, char** argv) {
 }
 
 void cmd_mount(int argc, char** argv) {
-    (void)argc; (void)argv;
-    extern int ext2_mount(void);
-    extern int ext2_is_mounted(void);
-    if (ext2_is_mounted()) {
-        printk("ext2 filesystem already mounted\n");
+    /* Show mount info or mount a filesystem. */
+    if (argc >= 3 && strcmp(argv[1], "ext2") == 0) {
+        /* Mount ext2 at the specified target path. */
+        int rc = vfs_mount(argv[2], argv[2], "ext2");
+        if (rc == 0) {
+            printk("ext2 filesystem mounted at %s\n", argv[2]);
+            /* Show the directory listing. */
+            int dirfd = vfs_open(argv[2], O_DIRECTORY);
+            if (dirfd < 0) dirfd = vfs_open(argv[2], O_RDONLY);
+            if (dirfd >= 0) {
+                struct dirent entry;
+                entry.inode = 0;
+                printk("Contents:\n");
+                while (vfs_readdir(dirfd, &entry) == 0) {
+                    const char* type_str = (entry.type == FT_DIRECTORY) ? "dir" : "file";
+                    printk("  [%s] %s\n", type_str, entry.name);
+                }
+                vfs_close(dirfd);
+            }
+        } else {
+            printk("Failed to mount ext2 filesystem.\n");
+        }
         return;
     }
-    printk("Attempting to mount ext2 filesystem...\n");
-    if (ext2_mount()) {
-        printk("ext2 filesystem mounted successfully!\n");
-        printk("Root directory listing:\n");
-        extern void ext2_list_root(void (*callback)(const char*, uint32_t, uint8_t));
-        /* Simple inline callback */
-        void list_cb(const char* name, uint32_t inode, uint8_t type) {
-            const char* type_str = "?";
-            if (type == 1) type_str = "file";
-            else if (type == 2) type_str = "dir";
-            printk("  [%s] %s (inode %u)\n", type_str, name, (unsigned)inode);
+
+    /* Default: mount ext2 at root. */
+    if (argc >= 2 && strcmp(argv[1], "ext2") == 0) {
+        int rc = vfs_mount("sda1", "/", "ext2");
+        if (rc == 0) {
+            printk("ext2 filesystem mounted at root (/)\n");
+            /* Show root directory listing. */
+            int dirfd = vfs_open("/", O_DIRECTORY);
+            if (dirfd < 0) dirfd = vfs_open("/", O_RDONLY);
+            if (dirfd >= 0) {
+                struct dirent entry;
+                entry.inode = 0;
+                printk("Root contents:\n");
+                while (vfs_readdir(dirfd, &entry) == 0) {
+                    const char* type_str = (entry.type == FT_DIRECTORY) ? "dir" : "file";
+                    printk("  [%s] %s\n", type_str, entry.name);
+                }
+                vfs_close(dirfd);
+            }
+        } else {
+            printk("ext2 filesystem already mounted or mount failed.\n");
         }
-        ext2_list_root(list_cb);
-    } else {
-        printk("Failed to mount ext2 filesystem.\n");
-        printk("Make sure QEMU has a disk attached with a valid ext2 filesystem.\n");
+        return;
+    }
+
+    /* No arguments: show current mount status. */
+    if (argc == 1) {
+        int mount_count = vfs_get_mount_count();
+        if (mount_count == 0) {
+            printk("No filesystems mounted (use 'mount ext2' to mount)\n");
+            return;
+        }
+        printk("Mounted filesystems:\n");
+        for (int i = 0; i < mount_count; i++) {
+            struct mount* m = vfs_get_mount(i);
+            if (m) {
+                const char* type_str = (m->fs_type == FS_TYPE_EXT2) ? "ext2" : "memfs";
+                printk("  %s at %s (%s)\n", type_str, m->path, type_str);
+            }
+        }
     }
 }
 
 /* ----- file subcommands ----------------------------------------------- */
 static void cmd_file(int argc, char** argv) {
     if (argc < 2) {
-        printk("Usage: file <ls|cat|write> [args]\n");
+        printk("Usage: file <ls|cat|write|mkdir|rm|stat> [args]\n");
         return;
     }
     if (strcmp(argv[1], "ls") == 0) {
-        /* List all files in VFS via vfs_readdir */
-        extern int vfs_readdir(int fd, struct dirent* entry);
-        printk("\nVFS files:\n");
+        /* List files in a directory via vfs_readdir.
+         * If a path argument is given, list that directory;
+         * otherwise list the root directory. */
+        const char* dir_path = "/";
+        if (argc >= 3) dir_path = argv[2];
+
+        /* Open the directory for reading. */
+        int dirfd = vfs_open(dir_path, O_DIRECTORY);
+        if (dirfd < 0) {
+            /* vfs_open on a directory may not work with O_DIRECTORY
+             * for memfs directories (they just return the idx+3 fd).
+             * Try without O_DIRECTORY as fallback. */
+            dirfd = vfs_open(dir_path, O_RDONLY);
+        }
+        if (dirfd < 0) {
+            printk("file: %s: not found or not a directory\n", dir_path);
+            return;
+        }
+
+        printk("\nContents of %s:\n", dir_path);
         struct dirent entry;
         entry.inode = 0;
         int count = 0;
-        while (vfs_readdir(0, &entry) == 0) {
-            printk("  %s\n", entry.name);
+        while (vfs_readdir(dirfd, &entry) == 0) {
+            const char* type_str = (entry.type == FT_DIRECTORY) ? "dir" : "file";
+            printk("  [%s] %s\n", type_str, entry.name);
             count++;
         }
         if (count == 0) {
-            printk("  (no files in VFS - load an initrd)\n");
+            printk("  (empty directory)\n");
         }
-        printk("(%d file%s total)\n", count, count == 1 ? "" : "s");
+        printk("(%d entry%s total)\n", count, count == 1 ? "" : "s");
+        vfs_close(dirfd);
     } else if (strcmp(argv[1], "cat") == 0) {
         if (argc < 3) { printk("Usage: file cat <path>\n"); return; }
-        extern ssize_t vfs_read(int fd, void* buf, size_t count);
         int fd = vfs_open(argv[2], 0);
         if (fd < 0) {
             printk("file: %s: not found\n", argv[2]);
@@ -874,8 +1380,6 @@ static void cmd_file(int argc, char** argv) {
             printk("Usage: file write <path> <text...>\n");
             return;
         }
-        extern ssize_t vfs_write(int fd, const void* buf, size_t count);
-        extern int vfs_open(const char* path, int flags);
         int fd = vfs_open(argv[2], 0x10);  /* O_CREAT */
         if (fd < 0) {
             printk("file: cannot create %s\n", argv[2]);
@@ -893,9 +1397,35 @@ static void cmd_file(int argc, char** argv) {
         }
         buf[len] = 0;
         ssize_t n = vfs_write(fd, buf, len);
-        extern int vfs_close(int fd);
         vfs_close(fd);
         printk("Wrote %d bytes to %s\n", (int)n, argv[2]);
+    } else if (strcmp(argv[1], "mkdir") == 0) {
+        if (argc < 3) { printk("Usage: file mkdir <path>\n"); return; }
+        int rc = vfs_mkdir(argv[2], 0755);
+        if (rc < 0) {
+            printk("file: mkdir %s: failed (path exists or parent missing)\n", argv[2]);
+        } else {
+            printk("file: created directory %s\n", argv[2]);
+        }
+    } else if (strcmp(argv[1], "rm") == 0) {
+        if (argc < 3) { printk("Usage: file rm <path>\n"); return; }
+        int rc = vfs_unlink(argv[2]);
+        if (rc < 0) {
+            printk("file: rm %s: failed\n", argv[2]);
+        } else {
+            printk("file: removed %s\n", argv[2]);
+        }
+    } else if (strcmp(argv[1], "stat") == 0) {
+        if (argc < 3) { printk("Usage: file stat <path>\n"); return; }
+        struct stat st;
+        int rc = vfs_stat(argv[2], &st);
+        if (rc < 0) {
+            printk("file: stat %s: not found\n", argv[2]);
+        } else {
+            const char* type_str = S_ISDIR(st.mode) ? "directory" : "regular file";
+            printk("file: %s: %s, size=%u, mode=0%o\n",
+                   argv[2], type_str, (unsigned)st.size, st.mode);
+        }
     } else {
         printk("Unknown file subcommand: %s\n", argv[1]);
     }

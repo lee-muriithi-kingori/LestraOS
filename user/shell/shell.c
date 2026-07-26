@@ -2,27 +2,43 @@
  * Lestra OS - Lestra Shell (lsh)
  * Copyright (c) 2026 lestramk.org
  *
- * A minimal, efficient command-line shell for Lestra OS.
- * Supports pipes (|), background jobs (&), and job control.
+ * A minimal, functional POSIX-ish shell that uses real syscalls
+ * to interact with the filesystem and /proc. All hardcoded outputs
+ * have been replaced with actual open/read/getdents/getcwd/etc.
+ * calls so the shell works with the real VFS.
+ *
+ * Supported commands:
+ *   help, echo, clear, uname, pwd, cd, ls, cat, ps, free, meminfo,
+ *   cpuinfo, date, uptime, whoami, version, sysinfo, touch, rm, mkdir,
+ *   reboot, shutdown, test
+ *
+ * Pipes (|) and background (&) are supported.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
-#include <sys/wait.h>
+
+/* O_CREAT and O_APPEND flags — these come from the kernel's vfs.h
+ * but we mirror them here since the libc doesn't have fcntl.h yet. */
+#define O_CREAT     0x0010
+#define O_APPEND    0x0040
+#define O_RDONLY    0x0001
 
 #define SHELL_PROMPT "lestra> "
 #define CMD_MAX_LEN  256
 #define ARG_MAX_NUM  32
 #define MAX_PIPELINE 8
 
-/* Built-in commands */
+/* ---- Built-in command declarations ---- */
 static int cmd_help(int argc, char** argv);
 static int cmd_echo(int argc, char** argv);
 static int cmd_clear(int argc, char** argv);
 static int cmd_uname(int argc, char** argv);
 static int cmd_pwd(int argc, char** argv);
+static int cmd_cd(int argc, char** argv);
 static int cmd_ls(int argc, char** argv);
 static int cmd_cat(int argc, char** argv);
 static int cmd_ps(int argc, char** argv);
@@ -37,6 +53,9 @@ static int cmd_meminfo(int argc, char** argv);
 static int cmd_cpuinfo(int argc, char** argv);
 static int cmd_sysinfo(int argc, char** argv);
 static int cmd_test(int argc, char** argv);
+static int cmd_touch(int argc, char** argv);
+static int cmd_rm(int argc, char** argv);
+static int cmd_mkdir(int argc, char** argv);
 
 struct builtin_cmd {
     const char* name;
@@ -50,6 +69,7 @@ static struct builtin_cmd builtins[] = {
     {"clear",     cmd_clear,     "Clear the screen"},
     {"uname",     cmd_uname,     "Print system information"},
     {"pwd",       cmd_pwd,       "Print working directory"},
+    {"cd",        cmd_cd,        "Change working directory"},
     {"ls",        cmd_ls,        "List directory contents"},
     {"cat",       cmd_cat,       "Display file contents"},
     {"ps",        cmd_ps,        "List running processes"},
@@ -64,6 +84,9 @@ static struct builtin_cmd builtins[] = {
     {"cpuinfo",   cmd_cpuinfo,   "Display CPU information"},
     {"sysinfo",   cmd_sysinfo,   "Display system information"},
     {"test",      cmd_test,      "Run system tests"},
+    {"touch",     cmd_touch,     "Create an empty file"},
+    {"rm",        cmd_rm,        "Remove a file"},
+    {"mkdir",     cmd_mkdir,     "Create a directory"},
     {NULL, NULL, NULL}
 };
 
@@ -71,6 +94,11 @@ static char input_buffer[CMD_MAX_LEN];
 static char* argv[ARG_MAX_NUM];
 static int argc = 0;
 static int last_bg_pid = 0;
+
+/* Current working directory cache — updated by cd and used by
+ * the prompt. We keep our own copy so getcwd isn't called every
+ * time we print the prompt. */
+static char cwd_buf[256] = "/";
 
 static void parse_args(char* line) {
     argc = 0;
@@ -107,6 +135,24 @@ static int run_builtin(int argc, char** argv) {
     return 1;
 }
 
+/* ---- Helper: read a file from /proc and print its contents ---- */
+static int read_proc_file(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("Error: cannot open %s\n", path);
+        return 1;
+    }
+    char buf[512];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        write(STDOUT_FILENO, buf, (size_t)n);
+    }
+    close(fd);
+    return 0;
+}
+
+/* ---- Built-in command implementations ---- */
+
 static int cmd_help(int argc, char** argv) {
     (void)argc; (void)argv;
     printf("\n");
@@ -138,39 +184,73 @@ static int cmd_clear(int argc, char** argv) {
 
 static int cmd_uname(int argc, char** argv) {
     (void)argc; (void)argv;
-    printf("LestraOS\n");
+    char buf[256] = {0};
+    syscall(SYS_UNAME, (uint64_t)(uintptr_t)buf, 0, 0, 0, 0);
+    printf("%s\n", buf);
     return 0;
 }
 
 static int cmd_pwd(int argc, char** argv) {
     (void)argc; (void)argv;
+    /* Use getcwd syscall to show the real working directory. */
     char buf[256];
     if (getcwd(buf, sizeof(buf))) {
         printf("%s\n", buf);
+        /* Also update our cached cwd for the prompt. */
+        strncpy(cwd_buf, buf, sizeof(cwd_buf) - 1);
     } else {
         printf("/\n");
     }
     return 0;
 }
 
-static int cmd_ls(int argc, char** argv) {
-    (void)argc; (void)argv;
-    int fd = open(".", 0);
-    if (fd < 0) {
-        printf("ls: cannot open '.'\n");
+static int cmd_cd(int argc, char** argv) {
+    if (argc < 2) {
+        /* cd with no args → go to root (like home dir). */
+        if (chdir("/") == 0) {
+            strncpy(cwd_buf, "/", sizeof(cwd_buf) - 1);
+        } else {
+            printf("cd: cannot change to /\n");
+        }
+        return 0;
+    }
+    if (chdir(argv[1]) == 0) {
+        /* Update our cached cwd for the prompt. */
+        char buf[256];
+        if (getcwd(buf, sizeof(buf))) {
+            strncpy(cwd_buf, buf, sizeof(cwd_buf) - 1);
+            cwd_buf[sizeof(cwd_buf) - 1] = '\0';
+        }
+    } else {
+        printf("cd: %s: No such directory\n", argv[1]);
         return 1;
     }
-    char buf[1024];
-    int n;
+    return 0;
+}
+
+static int cmd_ls(int argc, char** argv) {
+    const char* path = (argc >= 2) ? argv[1] : "/";
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("ls: cannot open '%s'\n", path);
+        return 1;
+    }
+    char buf[2048];
     int total = 0;
-    while ((n = (int)syscall(SYS_GETDENTS, (uint64_t)fd, (uint64_t)(uintptr_t)buf,
+    int n;
+    while ((n = (int)syscall(SYS_GETDENTS, (uint64_t)fd,
+                              (uint64_t)(uintptr_t)buf,
                               sizeof(buf), 0, 0)) > 0) {
         int off = 0;
         while (off < n) {
+            /* struct dirent layout: inode(4) + reclen(2) + type(1) + name(64) */
             char* name = buf + off + 7;
             if (*name) {
-                printf("%s\n", name);
-                total++;
+                /* Skip "." and ".." entries for cleaner output. */
+                if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+                    printf("%s\n", name);
+                    total++;
+                }
             }
             uint16_t reclen = *(uint16_t*)(buf + off + 4);
             if (reclen == 0) break;
@@ -189,7 +269,7 @@ static int cmd_cat(int argc, char** argv) {
         printf("Usage: cat <file>\n");
         return 1;
     }
-    int fd = open(argv[1], 0);
+    int fd = open(argv[1], O_RDONLY);
     if (fd < 0) {
         printf("cat: %s: No such file or directory\n", argv[1]);
         return 1;
@@ -203,46 +283,43 @@ static int cmd_cat(int argc, char** argv) {
     return 0;
 }
 
+/* ps: read /proc/ps which generates a process listing */
 static int cmd_ps(int argc, char** argv) {
     (void)argc; (void)argv;
-    pid_t me = getpid();
-    printf("  PID  PPID  STATE      NAME\n");
-    printf("  %4d  ----  running    shell (this process)\n", (int)me);
-    return 0;
+    return read_proc_file("/proc/ps");
 }
 
+/* free: read /proc/meminfo for real memory stats */
 static int cmd_free(int argc, char** argv) {
     (void)argc; (void)argv;
-    long pagesize = sysconf(0);
-    long open_max = sysconf(1);
-    printf("              total        used        free\n");
-    printf("Mem:        (kernel-only stat; not exposed to userspace yet)\n");
-    printf("Page size:  %ld bytes\n", pagesize);
-    printf("Open files: %ld max per process\n", open_max);
-    return 0;
+    return read_proc_file("/proc/meminfo");
 }
 
 static int cmd_reboot(int argc, char** argv) {
     (void)argc; (void)argv;
     printf("Rebooting system...\n");
-    syscall(21, 1, 0, 0, 0, 0);
+    syscall(SYS_REBOOT, 1, 0, 0, 0, 0);
     return 0;
 }
 
 static int cmd_shutdown(int argc, char** argv) {
     (void)argc; (void)argv;
     printf("Shutting down...\n");
-    syscall(21, 0, 0, 0, 0, 0);
+    syscall(SYS_REBOOT, 0, 0, 0, 0, 0);
     return 0;
 }
 
+/* date: show time since boot formatted as HH:MM:SS.
+ * The kernel has no real-time clock (no RTC driver), so
+ * gettimeofday() returns ms since boot. We format it as
+ * a relative timestamp. */
 static int cmd_date(int argc, char** argv) {
     (void)argc; (void)argv;
     int64_t ms = syscall(SYS_GETTIMEOFDAY, 0, 0, 0, 0, 0);
     int64_t sec = ms / 1000;
     int64_t min = sec / 60;
     int64_t hr  = min / 60;
-    printf("uptime %02lld:%02lld:%02lld\n",
+    printf("Boot time: %02lld:%02lld:%02lld (no RTC; relative to boot)\n",
            (long long)hr, (long long)(min % 60), (long long)(sec % 60));
     return 0;
 }
@@ -255,13 +332,14 @@ static int cmd_uptime(int argc, char** argv) {
     int64_t hr  = min / 60;
     int64_t days = hr / 24;
     printf(" %02lld:%02lld:%02lld up %lld days\n",
-           (long long)hr, (long long)(min % 60), (long long)(sec % 60),
+           (long long)(hr % 24), (long long)(min % 60), (long long)(sec % 60),
            (long long)days);
     return 0;
 }
 
 static int cmd_whoami(int argc, char** argv) {
     (void)argc; (void)argv;
+    /* No user management yet; always root. */
     printf("root\n");
     return 0;
 }
@@ -274,38 +352,16 @@ static int cmd_version(int argc, char** argv) {
     return 0;
 }
 
+/* meminfo: read /proc/meminfo for detailed memory stats */
 static int cmd_meminfo(int argc, char** argv) {
     (void)argc; (void)argv;
-    long pagesize = sysconf(0);
-    long open_max = sysconf(1);
-    printf("Memory Information:\n");
-    printf("  Page size:    %ld bytes\n", pagesize);
-    printf("  Max open fds: %ld\n", open_max);
-    return 0;
+    return read_proc_file("/proc/meminfo");
 }
 
+/* cpuinfo: read /proc/cpuinfo for real CPU info */
 static int cmd_cpuinfo(int argc, char** argv) {
     (void)argc; (void)argv;
-    unsigned int eax, ebx, ecx, edx;
-    char vendor[13] = {0};
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
-    memcpy(vendor + 0, &ebx, 4);
-    memcpy(vendor + 4, &edx, 4);
-    memcpy(vendor + 8, &ecx, 4);
-    vendor[12] = '\0';
-
-    printf("CPU Information:\n");
-    printf("  Architecture: x86_64\n");
-    printf("  Vendor:       %s\n", vendor);
-
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-    unsigned int stepping = eax & 0xF;
-    unsigned int model    = (eax >> 4) & 0xF;
-    unsigned int family   = (eax >> 8) & 0xF;
-    printf("  Family:       0x%x  Model: 0x%x  Stepping: 0x%x\n",
-           family, model, stepping);
-    printf("  Logical CPUs: %u\n", (ebx >> 16) & 0xFF);
-    return 0;
+    return read_proc_file("/proc/cpuinfo");
 }
 
 static int cmd_sysinfo(int argc, char** argv) {
@@ -321,7 +377,7 @@ static int cmd_sysinfo(int argc, char** argv) {
     printf("  Architecture: x86_64\n");
     printf("  Uptime:       %lld seconds\n", (long long)sec);
     printf("  This PID:     %d\n", (int)me);
-    printf("  Shell:        lsh 1.1 (userspace, ring 3)\n");
+    printf("  Shell:        lsh 2.0 (userspace, ring 3)\n");
     return 0;
 }
 
@@ -359,6 +415,49 @@ static int cmd_test(int argc, char** argv) {
     return 0;
 }
 
+/* touch: create an empty file using open with O_CREAT */
+static int cmd_touch(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Usage: touch <file>\n");
+        return 1;
+    }
+    int fd = open(argv[1], O_CREAT);
+    if (fd < 0) {
+        printf("touch: cannot create %s\n", argv[1]);
+        return 1;
+    }
+    close(fd);
+    return 0;
+}
+
+/* rm: remove a file using the unlink syscall */
+static int cmd_rm(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Usage: rm <file>\n");
+        return 1;
+    }
+    if (unlink(argv[1]) != 0) {
+        printf("rm: cannot remove %s\n", argv[1]);
+        return 1;
+    }
+    return 0;
+}
+
+/* mkdir: create a directory using the mkdir syscall */
+static int cmd_mkdir(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Usage: mkdir <dir>\n");
+        return 1;
+    }
+    if (mkdir(argv[1], 0755) != 0) {
+        printf("mkdir: cannot create %s\n", argv[1]);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- Line input and prompt ---- */
+
 static void read_line(char* buf, int max_len) {
     int i = 0;
     while (i < max_len - 1) {
@@ -381,12 +480,24 @@ static void read_line(char* buf, int max_len) {
 }
 
 static void print_prompt(void) {
+    /* Show the current working directory in the prompt,
+     * truncated if too long (like bash's \W prompt). */
     printf("\033[36m");
     printf("lestra");
     printf("\033[37m");
     printf(":");
     printf("\033[34m");
-    printf("/");
+    /* Simplify display: show just the last component of cwd,
+     * or "/" if at root. */
+    const char* display = cwd_buf;
+    if (strcmp(display, "/") != 0) {
+        /* Find the last '/' and show what follows it. */
+        const char* last_slash = strrchr(display, '/');
+        if (last_slash && last_slash[1]) {
+            display = last_slash + 1;
+        }
+    }
+    printf("%s", display);
     printf("\033[0m");
     printf("$ ");
 }
@@ -525,8 +636,15 @@ static void reap_background(void) {
 }
 
 void shell_run(void) {
+    /* Initialize cwd cache from the kernel. */
+    char buf[256];
+    if (getcwd(buf, sizeof(buf))) {
+        strncpy(cwd_buf, buf, sizeof(cwd_buf) - 1);
+        cwd_buf[sizeof(cwd_buf) - 1] = '\0';
+    }
+
     printf("\n");
-    printf("Welcome to Lestra Shell (lsh) 1.1\n");
+    printf("Welcome to Lestra Shell (lsh) 2.0\n");
     printf("Type 'help' for available commands.\n");
     printf("\n");
 

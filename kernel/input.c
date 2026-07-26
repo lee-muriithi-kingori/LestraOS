@@ -1,23 +1,21 @@
 /*
- * Lestra OS - Input subsystem implementation (PS/2 mouse + event queue)
+ * Lestra OS - Input subsystem implementation (mouse + keyboard event queue)
  * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
  *
- * PS/2 mouse initialization sequence:
- *   1. Enable aux port (outb 0xA8 to 0x64)
- *   2. Read config byte (outb 0x20 to 0x64, read 0x60)
- *   3. Set bit 1 (enable IRQ12), write back (outb 0x60 to 0x64, outb config to 0x60)
- *   4. Enable packet streaming (outb 0xD4 to 0x64, outb 0xF4 to 0x60)
+ * The PS/2 mouse driver is now a separate module (drivers/char/mouse.c)
+ * that handles aux port initialization, IRQ12 processing, and packet
+ * parsing. This module wires the mouse driver into the unified event
+ * queue via a callback that converts mouse_event → input event.
  *
- * IRQ12 handler reads 3 bytes from 0x60:
- *   byte 0: flags (bit 0=left, bit 1=right, bit 2=middle, bit 6=X overflow, bit 7=Y overflow, bit 5=Y sign, bit 4=X sign)
- *   byte 1: X delta (sign-extended if bit 4 set)
- *   byte 2: Y delta (sign-extended if bit 5 set, INVERTED because screen Y is downward)
+ * The keyboard is still handled by keyboard.c, and we hook into its
+ * scancode handler to also push key events for the GUI compositor.
  *
- * Mouse position is clamped to [0, fb_w-1] × [0, fb_h-1].
+ * The compositor polls events via input_poll().
  */
 
 #include <lestra/types.h>
 #include <lestra/input.h>
+#include <lestra/mouse.h>
 #include <lestra/fb.h>
 #include <lestra/irq.h>
 #include <lestra/idt.h>
@@ -44,100 +42,28 @@ int input_poll(struct event* e) {
     return 1;
 }
 
-/* ----- mouse state ----- */
-static volatile int mouse_x = 512;   /* start center-screen */
-static volatile int mouse_y = 384;
-static volatile uint8_t mouse_buttons = 0;
-static uint8_t mouse_prev_buttons = 0;
+/* ----- mouse state (for button transition detection) ----- */
+static uint8_t prev_mouse_buttons = 0;
 
-/* Mouse packet parsing state */
-static uint8_t mouse_packet[3];
-static int mouse_packet_idx = 0;
-
-void input_get_mouse_pos(int* x, int* y) {
-    if (x) *x = mouse_x;
-    if (y) *y = mouse_y;
-}
-
-uint8_t input_get_mouse_buttons(void) {
-    return mouse_buttons;
-}
-
-/* ----- PS/2 controller helpers ----- */
-static inline void ps2_wait_write(void) {
-    /* Wait until input buffer is empty (controller can accept data) */
-    int timeout = 10000;
-    while ((inb(0x64) & 0x02) && timeout-- > 0);
-}
-
-static inline void ps2_wait_read(void) {
-    /* Wait until output buffer is full (data available to read) */
-    int timeout = 10000;
-    while (!(inb(0x64) & 0x01) && timeout-- > 0);
-}
-
-static inline void ps2_mouse_write(uint8_t data) {
-    ps2_wait_write();
-    outb(0x64, 0xD4);       /* next byte goes to aux (mouse) port */
-    ps2_wait_write();
-    outb(0x60, data);
-}
-
-static inline uint8_t ps2_mouse_read(void) {
-    ps2_wait_read();
-    return inb(0x60);
-}
-
-/* ----- mouse IRQ handler ----- */
-static void mouse_irq_handler(struct interrupt_frame* frame) {
-    (void)frame;
-    uint8_t data = inb(0x60);
-
-    if (mouse_packet_idx == 0 && !(data & 0x08)) {
-        /* First byte must have bit 3 set (sync bit). If not, resync. */
-        return;
-    }
-
-    mouse_packet[mouse_packet_idx++] = data;
-    if (mouse_packet_idx < 3) return;
-    mouse_packet_idx = 0;
-
-    /* Parse the 3-byte packet */
-    uint8_t flags = mouse_packet[0];
-    int dx = (int)mouse_packet[1];
-    int dy = (int)mouse_packet[2];
-
-    /* Sign-extend if negative */
-    if (flags & 0x10) dx |= 0xFFFFFF00;
-    if (flags & 0x20) dy |= 0xFFFFFF00;
-
-    /* Y is inverted: mouse up = negative dy, but screen Y goes down */
-    dy = -dy;
-
-    /* Update position */
-    mouse_x += dx;
-    mouse_y += dy;
-    if (mouse_x < 0) mouse_x = 0;
-    if (mouse_y < 0) mouse_y = 0;
-    if (fb_available) {
-        if (mouse_x >= (int)fb_w) mouse_x = fb_w - 1;
-        if (mouse_y >= (int)fb_h) mouse_y = fb_h - 1;
-    }
-
-    /* Update buttons */
-    mouse_buttons = flags & 0x07;  /* left, right, middle */
-
+/* ----- mouse callback (called from IRQ12 context by mouse.c) -----
+ *
+ * Converts a mouse_event from the PS/2 mouse driver into one or more
+ * input events in the unified queue:
+ *   1. Always push EV_MOUSE_MOVE with the new position and current buttons
+ *   2. Push EV_MOUSE_DOWN / EV_MOUSE_UP for button press/release transitions
+ */
+static void input_mouse_callback(const struct mouse_event* mev) {
     /* Push mouse-move event */
     struct event ev;
     ev.type = EV_MOUSE_MOVE;
-    ev.mouse.x = mouse_x;
-    ev.mouse.y = mouse_y;
-    ev.mouse.buttons = mouse_buttons;
+    ev.mouse.x = mev->x;
+    ev.mouse.y = mev->y;
+    ev.mouse.buttons = mev->buttons;
     input_push(&ev);
 
     /* Check for button press/release transitions */
-    uint8_t pressed = mouse_buttons & ~mouse_prev_buttons;
-    uint8_t released = ~mouse_buttons & mouse_prev_buttons;
+    uint8_t pressed  = mev->buttons & ~prev_mouse_buttons;
+    uint8_t released = ~mev->buttons & prev_mouse_buttons;
 
     if (pressed & MOUSE_BTN_LEFT) {
         ev.type = EV_MOUSE_DOWN;
@@ -160,7 +86,17 @@ static void mouse_irq_handler(struct interrupt_frame* frame) {
         input_push(&ev);
     }
 
-    mouse_prev_buttons = mouse_buttons;
+    prev_mouse_buttons = mev->buttons;
+}
+
+/* ----- mouse position / button getters (for external consumers) ----- */
+
+void input_get_mouse_pos(int* x, int* y) {
+    mouse_get_pos(x, y);
+}
+
+uint8_t input_get_mouse_buttons(void) {
+    return mouse_get_buttons();
 }
 
 /* ----- keyboard hook (pushes key events to input queue) -----
@@ -200,48 +136,23 @@ static void input_kb_hook(uint8_t scancode, char ascii) {
 
 /* ----- public API ----- */
 void input_init(void) {
-    /* Enable the aux (mouse) port on the PS/2 controller */
-    ps2_wait_write();
-    outb(0x64, 0xA8);   /* enable aux port */
+    /* Initialize the PS/2 mouse driver (handles aux port, IRQ12, packets) */
+    mouse_init();
 
-    /* Read current config, enable IRQ12 (bit 1), write back */
-    ps2_wait_write();
-    outb(0x64, 0x20);   /* read config */
-    ps2_wait_read();
-    uint8_t config = inb(0x60);
-    config |= 0x02;     /* enable IRQ12 */
-    config &= ~0x20;    /* disable mouse clock gating */
-    ps2_wait_write();
-    outb(0x64, 0x60);   /* write config */
-    ps2_wait_write();
-    outb(0x60, config);
+    /* Set framebuffer bounds for mouse position clamping */
+    if (fb_available) {
+        mouse_set_fb_bounds((int)fb_w, (int)fb_h);
+    }
 
-    /* Reset the mouse */
-    ps2_mouse_write(0xFF);  /* reset */
-    (void)ps2_mouse_read(); /* ACK */
-    (void)ps2_mouse_read(); /* self-test pass */
-    (void)ps2_mouse_read(); /* mouse ID */
-
-    /* Enable packet streaming */
-    ps2_mouse_write(0xF4);  /* enable streaming */
-    (void)ps2_mouse_read(); /* ACK */
-
-    /* Register IRQ12 handler */
-    register_irq_handler(12, mouse_irq_handler);
-    irq_enable(12);
+    /* Register our callback so we receive mouse events from the driver.
+     * The callback runs in IRQ context and pushes events into our
+     * unified input queue — no polling needed. */
+    mouse_set_callback(input_mouse_callback);
 
     /* Hook into the keyboard handler to push key events for the GUI.
      * keyboard.c's set_handler lets us register a callback. */
-    extern void keyboard_set_handler(void (*handler)(uint8_t, char));
     prev_kb_handler = NULL;  /* keyboard.c doesn't chain; we capture directly */
     keyboard_set_handler(input_kb_hook);
 
-    /* Set initial mouse position to center of screen */
-    if (fb_available) {
-        mouse_x = fb_w / 2;
-        mouse_y = fb_h / 2;
-    }
-
-    pr_info("input: PS/2 mouse initialized (IRQ12), cursor at (%u,%u)\n",
-            (unsigned)mouse_x, (unsigned)mouse_y);
+    pr_info("input: subsystem initialized (mouse callback + keyboard hook)\n");
 }

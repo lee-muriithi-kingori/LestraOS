@@ -10,6 +10,7 @@
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 #include <lestra/vga.h>
+#include <lestra/mm.h>
 
 /* IDT entries and pointer */
 static struct idt_entry idt_entries[IDT_ENTRIES];
@@ -96,10 +97,14 @@ static void default_exception_handler(struct interrupt_frame* frame) {
            (void*)frame->rbp, (void*)frame->rsp, frame->err_code);
     
     if (vector == ISR_PAGE_FAULT) {
-        uint64_t fault_addr;
-        __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
-        extern void vmm_page_fault_handler(uintptr_t fault_addr, uint64_t error_code);
-        vmm_page_fault_handler(fault_addr, frame->err_code);
+        /* Read faulting address from CR2 before any other operation
+         * can clobber it. Then delegate to the comprehensive
+         * page_fault_handler in kernel/mm/page_fault.c which
+         * handles COW resolution, stack growth, and demand paging.
+         * If the handler returns, iretq retries the faulting
+         * instruction with the newly-mapped/resolved page. */
+        uint64_t fault_addr = read_cr2();
+        page_fault_handler((uintptr_t)fault_addr, frame->err_code, frame);
         return;
     }
     

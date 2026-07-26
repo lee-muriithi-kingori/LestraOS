@@ -1,13 +1,13 @@
 /*
- * Lestra OS - Input subsystem (PS/2 mouse + keyboard event queue)
+ * Lestra OS - Input subsystem (mouse + keyboard event queue)
  * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
  *
- * The PS/2 keyboard is already handled by keyboard.c (scancodes → ASCII →
- * ring buffer). This module adds:
- *   - PS/2 mouse driver (IRQ12, 3-byte packets)
- *   - Unified event queue for the GUI compositor (mouse move/down/up +
- *     key down/up events)
- *   - Mouse cursor position tracking
+ * The PS/2 mouse driver is in drivers/char/mouse.c (handles aux port,
+ * IRQ12, packet parsing). The keyboard is handled by keyboard.c.
+ * This module wires both drivers into a unified event queue:
+ *   - Mouse events (move/down/up) via callback from mouse.c
+ *   - Keyboard events (key down/up) via hook from keyboard.c
+ *   - Mouse cursor position tracking (delegates to mouse.c)
  *
  * The compositor polls events via input_poll().
  */

@@ -13,5 +13,7 @@ uint32_t ext2_create_file(const char* path, uint16_t mode);
 uint32_t ext2_mkdir(const char* path, uint16_t mode);
 int      ext2_unlink(const char* path);
 void     ext2_list_root(void (*callback)(const char* name, uint32_t inode, uint8_t type));
+void     ext2_list_dir(const char* path, void (*callback)(const char* name, uint32_t inode, uint8_t type));
+uint16_t ext2_get_inode_mode(const char* path);
 
 #endif

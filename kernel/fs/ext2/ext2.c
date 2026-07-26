@@ -191,6 +191,20 @@ int ext2_is_mounted(void) {
     return ext2_mounted;
 }
 
+/* ext2_get_inode_mode: return the i_mode field of the inode at `path`.
+ * This allows callers (like the ext2_shim) to determine whether a
+ * path is a regular file, directory, etc. without reading the entire
+ * inode. Returns 0 if the path doesn't exist or the filesystem isn't
+ * mounted. */
+uint16_t ext2_get_inode_mode(const char* path) {
+    if (!ext2_mounted || !path) return 0;
+    uint32_t inode_num = ext2_resolve_path(path);
+    if (inode_num == 0) return 0;
+    struct ext2_inode inode;
+    if (!ext2_read_inode(inode_num, &inode)) return 0;
+    return inode.i_mode;
+}
+
 static int ext2_read_inode(uint32_t inode_num, struct ext2_inode* out) {
     if (!ext2_mounted || inode_num == 0) return 0;
 
@@ -398,6 +412,57 @@ void ext2_list_root(void (*callback)(const char* name, uint32_t inode, uint8_t t
                 memcpy(name, de->name, len);
                 name[len] = '\0';
                 if (callback) callback(name, de->inode, de->file_type);
+            }
+            offset += de->rec_len;
+        }
+        bytes_walked += ext2_block_size;
+        logical_block++;
+    }
+}
+
+/* ext2_list_dir: list the contents of ANY ext2 directory (not just root).
+ * Resolves `path` to an inode, then walks its data blocks and calls
+ * the callback for each directory entry. This is a generalization of
+ * ext2_list_root() that works for any path, e.g. "/etc", "/usr/bin". */
+void ext2_list_dir(const char* path, void (*callback)(const char* name, uint32_t inode, uint8_t type)) {
+    if (!ext2_mounted || !path || !callback) return;
+
+    /* Resolve path to inode number. */
+    uint32_t inode_num = ext2_resolve_path(path);
+    if (inode_num == 0) {
+        pr_warn("ext2: dir '%s' not found\n", path);
+        return;
+    }
+
+    struct ext2_inode inode;
+    if (!ext2_read_inode(inode_num, &inode)) return;
+
+    /* Verify it's actually a directory. */
+    if ((inode.i_mode & 0xF000) != 0x4000) {
+        pr_warn("ext2: '%s' is not a directory\n", path);
+        return;
+    }
+
+    static uint8_t block_buf[4096];
+    uint32_t bytes_walked = 0;
+    uint32_t logical_block = 0;
+
+    while (bytes_walked < inode.i_size) {
+        uint32_t phys = ext2_get_inode_block(&inode, logical_block);
+        if (phys == 0) break;
+        if (!ext2_read_block(phys, block_buf)) break;
+
+        uint32_t offset = 0;
+        while (offset < ext2_block_size && bytes_walked + offset < inode.i_size) {
+            struct ext2_dirent* de = (struct ext2_dirent*)&block_buf[offset];
+            if (de->rec_len == 0) break;
+
+            if (de->inode != 0 && de->name_len > 0) {
+                char name[256];
+                int len = de->name_len < 255 ? de->name_len : 255;
+                memcpy(name, de->name, len);
+                name[len] = '\0';
+                callback(name, de->inode, de->file_type);
             }
             offset += de->rec_len;
         }

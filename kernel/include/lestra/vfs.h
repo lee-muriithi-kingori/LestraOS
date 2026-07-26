@@ -18,6 +18,11 @@ typedef int64_t off_t;
 #define MAX_NAME_LEN    64
 #define MAX_OPEN_FILES  128
 #define MAX_MOUNTS      8
+#define MAX_CHILDREN    64    /* max children per memfs directory */
+
+/* Filesystem type identifiers for mount table */
+#define FS_TYPE_MEMFS   0
+#define FS_TYPE_EXT2    1
 
 /* File types */
 #define FT_REGULAR   1
@@ -36,6 +41,13 @@ typedef int64_t off_t;
 #define O_TRUNC     0x0020
 #define O_APPEND    0x0040
 #define O_DIRECTORY 0x0100
+
+/* File mode type masks (POSIX) */
+#define S_IFMT   0170000   /* type mask */
+#define S_IFDIR  0040000   /* directory */
+#define S_IFREG  0100000   /* regular file */
+#define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
+#define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 
 /* Permissions */
 #define S_IRUSR     0400
@@ -92,7 +104,8 @@ struct vnode {
 
 /* Mount point */
 struct mount {
-    char path[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];     /* mount point path (e.g. "/", "/mnt/disk") */
+    int fs_type;                  /* FS_TYPE_MEMFS or FS_TYPE_EXT2 */
     struct vnode* root;
     struct filesystem* fs;
     void* private_data;
@@ -118,15 +131,22 @@ void vfs_init(void);
 int vfs_mount(const char* source, const char* target, const char* fs_type);
 int vfs_unmount(const char* path);
 struct vnode* vfs_lookup(const char* path);
+int vfs_resolve_path(const char* path);
 int vfs_open(const char* path, int flags);
 int vfs_close(int fd);
 ssize_t vfs_read(int fd, void* buf, size_t count);
 ssize_t vfs_write(int fd, const void* buf, size_t count);
+ssize_t vfs_read_at(int fd, void* buf, size_t count, off_t offset);
+ssize_t vfs_write_at(int fd, const void* buf, size_t count, off_t offset);
 int vfs_readdir(int fd, struct dirent* entry);
 int vfs_mkdir(const char* path, uint32_t mode);
 int vfs_create(const char* path, uint32_t mode);
 int vfs_stat(const char* path, struct stat* st);
+off_t vfs_lseek(int fd, off_t offset, int whence);
+int vfs_unlink(const char* path);
 void vfs_register_fs(struct filesystem* fs);
+struct mount* vfs_get_mount(int idx);
+int vfs_get_mount_count(void);
 
 /* initrd */
 void initrd_load(void* data, size_t size);

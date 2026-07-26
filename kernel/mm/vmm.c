@@ -115,12 +115,18 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
 
     uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
 
-    /* Check if page is already mapped - report overwrite */
+    /* Check if page is already mapped — use refcount-aware freeing.
+     * With COW, the old physical page may be shared by other processes.
+     * We only free it if this was the last PTE reference (refcount
+     * drops to 0 after decrement). Otherwise, other processes still
+     * reference it and we must not free it. */
     if (pt[pt_idx] & PAGE_PRESENT) {
-        pr_warn("VMM: Remapping already-mapped page at virt=0x%x (old: 0x%x)\n",
-                (unsigned)virt, (unsigned)(pt[pt_idx] & ~0xFFF));
         phys_addr_t old_phys = pt[pt_idx] & ~0xFFF;
-        pmm_free_page(old_phys);
+        /* Decrement refcount of the old physical page. Only free if
+         * no other PTEs reference it (refcount drops to 0). */
+        if (pmm_refcount_dec(old_phys) == 0) {
+            pmm_free_page(old_phys);
+        }
     }
 
     pt[pt_idx] = paddr | flags | PAGE_PRESENT;
@@ -179,7 +185,12 @@ uintptr_t* vmm_create_address_space(void) {
  * PDPT entry. Only ever called on PML4 indices >= 4, which are private
  * to this address space (indices 0-3 are shared with boot_pml4 across
  * every process and the kernel — see create_proc_pml4() in scheduler.c
- * — and must never be freed here). */
+ * — and must never be freed here).
+ *
+ * COW-aware: leaf pages (4KB user pages) are freed only when their
+ * refcount drops to 0 (meaning no other process's PTE still references
+ * them). Page table structures (PT, PD, PDPT pages) are always private
+ * to this address space and are freed directly. */
 static void free_pdpt_subtree(phys_addr_t pdpt_phys) {
     uint64_t* pdpt = (uint64_t*)pdpt_phys;
     for (int p3 = 0; p3 < PDPT_ENTRIES; p3++) {
@@ -196,10 +207,16 @@ static void free_pdpt_subtree(phys_addr_t pdpt_phys) {
             uint64_t* pt = (uint64_t*)pt_phys;
             for (int p1 = 0; p1 < PT_ENTRIES; p1++) {
                 if (!(pt[p1] & PAGE_PRESENT)) continue;
-                /* Free the mapped leaf page itself (stack, ELF segments,
-                 * anything proc_map_page put here). */
-                pmm_free_page(pt[p1] & ~0xFFFULL);
+                phys_addr_t page_phys = pt[p1] & ~0xFFFULL;
+                /* COW-aware: decrement refcount. Only free the physical
+                 * page if no other PTE still references it. Private
+                 * pages (refcount=1) will be freed; COW-shared pages
+                 * (refcount>1) will remain for other processes. */
+                if (pmm_refcount_dec(page_phys) == 0) {
+                    pmm_free_page(page_phys);
+                }
             }
+            /* Page table page: private to this address space, free directly */
             pmm_free_page(pt_phys);
         }
         pmm_free_page(pd_phys);
@@ -261,40 +278,14 @@ void vmm_free_page_ptr(void* ptr) {
     }
 }
 
-/* Page fault handler */
+/* Legacy page-fault handler — kept as a fallback for kernel-context
+ * faults that don't go through the per-process ISR 14 handler.
+ * The real handler is page_fault_handler() in kernel/mm/page_fault.c,
+ * called from idt.c. This stub remains for any direct calls from
+ * kernel code that still reference vmm_page_fault_handler. */
 void vmm_page_fault_handler(uintptr_t fault_addr, uint64_t error_code) {
-    pr_err("Page fault at 0x%x (error: 0x%x)\n", (unsigned)fault_addr, (unsigned)error_code);
-
-    if (error_code & 0x1) {
-        pr_err("  -> Page protection violation\n");
-    } else {
-        pr_err("  -> Page not present\n");
-    }
-
-    if (error_code & 0x4) {
-        pr_err("  -> User-mode access\n");
-    } else {
-        pr_err("  -> Supervisor-mode access\n");
-    }
-
-    if (error_code & 0x2) {
-        pr_err("  -> Write access\n");
-    } else {
-        pr_err("  -> Read access\n");
-    }
-
-    /* Try to handle stack growth */
-    if (fault_addr >= KERNEL_STACK_START && fault_addr < KERNEL_STACK_END) {
-        phys_addr_t phys = pmm_alloc_page();
-        if (phys) {
-            vmm_map_page(boot_pml4, ALIGN_DOWN(fault_addr, PAGE_SIZE), phys,
-                         PAGE_WRITABLE | PAGE_GLOBAL);
-            pr_info("  -> Handled stack growth\n");
-            return;
-        }
-    }
-
-    panicf("Unhandled page fault at 0x%x", (unsigned)fault_addr);
+    /* Delegate to the new handler with a NULL frame (kernel context) */
+    page_fault_handler(fault_addr, error_code, NULL);
 }
 
 /* Map a contiguous region */
