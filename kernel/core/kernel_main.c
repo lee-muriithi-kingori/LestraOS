@@ -374,6 +374,16 @@ void kernel_main(void* mb2_info) {
     extern void cron_init(void);
     cron_init();
 
+    /* Initialize service manager */
+    pr_info("Initializing service manager...\n");
+    extern void service_init(void);
+    service_init();
+
+    /* Initialize sandbox subsystem */
+    pr_info("Initializing sandbox subsystem...\n");
+    extern void sandbox_init(void);
+    sandbox_init();
+
     /* Enable interrupts */
     pr_info("Enabling interrupts...\n");
     sti();

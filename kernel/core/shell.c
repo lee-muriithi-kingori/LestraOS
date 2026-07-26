@@ -29,6 +29,9 @@
 #include <lestra/power.h>
 #include <lestra/cron.h>
 #include <lestra/wifi.h>
+#include <lestra/sandbox.h>
+#include <lestra/service.h>
+#include <lestra/ssh_server.h>
 #include <string.h>
 
 #define CMD_MAX_LEN  512
@@ -132,12 +135,26 @@ static void cmd_help(void) {
     printk("    ping <host-or-ip>       Send ICMP echo request (e.g. 'ping 10.0.2.2')\n");
     printk("    wget <url>              HTTP GET to a URL (e.g. 'wget http://example.com/')\n");
     printk("\n");
+    printk("  VPS / Service Management (lee):\n");
+    printk("    lee strt ssh            Start SSH remote shell (port 2222)\n");
+    printk("    lee strt server         Start sandbox HTTP server\n");
+    printk("    lee stop ssh            Stop SSH remote shell\n");
+    printk("    lee stop server         Stop sandbox HTTP server\n");
+    printk("    lee status              Show all services\n");
+    printk("    lee service list        List services\n");
+    printk("    lee service start <n>   Start a named service\n");
+    printk("    lee service stop <n>    Stop a named service\n");
+    printk("    lee net config <ip> <mask> <gw>   Set static IP\n");
+    printk("    lee net dns <dns1> [dns2]         Set DNS servers\n");
+    printk("    lee net dhcp                      Switch to DHCP\n");
+    printk("\n");
     printk("  Files (file):\n");
     printk("    file ls                 List files in VFS\n");
     printk("    file cat <path>         Show file contents\n");
     printk("    file write <p> <text>   Write text to a file\n");
     printk("\n");
     printk("  Other:\n");
+    printk("    lee          Sandbox and service manager\n");
     printk("    install      Show installer instructions\n");
     printk("    exit         Exit shell (halt)\n");
     printk("\n");
@@ -794,6 +811,256 @@ static void cmd_file(int argc, char** argv) {
     }
 }
 
+/* ----- lee subcommands ------------------------------------------------- */
+static void cmd_lee(int argc, char** argv) {
+    if (argc < 2) {
+        printk("Usage: lee <strt|stop|status|sandbox|service|net|help>\n");
+        printk("  lee strt server [port]    Start sandbox HTTP server (default 8080)\n");
+        printk("  lee strt ssh [port]       Start SSH-like remote shell (default 2222)\n");
+        printk("  lee strt sandbox [id]     Start sandboxed environment (id=1 or 2)\n");
+        printk("  lee stop server           Stop the HTTP server\n");
+        printk("  lee stop ssh              Stop the SSH server\n");
+        printk("  lee stop sandbox [id]     Stop a specific sandbox\n");
+        printk("  lee status                Show all running services\n");
+        printk("  lee service list          List all services\n");
+        printk("  lee service start <name>  Start a named service\n");
+        printk("  lee service stop <name>   Stop a named service\n");
+        printk("  lee net config <ip> <mask> <gw>  Set static IP\n");
+        printk("  lee net dns <dns1> [dns2] Set DNS servers\n");
+        printk("  lee net dhcp              Switch to DHCP mode\n");
+        printk("  lee sandbox list          List active sandboxes\n");
+        printk("  lee help                  Show this help\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "help") == 0) {
+        cmd_lee(1, NULL);
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        printk("\nLestraOS Services:\n");
+        /* Use the service manager for all services */
+        struct service_info list[SERVICE_MAX];
+        int count = service_list(list, SERVICE_MAX);
+        printk("  %-18s  %-10s  %s\n", "SERVICE", "STATE", "DESCRIPTION");
+        printk("  %-18s  %-10s  %s\n", "-------", "-----", "-----------");
+        for (int i = 0; i < count; i++) {
+            const char* state_str;
+            switch (list[i].state) {
+                case SVC_STOPPED:  state_str = "stopped";  break;
+                case SVC_STARTING: state_str = "starting"; break;
+                case SVC_RUNNING:  state_str = "running";  break;
+                case SVC_FAILED:   state_str = "failed";   break;
+                default:           state_str = "unknown";   break;
+            }
+            printk("  %-18s  %-10s  %s\n",
+                   list[i].name, state_str, list[i].description);
+        }
+        /* Sandboxes */
+        int sb_count = sandbox_count();
+        printk("\n  Sandboxes: %d/%d\n", sb_count, SANDBOX_MAX);
+        for (int i = 1; i <= SANDBOX_MAX; i++) {
+            struct sandbox_info info;
+            if (sandbox_status(i, &info) == 0) {
+                printk("    [%d] %-16s  %s\n",
+                       info.id, info.name,
+                       info.active ? "RUNNING" : "STOPPED");
+            }
+        }
+        printk("\n");
+        return;
+    }
+
+    /* ----- lee service ... ----- */
+    if (strcmp(argv[1], "service") == 0) {
+        if (argc < 3) {
+            printk("Usage: lee service <list|start|stop> [name]\n");
+            return;
+        }
+        if (strcmp(argv[2], "list") == 0) {
+            struct service_info list[SERVICE_MAX];
+            int count = service_list(list, SERVICE_MAX);
+            printk("\n  %-18s  %-10s  %s\n", "SERVICE", "STATE", "DESCRIPTION");
+            printk("  %-18s  %-10s  %s\n", "-------", "-----", "-----------");
+            for (int i = 0; i < count; i++) {
+                const char* state_str;
+                switch (list[i].state) {
+                    case SVC_STOPPED:  state_str = "stopped";  break;
+                    case SVC_STARTING: state_str = "starting"; break;
+                    case SVC_RUNNING:  state_str = "running";  break;
+                    case SVC_FAILED:   state_str = "failed";   break;
+                    default:           state_str = "unknown";   break;
+                }
+                printk("  %-18s  %-10s  %s\n",
+                       list[i].name, state_str, list[i].description);
+            }
+            printk("\n");
+        } else if (strcmp(argv[2], "start") == 0) {
+            if (argc < 4) {
+                printk("Usage: lee service start <name>\n");
+                return;
+            }
+            service_start(argv[3]);
+        } else if (strcmp(argv[2], "stop") == 0) {
+            if (argc < 4) {
+                printk("Usage: lee service stop <name>\n");
+                return;
+            }
+            service_stop(argv[3]);
+        } else {
+            printk("Unknown service subcommand: %s\n", argv[2]);
+        }
+        return;
+    }
+
+    /* ----- lee net config ... ----- */
+    if (strcmp(argv[1], "net") == 0) {
+        if (argc < 3) {
+            printk("Usage: lee net <config|dns|dhcp>\n");
+            printk("  lee net config <ip> <mask> <gw>  Set static IP\n");
+            printk("  lee net dns <dns1> [dns2]        Set DNS servers\n");
+            printk("  lee net dhcp                     Switch to DHCP mode\n");
+            return;
+        }
+        if (strcmp(argv[2], "config") == 0) {
+            if (argc < 6) {
+                printk("Usage: lee net config <ip> <mask> <gw>\n");
+                printk("Example: lee net config 192.168.1.100 255.255.255.0 192.168.1.1\n");
+                return;
+            }
+            extern int net_config_set_ip(const char*, const char*, const char*);
+            if (net_config_set_ip(argv[3], argv[4], argv[5]) == 0) {
+                printk("Static IP configured (reboot or reinit net to apply)\n");
+            }
+        } else if (strcmp(argv[2], "dns") == 0) {
+            if (argc < 4) {
+                printk("Usage: lee net dns <dns1> [dns2]\n");
+                printk("Example: lee net dns 8.8.8.8 8.8.4.4\n");
+                return;
+            }
+            extern int net_config_set_dns(const char*, const char*);
+            const char* d2 = (argc >= 5) ? argv[4] : "";
+            if (net_config_set_dns(argv[3], d2) == 0) {
+                printk("DNS configured\n");
+            }
+        } else if (strcmp(argv[2], "dhcp") == 0) {
+            extern void net_config_dhcp(void);
+            net_config_dhcp();
+            printk("Switched to DHCP mode\n");
+        } else {
+            printk("Unknown net subcommand: %s\n", argv[2]);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "strt") == 0) {
+        if (argc < 3) {
+            printk("Usage: lee strt <server|ssh|sandbox> [args]\n");
+            return;
+        }
+        if (strcmp(argv[2], "server") == 0) {
+            int port = 8080;
+            if (argc >= 4) {
+                port = 0;
+                for (char* p = argv[3]; *p >= '0' && *p <= '9'; p++)
+                    port = port * 10 + (*p - '0');
+                if (port <= 0 || port > 65535) port = 8080;
+            }
+            if (sandbox_server_is_running()) {
+                printk("HTTP server already running on port %d\n",
+                       sandbox_server_port());
+            } else {
+                sandbox_server_start(port);
+                printk("HTTP sandbox server started on port %d\n", port);
+            }
+        } else if (strcmp(argv[2], "ssh") == 0) {
+            service_start("ssh");
+        } else if (strcmp(argv[2], "sandbox") == 0) {
+            int id = 0;
+            if (argc >= 4) {
+                id = 0;
+                for (char* p = argv[3]; *p >= '0' && *p <= '9'; p++)
+                    id = id * 10 + (*p - '0');
+            }
+            if (id == 0) {
+                id = sandbox_create(NULL, 0);
+                if (id > 0) {
+                    printk("Created sandbox %d\n", id);
+                } else {
+                    printk("Failed to create sandbox (max %d reached)\n",
+                           SANDBOX_MAX);
+                }
+            } else {
+                if (id < 1 || id > SANDBOX_MAX) {
+                    printk("Invalid sandbox id: %d (max %d)\n",
+                           id, SANDBOX_MAX);
+                } else {
+                    struct sandbox_info info;
+                    if (sandbox_status(id, &info) != 0 || !info.active) {
+                        printk("Sandbox %d is not running\n", id);
+                    } else {
+                        printk("Sandbox %d already active (pid %d)\n",
+                               id, info.pid);
+                    }
+                }
+            }
+        } else {
+            printk("Unknown strt target: %s\n", argv[2]);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "stop") == 0) {
+        if (argc < 3) {
+            printk("Usage: lee stop <server|ssh|sandbox> [args]\n");
+            return;
+        }
+        if (strcmp(argv[2], "server") == 0) {
+            if (!sandbox_server_is_running()) {
+                printk("HTTP server not running\n");
+            } else {
+                sandbox_server_stop();
+                printk("HTTP server stopped\n");
+            }
+        } else if (strcmp(argv[2], "ssh") == 0) {
+            service_stop("ssh");
+        } else if (strcmp(argv[2], "sandbox") == 0) {
+            if (argc < 4) {
+                printk("Usage: lee stop sandbox <id>\n");
+                return;
+            }
+            int id = 0;
+            for (char* p = argv[3]; *p >= '0' && *p <= '9'; p++)
+                id = id * 10 + (*p - '0');
+            if (id < 1 || id > SANDBOX_MAX) {
+                printk("Invalid sandbox id: %d\n", id);
+                return;
+            }
+            if (sandbox_stop(id) == 0) {
+                printk("Sandbox %d stopped\n", id);
+            } else {
+                printk("Failed to stop sandbox %d\n", id);
+            }
+        } else {
+            printk("Unknown stop target: %s\n", argv[2]);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "sandbox") == 0) {
+        if (argc >= 3 && strcmp(argv[2], "list") == 0) {
+            sandbox_list();
+            return;
+        }
+        printk("Usage: lee sandbox list\n");
+        return;
+    }
+
+    printk("Unknown lee subcommand: %s\n", argv[1]);
+    printk("Type 'lee help' for available commands.\n");
+}
+
 /* ----- command dispatch ----------------------------------------------- */
 static void execute_command(void) {
     if (argc == 0) return;
@@ -1032,6 +1299,7 @@ static void execute_command(void) {
             printk("Unknown cron subcommand: %s\n", argv[1]);
         }
     }
+    else if (strcmp(cmd, "lee") == 0) cmd_lee(argc, argv);
     else if (strcmp(cmd, "sysinfo") == 0) {
         printk("\n=== System Information ===\n");
         printk("OS:        Lestra OS 1.0.0-alpha\n");

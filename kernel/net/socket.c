@@ -73,6 +73,11 @@ struct socket {
     int so_sndbuf;
     int so_reuseaddr;
 
+    /* TCP multi-connection */
+    uint16_t local_port;
+    int is_listening;
+    struct tcp_conn* tcp_conn_ptr;
+
     /* TLS support */
     int use_tls;
 };
@@ -140,6 +145,7 @@ int socket_connect(int fd, const struct sockaddr* addr, int addrlen) {
         s->peer_ip   = ip;
         s->peer_port = port;
         s->state     = SS_CONNECTING;
+        s->tcp_conn_ptr = NULL;
 
         /* tcp_connect blocks until SYN-ACK or timeout. */
         int rc = tcp_connect(ip, port, 5000);
@@ -149,6 +155,7 @@ int socket_connect(int fd, const struct sockaddr* addr, int addrlen) {
             return -ECONNREFUSED;
         }
         s->state = SS_CONNECTED;
+        s->tcp_conn_ptr = tcp_get_conn(0);
         return 0;
     }
     /* AF_UNIX connect is not supported — clients should use socketpair
@@ -171,25 +178,63 @@ int socket_start_tls(int fd, const char* hostname) {
 
 int socket_bind(int fd, const struct sockaddr* addr, int addrlen) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
-    if (!addr || addrlen < (int)sizeof(uint16_t)) return -EFAULT;
-    /* LestraOS TCP is single-connection client-only; bind() is a no-op
-     * that succeeds so user code that calls it doesn't crash. */
-    (void)addr; (void)addrlen;
+    if (!addr || addrlen < (int)sizeof(struct sockaddr_in)) return -EFAULT;
+    struct socket* s = &sockets[fd - SOCKET_FD_BASE];
+    if (s->kind != SOCK_INET_TCP) return -EOPNOTSUPP;
+
+    const struct sockaddr_in* in = (const struct sockaddr_in*)addr;
+    if (in->sin_family != AF_INET) return -EAFNOSUPPORT;
+    s->local_port = ntohs16(in->sin_port);
     return 0;
 }
 
 int socket_listen(int fd, int backlog) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
-    /* Same caveat as bind() — we don't have a TCP server. Accept success. */
-    (void)backlog;
+    struct socket* s = &sockets[fd - SOCKET_FD_BASE];
+    if (s->kind != SOCK_INET_TCP) return -EOPNOTSUPP;
+    if (s->local_port == 0) return -EOPNOTSUPP;
+
+    int idx = tcp_listen(s->local_port, backlog);
+    if (idx < 0) return -EADDRINUSE;
+    s->is_listening = 1;
+    s->state = SS_CONNECTED;
+    s->tcp_conn_ptr = tcp_get_conn(idx);
     return 0;
 }
 
 int socket_accept(int fd, struct sockaddr* addr, int* addrlen) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
-    /* No server-side TCP yet. */
-    (void)addr; (void)addrlen;
-    return -EOPNOTSUPP;
+    struct socket* s = &sockets[fd - SOCKET_FD_BASE];
+    if (!s->is_listening) return -EOPNOTSUPP;
+    if (s->kind != SOCK_INET_TCP) return -EOPNOTSUPP;
+
+    int listen_idx = (int)(s->tcp_conn_ptr - tcp_get_conn(0));
+    struct tcp_conn* accepted = NULL;
+    if (tcp_accept(listen_idx, &accepted) < 0) return -EOPNOTSUPP;
+
+    struct socket* ns = sock_alloc();
+    if (!ns) return -EBADF;
+    ns->domain = AF_INET;
+    ns->type   = SOCK_STREAM;
+    ns->kind   = SOCK_INET_TCP;
+    ns->state  = SS_CONNECTED;
+    ns->peer_ip   = accepted->peer_ip;
+    ns->peer_port = accepted->peer_port;
+    ns->local_port = accepted->local_port;
+    ns->tcp_conn_ptr = accepted;
+
+    if (addr && addrlen && *addrlen >= (int)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in* out = (struct sockaddr_in*)addr;
+        out->sin_family = AF_INET;
+        out->sin_port = htons16(accepted->peer_port);
+        memcpy(&out->sin_addr, accepted->peer_ip.bytes, 4);
+        memset(out->sin_zero, 0, sizeof(out->sin_zero));
+        *addrlen = sizeof(struct sockaddr_in);
+    }
+
+    int new_fd = (int)(ns - &sockets[0]) + SOCKET_FD_BASE;
+    pr_info("socket: accepted connection -> fd %d\n", new_fd);
+    return new_fd;
 }
 
 ssize_t socket_sendto(int fd, const void* buf, size_t len, int flags,
@@ -207,6 +252,9 @@ ssize_t socket_sendto(int fd, const void* buf, size_t len, int flags,
         if (s->use_tls) {
             extern int tls_send(const void*, uint16_t);
             int rc = tls_send(buf, (uint16_t)len);
+            return (rc > 0) ? (ssize_t)len : -1;
+        } else if (s->tcp_conn_ptr) {
+            int rc = tcp_send_conn(s->tcp_conn_ptr, buf, (uint16_t)len);
             return (rc > 0) ? (ssize_t)len : -1;
         } else {
             int rc = tcp_send(buf, (uint16_t)len);
@@ -238,6 +286,9 @@ ssize_t socket_recvfrom(int fd, void* buf, size_t len, int flags,
             extern int tls_recv(void*, uint16_t, uint32_t);
             int rc = tls_recv(buf, (uint16_t)len, 30000);
             return (rc >= 0) ? (ssize_t)rc : -1;
+        } else if (s->tcp_conn_ptr) {
+            int rc = tcp_recv_conn(s->tcp_conn_ptr, buf, (uint16_t)len, 30000);
+            return (rc >= 0) ? (ssize_t)rc : -1;
         } else {
             int rc = tcp_recv_wait(buf, (uint16_t)len, 30000);
             return (rc >= 0) ? (ssize_t)rc : -1;
@@ -255,12 +306,19 @@ ssize_t socket_recvfrom(int fd, void* buf, size_t len, int flags,
 int socket_close(int fd) {
     if (!socket_is_socket_fd(fd)) return -ENOTSOCK;
     struct socket* s = &sockets[fd - SOCKET_FD_BASE];
-    if (s->kind == SOCK_INET_TCP && s->state == SS_CONNECTED) {
-        if (s->use_tls) {
-            extern void tls_close(void);
-            tls_close();
-        } else {
-            tcp_close();
+    if (s->kind == SOCK_INET_TCP) {
+        if (s->is_listening && s->tcp_conn_ptr) {
+            s->tcp_conn_ptr->in_use = 0;
+            s->tcp_conn_ptr->state = TCP_CLOSED;
+        } else if (s->state == SS_CONNECTED) {
+            if (s->use_tls) {
+                extern void tls_close(void);
+                tls_close();
+            } else if (s->tcp_conn_ptr) {
+                tcp_close_conn(s->tcp_conn_ptr);
+            } else {
+                tcp_close();
+            }
         }
     }
     if (s->kind == SOCK_UNIX_STREAM) {

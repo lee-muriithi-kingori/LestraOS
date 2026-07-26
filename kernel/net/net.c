@@ -223,6 +223,9 @@ static void dhcp_handle(struct ip_hdr* ip, uint8_t* data, uint16_t len);
 extern void tcp_handle(struct ip_hdr* ip, uint8_t* data, uint16_t len);
 extern void tcp_tick(void);
 
+/* HTTP server (defined in http_server.c) */
+extern void http_server_tick(void);
+
 /* ----- checksum (Internet 16-bit one's complement) ----- */
 static uint16_t inet_checksum(const void* data, uint16_t len, uint32_t init_sum) {
     const uint8_t* p = (const uint8_t*)data;
@@ -976,9 +979,11 @@ void net_init(void) {
     }
     my_mac = e1000_get_mac();
     net_initialized = 1;
-    /* Trigger DHCP to start in net_tick() */
     net_link_up = 1;   /* link is up from driver perspective; IP not yet */
     dhcp_start();
+    /* Apply static network config if set (overrides DHCP) */
+    extern void net_config_apply(void);
+    net_config_apply();
 }
 
 void net_tick(void) {
@@ -1022,11 +1027,18 @@ void net_tick(void) {
     /* Advance DHCP and TCP state machines. */
     dhcp_tick();
     tcp_tick();
+    http_server_tick();
 
     in_net_tick = 0;
 }
 
-int          net_is_up(void)         { return net_link_up && dhcp_state == DHCP_STATE_BOUND; }
+int net_is_up(void) {
+    if (!net_link_up) return 0;
+    if (dhcp_state == DHCP_STATE_BOUND) return 1;
+    /* Static config also counts as "up" */
+    extern int net_config_is_static(void);
+    return net_config_is_static() && !ipv4_is_zero(my_ip);
+}
 ipv4_addr_t  net_get_ip(void)        { return my_ip; }
 ipv4_addr_t  net_get_gateway(void)   { return my_gw; }
 ipv4_addr_t  net_get_dns(void)       { return my_dns; }
@@ -1038,3 +1050,8 @@ int eth_send_ipv4_pub(ipv4_addr_t dst_ip, uint8_t proto,
                        const void* payload, uint16_t payload_len) {
     return eth_send_ipv4(dst_ip, proto, payload, payload_len);
 }
+
+/* Setter functions for net_config module (static IP override) */
+void net_set_mask(ipv4_addr_t mask) { my_mask = mask; }
+void net_set_gw(ipv4_addr_t gw)     { my_gw = gw; }
+void net_set_dns(ipv4_addr_t dns)   { my_dns = dns; }

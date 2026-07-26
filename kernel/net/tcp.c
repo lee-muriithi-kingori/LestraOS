@@ -1,24 +1,11 @@
 /*
- * Lestra OS - Minimal TCP state machine for one-shot HTTP requests
+ * Lestra OS - TCP state machine with multi-connection support
  * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
  *
- * This is intentionally NOT a general-purpose TCP. It supports exactly
- * one outstanding connection at a time, in a strict request/response
- * pattern:
- *
- *   1. tcp_connect(dst_ip, dst_port)
- *   2. tcp_send(data, len)         (writes happen via one or more PSH segments)
- *   3. tcp_recv(buf, bufsz, timeout)  (collects data until FIN or timeout)
- *   4. tcp_close()                  (sends FIN, transitions to CLOSED)
- *
- * The state machine is advanced by net_tick() calling tcp_tick(), which
- * processes any incoming TCP packets (already demuxed by net.c) and
- * retransmits if needed.
- *
- * Supported states: CLOSED, SYN_SENT, ESTABLISHED, CLOSE_WAIT, LAST_ACK.
- * We deliberately don't implement TIME_WAIT (just go straight to CLOSED
- * after sending the final ACK) — this is fine for a client that does
- * one request at a time.
+ * Supports up to TCP_MAX_CONNS concurrent connections (client + server).
+ * conn[0] is the default client connection used by the legacy API
+ * (tcp_connect/tcp_send/tcp_recv_wait/tcp_close) for backward compat
+ * with http.c, tls.c, ai.c.
  */
 
 #include <lestra/types.h>
@@ -27,8 +14,6 @@
 #include <lestra/timer.h>
 #include <string.h>
 
-/* IP header struct (defined in net.c — duplicate the layout here so we
- * can avoid leaking net.c's private header into tcp.c) */
 struct ip_hdr_pub {
     uint8_t  ver_ihl;
     uint8_t  tos;
@@ -42,26 +27,23 @@ struct ip_hdr_pub {
     ipv4_addr_t dst;
 } __packed;
 
-/* TCP header */
 struct tcp_hdr {
     uint16_t src_port;
     uint16_t dst_port;
     uint32_t seq;
     uint32_t ack;
-    uint16_t data_off_flags;   /* high 4 bits = data offset (in 32-bit words), low 12 = flags */
+    uint16_t data_off_flags;
     uint16_t window;
     uint16_t checksum;
     uint16_t urg_ptr;
 } __packed;
 
-/* TCP flags */
 #define TCP_FIN  0x01
 #define TCP_SYN  0x02
 #define TCP_RST  0x04
 #define TCP_PSH  0x08
 #define TCP_ACK  0x10
 
-/* Pseudo-header for TCP checksum */
 struct tcp_pseudo {
     ipv4_addr_t src;
     ipv4_addr_t dst;
@@ -70,49 +52,21 @@ struct tcp_pseudo {
     uint16_t tcp_len;
 } __packed;
 
-/* TCP connection states */
-typedef enum {
-    TCP_CLOSED = 0,
-    TCP_SYN_SENT,
-    TCP_ESTABLISHED,
-    TCP_FIN_WAIT_1,
-    TCP_FIN_WAIT_2,
-    TCP_CLOSE_WAIT,
-    TCP_LAST_ACK,
-    TCP_CLOSING,
-} tcp_state_t;
+static struct tcp_conn conns[TCP_MAX_CONNS];
+static uint16_t next_local_port = 0x4000;
 
-static tcp_state_t tcp_state = TCP_CLOSED;
-static ipv4_addr_t tcp_peer_ip;
-static uint16_t    tcp_peer_port;
-static uint16_t    tcp_local_port = 0x4000;
-static uint32_t    tx_seq = 0;
-static uint32_t    rx_seq = 0;
-
-/* Receive buffer for incoming data */
-#define TCP_RX_BUF 8192
-static uint8_t  tcp_rx_buf[TCP_RX_BUF];
-static uint16_t tcp_rx_len = 0;
-static int      tcp_rx_closed = 0;   /* set when peer sends FIN */
-
-/* Connection completion flag (for SYN_SENT -> ESTABLISHED) */
-static int      tcp_connected = 0;
-static int      tcp_connect_failed = 0;
-
-/* Retransmit state */
-static uint8_t  last_seg_buf[sizeof(struct tcp_hdr) + 1500];
-static uint16_t last_seg_len = 0;
-static uint64_t last_seg_time = 0;
-static int      retransmit_count = 0;
 #define TCP_RETRANSMIT_TIMEOUT_MS  2000
 #define TCP_MAX_RETRANSMITS        5
 
-/* Extern from net.c */
 extern int eth_send_ipv4_pub(ipv4_addr_t dst_ip, uint8_t proto,
                               const void* payload, uint16_t payload_len);
-extern ipv4_addr_t my_ip;   /* our own IP, for TCP checksum */
+extern ipv4_addr_t my_ip;
 
-/* Compute TCP checksum (pseudo-header + TCP segment) */
+struct tcp_conn* tcp_get_conn(int idx) {
+    if (idx < 0 || idx >= TCP_MAX_CONNS) return NULL;
+    return &conns[idx];
+}
+
 static uint16_t tcp_checksum(ipv4_addr_t src, ipv4_addr_t dst,
                               const void* seg, uint16_t seg_len) {
     struct tcp_pseudo ph;
@@ -122,7 +76,6 @@ static uint16_t tcp_checksum(ipv4_addr_t src, ipv4_addr_t dst,
     ph.proto = 6;
     ph.tcp_len = htons16(seg_len);
 
-    /* Sum pseudo-header then segment */
     uint32_t sum = 0;
     const uint8_t* p = (const uint8_t*)&ph;
     for (int i = 0; i < 12; i += 2) {
@@ -139,16 +92,15 @@ static uint16_t tcp_checksum(ipv4_addr_t src, ipv4_addr_t dst,
     return (uint16_t)(~sum);
 }
 
-/* Build and send a TCP segment. `flags` is the OR of TCP_* above.
- * `payload` may be NULL if payload_len == 0. */
-static int tcp_send_seg(uint8_t flags, const void* payload, uint16_t payload_len) {
+static int tcp_send_seg(struct tcp_conn* c, uint8_t flags,
+                         const void* payload, uint16_t payload_len) {
     uint8_t buf[sizeof(struct tcp_hdr) + 1500];
     struct tcp_hdr* h = (struct tcp_hdr*)buf;
-    h->src_port = htons16(tcp_local_port);
-    h->dst_port = htons16(tcp_peer_port);
-    h->seq      = htonl32(tx_seq);
-    h->ack      = htonl32(rx_seq);
-    h->data_off_flags = htons16((5 << 12) | flags);   /* 5 = 20-byte header, no options */
+    h->src_port = htons16(c->local_port);
+    h->dst_port = htons16(c->peer_port);
+    h->seq      = htonl32(c->tx_seq);
+    h->ack      = htonl32(c->rx_seq);
+    h->data_off_flags = htons16((5 << 12) | flags);
     h->window   = htons16(8192);
     h->checksum = 0;
     h->urg_ptr  = 0;
@@ -156,107 +108,184 @@ static int tcp_send_seg(uint8_t flags, const void* payload, uint16_t payload_len
         memcpy(&buf[sizeof(struct tcp_hdr)], payload, payload_len);
     }
     uint16_t seg_len = sizeof(struct tcp_hdr) + payload_len;
-    h->checksum = htons16(tcp_checksum(my_ip, tcp_peer_ip, buf, seg_len));
+    h->checksum = htons16(tcp_checksum(my_ip, c->peer_ip, buf, seg_len));
 
-    memcpy(last_seg_buf, buf, seg_len);
-    last_seg_len = seg_len;
-    last_seg_time = timer_get_ms();
-    retransmit_count = 0;
+    memcpy(c->last_seg, buf, seg_len);
+    c->last_seg_len = seg_len;
+    c->last_seg_time = timer_get_ms();
+    c->retransmit_count = 0;
 
-    int r = eth_send_ipv4_pub(tcp_peer_ip, 6 /* TCP */, buf, seg_len);
-    /* Advance our seq by payload bytes + 1 if SYN or FIN (they consume a seq) */
-    tx_seq += payload_len;
-    if (flags & (TCP_SYN | TCP_FIN)) tx_seq += 1;
+    int r = eth_send_ipv4_pub(c->peer_ip, 6, buf, seg_len);
+    c->tx_seq += payload_len;
+    if (flags & (TCP_SYN | TCP_FIN)) c->tx_seq += 1;
     return r;
 }
 
-/* ----- public API ----- */
+static uint16_t alloc_local_port(void) {
+    uint16_t p = next_local_port++;
+    if (next_local_port < 0x4000) next_local_port = 0x4000;
+    return p;
+}
+
+/* ----- legacy client API (conn[0]) ----- */
 
 int tcp_connect(ipv4_addr_t dst_ip, uint16_t dst_port, uint32_t timeout_ms) {
-    if (tcp_state != TCP_CLOSED) return 0;
+    struct tcp_conn* c = &conns[0];
+    if (c->state != TCP_CLOSED) return 0;
     if (!net_is_up()) return 0;
 
-    tcp_peer_ip = dst_ip;
-    tcp_peer_port = dst_port;
-    tcp_local_port++;
-    if (tcp_local_port < 0x4000) tcp_local_port = 0x4000;
-    tx_seq = 0x12345u ^ (uint32_t)timer_get_ms();
-    rx_seq = 0;
-    tcp_rx_len = 0;
-    tcp_rx_closed = 0;
-    tcp_connected = 0;
-    tcp_connect_failed = 0;
+    c->in_use = 1;
+    c->peer_ip = dst_ip;
+    c->peer_port = dst_port;
+    c->local_port = alloc_local_port();
+    c->tx_seq = 0x12345u ^ (uint32_t)timer_get_ms();
+    c->rx_seq = 0;
+    c->rx_len = 0;
+    c->rx_closed = 0;
+    c->tcp_connected = 0;
+    c->tcp_connect_failed = 0;
+    c->is_server = 0;
+    c->pending_accept = 0;
+    c->accepted = NULL;
+    c->last_seg_len = 0;
 
-    /* Send SYN */
-    if (!tcp_send_seg(TCP_SYN, NULL, 0)) return 0;
-    tcp_state = TCP_SYN_SENT;
+    if (!tcp_send_seg(c, TCP_SYN, NULL, 0)) return 0;
+    c->state = TCP_SYN_SENT;
 
-    /* Wait for SYN-ACK (handled by tcp_handle) */
     uint64_t deadline = timer_get_ms() + timeout_ms;
     while (timer_get_ms() < deadline) {
-        if (tcp_connected) return 1;
-        if (tcp_connect_failed) return 0;
+        if (c->tcp_connected) return 1;
+        if (c->tcp_connect_failed) return 0;
         net_tick();
     }
     pr_warn("tcp_connect: timed out waiting for SYN-ACK\n");
-    tcp_state = TCP_CLOSED;
+    c->state = TCP_CLOSED;
     return 0;
 }
 
 int tcp_send(const void* data, uint16_t len) {
-    if (tcp_state != TCP_ESTABLISHED) return 0;
-    /* Send as one PSH+ACK segment. (For large payloads we'd fragment, but
-     * 8 KB fits in one Ethernet frame at MTU 1500 only if len <= ~1460.
-     * For simplicity we cap at 1400 bytes per send; HTTP requests are
-     * usually small.) */
-    if (len > 1400) len = 1400;
-    return tcp_send_seg(TCP_PSH | TCP_ACK, data, len);
+    return tcp_send_conn(&conns[0], data, len);
 }
 
 int tcp_recv_wait(uint8_t* buf, uint16_t bufsz, uint32_t timeout_ms) {
+    return tcp_recv_conn(&conns[0], buf, bufsz, timeout_ms);
+}
+
+void tcp_close(void) {
+    tcp_close_conn(&conns[0]);
+}
+
+int tcp_is_closed(void) {
+    return conns[0].state == TCP_CLOSED;
+}
+
+/* ----- connection-specific API ----- */
+
+int tcp_send_conn(struct tcp_conn* c, const void* data, uint16_t len) {
+    if (c->state != TCP_ESTABLISHED) return 0;
+    if (len > 1400) len = 1400;
+    return tcp_send_seg(c, TCP_PSH | TCP_ACK, data, len);
+}
+
+int tcp_recv_conn(struct tcp_conn* c, uint8_t* buf, uint16_t bufsz, uint32_t timeout_ms) {
     uint64_t deadline = timer_get_ms() + timeout_ms;
     uint16_t copied = 0;
     while (timer_get_ms() < deadline) {
-        if (tcp_rx_len > 0) {
-            uint16_t n = tcp_rx_len;
+        if (c->rx_len > 0) {
+            uint16_t n = c->rx_len;
             if (n > bufsz - copied) n = bufsz - copied;
-            memcpy(&buf[copied], tcp_rx_buf, n);
-            /* Shift remaining data in the rx buffer */
-            memmove(tcp_rx_buf, &tcp_rx_buf[n], tcp_rx_len - n);
-            tcp_rx_len -= n;
+            memcpy(&buf[copied], c->rx_buf, n);
+            memmove(c->rx_buf, &c->rx_buf[n], c->rx_len - n);
+            c->rx_len -= n;
             copied += n;
         }
-        if (tcp_rx_closed) {
-            return copied;
-        }
+        if (c->rx_closed) return copied;
         if (copied >= bufsz) return copied;
         net_tick();
     }
     return copied;
 }
 
-void tcp_close(void) {
-    if (tcp_state == TCP_ESTABLISHED) {
-        /* Send FIN+ACK */
-        tcp_send_seg(TCP_FIN | TCP_ACK, NULL, 0);
-        tcp_state = TCP_FIN_WAIT_1;
-    } else if (tcp_state == TCP_CLOSE_WAIT) {
-        /* Peer already FIN'd; send our FIN */
-        tcp_send_seg(TCP_FIN | TCP_ACK, NULL, 0);
-        tcp_state = TCP_LAST_ACK;
+void tcp_close_conn(struct tcp_conn* c) {
+    if (c->state == TCP_ESTABLISHED) {
+        tcp_send_seg(c, TCP_FIN | TCP_ACK, NULL, 0);
+        c->state = TCP_FIN_WAIT_1;
+    } else if (c->state == TCP_CLOSE_WAIT) {
+        tcp_send_seg(c, TCP_FIN | TCP_ACK, NULL, 0);
+        c->state = TCP_LAST_ACK;
     } else {
-        tcp_state = TCP_CLOSED;
+        c->state = TCP_CLOSED;
     }
 }
 
-int tcp_is_closed(void) {
-    return tcp_state == TCP_CLOSED;
+/* ----- server API ----- */
+
+int tcp_listen(uint16_t port, int backlog) {
+    (void)backlog;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!conns[i].in_use || conns[i].state == TCP_CLOSED) {
+            memset(&conns[i], 0, sizeof(conns[i]));
+            conns[i].in_use = 1;
+            conns[i].state = TCP_LISTEN;
+            conns[i].is_server = 1;
+            conns[i].local_port = port;
+            pr_info("tcp: listening on port %u (slot %d)\n", (unsigned)port, i);
+            return i;
+        }
+    }
+    pr_warn("tcp_listen: no free slots\n");
+    return -1;
 }
 
-/* ----- inbound packet handler (called from net.c) ----- */
+int tcp_accept(int listen_idx, struct tcp_conn** out_conn) {
+    if (listen_idx < 0 || listen_idx >= TCP_MAX_CONNS) return -1;
+    struct tcp_conn* lc = &conns[listen_idx];
+    if (!lc->is_server) return -1;
+
+    uint64_t deadline = timer_get_ms() + 30000;
+    while (timer_get_ms() < deadline) {
+        if (lc->pending_accept) {
+            lc->pending_accept = 0;
+            *out_conn = lc->accepted;
+            lc->accepted = NULL;
+            return 0;
+        }
+        net_tick();
+    }
+    return -1;
+}
+
+/* ----- packet demux (called from net.c) ----- */
+
+static struct tcp_conn* find_conn(ipv4_addr_t src_ip, uint16_t src_port, uint16_t dst_port) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!conns[i].in_use || conns[i].is_server) continue;
+        if (ipv4_eq(conns[i].peer_ip, src_ip) &&
+            conns[i].peer_port == src_port &&
+            conns[i].local_port == dst_port) {
+            return &conns[i];
+        }
+    }
+    return NULL;
+}
+
+static struct tcp_conn* find_listener(uint16_t port) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!conns[i].in_use || !conns[i].is_server) continue;
+        if (conns[i].local_port == port) return &conns[i];
+    }
+    return NULL;
+}
+
+static int alloc_conn_slot(void) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!conns[i].in_use || conns[i].state == TCP_CLOSED) return i;
+    }
+    return -1;
+}
+
 void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
     if (len < sizeof(struct tcp_hdr)) return;
-    /* Cast through void* to avoid struct aliasing warnings */
     struct ip_hdr_pub ip = *ip_pub;
     struct tcp_hdr* h = (struct tcp_hdr*)data;
     uint8_t  data_off = (ntohs16(h->data_off_flags) >> 12) & 0xF;
@@ -266,110 +295,148 @@ void tcp_handle(struct ip_hdr_pub* ip_pub, uint8_t* data, uint16_t len) {
     uint8_t* payload = &data[hdr_len];
     uint16_t payload_len = len - hdr_len;
 
-    /* Only handle packets from our current peer (or while waiting in SYN_SENT) */
-    if (!ipv4_eq(ip.src, tcp_peer_ip)) return;
-    if (ntohs16(h->src_port) != tcp_peer_port) return;
-    if (ntohs16(h->dst_port) != tcp_local_port) return;
+    uint16_t src_port = ntohs16(h->src_port);
+    uint16_t dst_port = ntohs16(h->dst_port);
+    uint32_t seg_seq = ntohl32(h->seq);
 
-    /* If RST, abort the connection */
     if (flags & TCP_RST) {
-        pr_warn("tcp: RST received, aborting connection\n");
-        tcp_state = TCP_CLOSED;
-        tcp_connect_failed = 1;
-        last_seg_len = 0;
+        struct tcp_conn* c = find_conn(ip.src, src_port, dst_port);
+        if (c) {
+            pr_warn("tcp: RST on conn (slot %d), aborting\n",
+                    (int)(c - conns));
+            c->state = TCP_CLOSED;
+            c->tcp_connect_failed = 1;
+            c->last_seg_len = 0;
+        }
         return;
     }
 
-    if (tcp_state == TCP_SYN_SENT && (flags & TCP_SYN) && (flags & TCP_ACK)) {
-        /* SYN-ACK: finalize the handshake */
-        rx_seq = ntohl32(h->seq) + 1;  /* peer's SYN consumes one seq */
-        tx_seq = ntohl32(h->ack);       /* our seq is now what peer ACK'd */
-        /* Send ACK */
-        tcp_send_seg(TCP_ACK, NULL, 0);
-        tcp_state = TCP_ESTABLISHED;
-        tcp_connected = 1;
-        last_seg_len = 0;
-        return;
-    }
-
-    if (tcp_state == TCP_ESTABLISHED || tcp_state == TCP_FIN_WAIT_1 ||
-        tcp_state == TCP_FIN_WAIT_2 || tcp_state == TCP_CLOSE_WAIT) {
-        /* Track the peer's sequence */
-        uint32_t seg_seq = ntohl32(h->seq);
-        if (seg_seq != rx_seq) {
-            /* Out-of-order or retransmit. For our simple stack, drop the
-             * payload but still ACK to nudge the peer. */
-            if (flags & TCP_ACK) {
-                /* Send a duplicate ACK */
-                uint32_t saved_tx = tx_seq;
-                tcp_send_seg(TCP_ACK, NULL, 0);
-                (void)saved_tx;
+    if ((flags & TCP_SYN) && !(flags & TCP_ACK)) {
+        struct tcp_conn* listener = find_listener(dst_port);
+        if (listener) {
+            int slot = alloc_conn_slot();
+            if (slot < 0) {
+                pr_warn("tcp: no free slots for new connection\n");
+                return;
             }
-            /* If FIN was set, we still need to handle it. */
+            struct tcp_conn* nc = &conns[slot];
+            memset(nc, 0, sizeof(*nc));
+            nc->in_use = 1;
+            nc->peer_ip = ip.src;
+            nc->peer_port = src_port;
+            nc->local_port = dst_port;
+            nc->tx_seq = 0x56789u ^ (uint32_t)timer_get_ms();
+            nc->rx_seq = seg_seq + 1;
+            tcp_send_seg(nc, TCP_SYN | TCP_ACK, NULL, 0);
+            nc->state = TCP_SYN_RECEIVED;
+
+            listener->pending_accept = 1;
+            listener->accepted = nc;
+
+            pr_info("tcp: SYN from %u.%u.%u.%u:%u -> port %u (slot %d)\n",
+                    ip.src.bytes[0], ip.src.bytes[1],
+                    ip.src.bytes[2], ip.src.bytes[3],
+                    (unsigned)src_port, (unsigned)dst_port, slot);
+            return;
+        }
+        return;
+    }
+
+    struct tcp_conn* c = find_conn(ip.src, src_port, dst_port);
+    if (!c) return;
+
+    if (c->state == TCP_SYN_SENT && (flags & TCP_SYN) && (flags & TCP_ACK)) {
+        c->rx_seq = seg_seq + 1;
+        c->tx_seq = ntohl32(h->ack);
+        tcp_send_seg(c, TCP_ACK, NULL, 0);
+        c->state = TCP_ESTABLISHED;
+        c->tcp_connected = 1;
+        c->last_seg_len = 0;
+        return;
+    }
+
+    if (c->state == TCP_SYN_RECEIVED && (flags & TCP_ACK)) {
+        c->state = TCP_ESTABLISHED;
+        c->last_seg_len = 0;
+        return;
+    }
+
+    if (c->state == TCP_ESTABLISHED || c->state == TCP_FIN_WAIT_1 ||
+        c->state == TCP_FIN_WAIT_2 || c->state == TCP_CLOSE_WAIT) {
+        if (seg_seq != c->rx_seq) {
+            if (flags & TCP_ACK) {
+                tcp_send_seg(c, TCP_ACK, NULL, 0);
+            }
             if (!(flags & TCP_FIN)) return;
         }
 
-        /* Accept payload */
         if (payload_len > 0 && (flags & (TCP_PSH | TCP_ACK))) {
-            if (tcp_rx_len + payload_len <= TCP_RX_BUF) {
-                memcpy(&tcp_rx_buf[tcp_rx_len], payload, payload_len);
-                tcp_rx_len += payload_len;
+            if (c->rx_len + payload_len <= (uint16_t)sizeof(c->rx_buf)) {
+                memcpy(&c->rx_buf[c->rx_len], payload, payload_len);
+                c->rx_len += payload_len;
             }
-            rx_seq += payload_len;
-            /* ACK the data */
-            tcp_send_seg(TCP_ACK, NULL, 0);
+            c->rx_seq += payload_len;
+            tcp_send_seg(c, TCP_ACK, NULL, 0);
         }
 
-        /* Handle FIN */
         if (flags & TCP_FIN) {
-            rx_seq += 1;  /* FIN consumes one seq */
-            tcp_send_seg(TCP_ACK, NULL, 0);
-            if (tcp_state == TCP_ESTABLISHED) {
-                tcp_state = TCP_CLOSE_WAIT;
-                tcp_rx_closed = 1;
-                last_seg_len = 0;
-                /* We'll send our own FIN when tcp_close() is called */
-                tcp_send_seg(TCP_FIN | TCP_ACK, NULL, 0);
-                tcp_state = TCP_LAST_ACK;
-            } else if (tcp_state == TCP_FIN_WAIT_1) {
-                tcp_state = TCP_CLOSING;  /* not implemented, just close */
-                tcp_state = TCP_CLOSED;
-            } else if (tcp_state == TCP_FIN_WAIT_2) {
-                tcp_state = TCP_CLOSED;
+            c->rx_seq += 1;
+            tcp_send_seg(c, TCP_ACK, NULL, 0);
+            if (c->state == TCP_ESTABLISHED) {
+                c->state = TCP_CLOSE_WAIT;
+                c->rx_closed = 1;
+                c->last_seg_len = 0;
+                tcp_send_seg(c, TCP_FIN | TCP_ACK, NULL, 0);
+                c->state = TCP_LAST_ACK;
+            } else if (c->state == TCP_FIN_WAIT_1) {
+                c->state = TCP_CLOSING;
+                c->state = TCP_CLOSED;
+            } else if (c->state == TCP_FIN_WAIT_2) {
+                c->state = TCP_CLOSED;
             }
         }
     }
 
-    if (tcp_state == TCP_LAST_ACK && (flags & TCP_ACK)) {
-        /* Our FIN was ACK'd - we're done */
-        tcp_state = TCP_CLOSED;
-        last_seg_len = 0;
+    if (c->state == TCP_LAST_ACK && (flags & TCP_ACK)) {
+        c->state = TCP_CLOSED;
+        c->last_seg_len = 0;
     }
 }
 
-/* Called from net_tick() to advance retransmit timers. */
+/* ----- retransmit timer (called from net_tick) ----- */
+
 void tcp_tick(void) {
-    if (tcp_state == TCP_CLOSED) return;
-    if (last_seg_len == 0) return;
-
     uint64_t now = timer_get_ms();
-    uint32_t rto = TCP_RETRANSMIT_TIMEOUT_MS;
-    for (int i = 0; i < retransmit_count && rto < 30000; i++) rto *= 2;
-
-    if (now - last_seg_time >= rto) {
-        if (retransmit_count >= TCP_MAX_RETRANSMITS) {
-            pr_warn("tcp: max retransmits, aborting\n");
-            tcp_state = TCP_CLOSED;
-            tcp_connect_failed = 1;
-            last_seg_len = 0;
-            return;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!conns[i].in_use) continue;
+        if (conns[i].state == TCP_CLOSED) {
+            conns[i].in_use = 0;
+            continue;
         }
-        pr_info("tcp: retransmit #%d\n", retransmit_count + 1);
-        struct tcp_hdr* h = (struct tcp_hdr*)last_seg_buf;
-        h->checksum = 0;
-        h->checksum = htons16(tcp_checksum(my_ip, tcp_peer_ip, last_seg_buf, last_seg_len));
-        eth_send_ipv4_pub(tcp_peer_ip, 6, last_seg_buf, last_seg_len);
-        last_seg_time = now;
-        retransmit_count++;
+        if (conns[i].last_seg_len == 0) continue;
+
+        uint32_t rto = TCP_RETRANSMIT_TIMEOUT_MS;
+        for (int j = 0; j < conns[i].retransmit_count && rto < 30000; j++)
+            rto *= 2;
+
+        if (now - conns[i].last_seg_time >= rto) {
+            if (conns[i].retransmit_count >= TCP_MAX_RETRANSMITS) {
+                pr_warn("tcp: max retransmits on slot %d, aborting\n", i);
+                conns[i].state = TCP_CLOSED;
+                conns[i].tcp_connect_failed = 1;
+                conns[i].last_seg_len = 0;
+                continue;
+            }
+            pr_info("tcp: retransmit #%d on slot %d\n",
+                    conns[i].retransmit_count + 1, i);
+            struct tcp_hdr* rh = (struct tcp_hdr*)conns[i].last_seg;
+            rh->checksum = 0;
+            rh->checksum = htons16(tcp_checksum(my_ip, conns[i].peer_ip,
+                                conns[i].last_seg, conns[i].last_seg_len));
+            eth_send_ipv4_pub(conns[i].peer_ip, 6,
+                              conns[i].last_seg, conns[i].last_seg_len);
+            conns[i].last_seg_time = now;
+            conns[i].retransmit_count++;
+        }
     }
 }

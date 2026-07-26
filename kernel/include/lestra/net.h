@@ -104,6 +104,11 @@ ipv4_addr_t  net_get_dns(void);
 mac_addr_t   net_get_mac(void);
 const char*  net_get_iface_name(void);
 
+/* Static config setters (used by net_config module) */
+void net_set_mask(ipv4_addr_t mask);
+void net_set_gw(ipv4_addr_t gw);
+void net_set_dns(ipv4_addr_t dns);
+
 /* ICMP */
 int net_ping(ipv4_addr_t target, uint16_t seq, uint32_t timeout_ms);
 
@@ -134,13 +139,62 @@ int http_parse_url(const char* url,
                    uint16_t* port_out,
                    char* path_out,  int path_sz);
 
-/* ----- TCP API (used by HTTP client) -----
- * One connection at a time. */
+/* ----- TCP multi-connection support ----- */
+typedef enum {
+    TCP_CLOSED = 0,
+    TCP_SYN_SENT,
+    TCP_SYN_RECEIVED,
+    TCP_ESTABLISHED,
+    TCP_FIN_WAIT_1,
+    TCP_FIN_WAIT_2,
+    TCP_CLOSE_WAIT,
+    TCP_LAST_ACK,
+    TCP_CLOSING,
+    TCP_LISTEN,
+} tcp_state_t;
+
+#define TCP_MAX_CONNS 8
+
+struct tcp_conn {
+    int in_use;
+    int fd;
+    tcp_state_t state;
+    ipv4_addr_t peer_ip;
+    uint16_t peer_port;
+    uint16_t local_port;
+    uint32_t tx_seq;
+    uint32_t rx_seq;
+    uint8_t rx_buf[8192];
+    uint16_t rx_len;
+    int rx_closed;
+    int tcp_connected;
+    int tcp_connect_failed;
+    int retransmit_count;
+    uint8_t last_seg[1540];
+    uint16_t last_seg_len;
+    uint64_t last_seg_time;
+    int is_server;
+    int pending_accept;
+    struct tcp_conn* accepted;
+};
+
+/* ----- TCP API ----- */
+/* Client (uses conn[0] internally) */
 int  tcp_connect(ipv4_addr_t dst_ip, uint16_t dst_port, uint32_t timeout_ms);
 int  tcp_send(const void* data, uint16_t len);
 int  tcp_recv_wait(uint8_t* buf, uint16_t bufsz, uint32_t timeout_ms);
 void tcp_close(void);
 int  tcp_is_closed(void);
+
+/* Server */
+int  tcp_listen(uint16_t port, int backlog);
+int  tcp_accept(int listen_idx, struct tcp_conn** out_conn);
+
+/* Connection-specific */
+int  tcp_send_conn(struct tcp_conn* c, const void* data, uint16_t len);
+int  tcp_recv_conn(struct tcp_conn* c, uint8_t* buf, uint16_t bufsz, uint32_t timeout_ms);
+void tcp_close_conn(struct tcp_conn* c);
+struct tcp_conn* tcp_get_conn(int idx);
 
 /* ----- UDP API (used by DNS / DHCP) ----- */
 int  udp_send(ipv4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port,

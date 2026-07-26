@@ -41,6 +41,9 @@ static void timer_irq_handler(struct interrupt_frame* frame) {
         last_cron_tick = ticks;
         extern void cron_tick(void);
         cron_tick();
+        /* Service manager — check services and SSH sessions */
+        extern void service_tick(void);
+        service_tick();
     }
 }
 
