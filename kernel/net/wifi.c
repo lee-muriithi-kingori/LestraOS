@@ -11,8 +11,16 @@
  * Protocol flow:
  *   Scan:    Probe Request (broadcast) -> collect Probe Responses
  *   Connect: Auth Request (open-system) -> Auth Response
- *            Assoc Request              -> Assoc Response (get AID)
- *   WPA2 4-way handshake is not implemented.
+ *            Assoc Request (with RSN IE) -> Assoc Response (get AID)
+ *            WPA2 4-way handshake via EAPOL (ethertype 0x888E):
+ *              Msg 1 (AP->Client): ANonce
+ *              Msg 2 (Client->AP): SNonce + MIC (HMAC-SHA1-128)
+ *              Msg 3 (AP->Client): GTK (AES-128-CTR encrypted) + MIC
+ *              Msg 4 (Client->AP): confirm
+ *
+ * Crypto:   PBKDF2-HMAC-SHA1 for PMK derivation
+ *           PRF-512 for PTK derivation
+ *           AES-128-CTR for GTK decryption in Message 3
  *
  * When the E1000 NIC has no WiFi counterpart (as in QEMU), probe
  * requests never receive responses and wifi_scan() returns 0
@@ -63,6 +71,66 @@
 
 /* Channels to probe (most common 2.4 GHz non-overlapping) */
 static const uint8_t scan_channels[WIFI_SCAN_CHANNELS] = { 1, 6, 11 };
+
+/* ===================================================================
+ * WPA2 / EAPOL constants
+ * =================================================================== */
+
+#define EAPOL_ETH_TYPE      0x888E
+#define EAPOL_8021X_VER     1
+#define EAPOL_TYPE_KEY      3
+#define EAPOL_KEY_DESC_RSN  2     /* RSN / WPA2 key descriptor type */
+
+/* Key Information field bits (2 bytes, little-endian) */
+#define KEY_INFO_VER_MASK    0x0007
+#define KEY_INFO_VER_2       2    /* HMAC-SHA1-128 (WPA2) */
+#define KEY_INFO_PAIRWISE    (1 << 3)
+#define KEY_INFO_INSTALL     (1 << 4)
+#define KEY_INFO_ACK         (1 << 5)
+#define KEY_INFO_MIC         (1 << 6)
+#define KEY_INFO_SECURE      (1 << 7)
+#define KEY_INFO_REQUEST     (1 << 9)
+
+/* EAPOL-Key descriptor body byte offsets */
+#define EAPOL_KEY_DESC_OFF   0
+#define EAPOL_KEY_INFO_OFF   1
+#define EAPOL_KEY_LEN_OFF    3
+#define EAPOL_KEY_REPLAY_OFF 5
+#define EAPOL_KEY_NONCE_OFF  13
+#define EAPOL_KEY_IV_OFF     45
+#define EAPOL_KEY_RSC_OFF    61
+#define EAPOL_KEY_ID_OFF     69
+#define EAPOL_KEY_MIC_OFF    77
+#define EAPOL_KEY_DLEN_OFF   93
+#define EAPOL_KEY_DATA_OFF   95
+
+/* RSN IE constants */
+#define RSN_IE_TAG           48
+#define RSN_IE_LEN           20
+#define RSN_OUI              0x00, 0x0F, 0xAC
+#define RSN_CIPHER_CCMP      4
+#define RSN_AKM_PSK          1
+
+/* WPA2 handshake states */
+#define WPA2_STATE_IDLE      0
+#define WPA2_STATE_MSG1      1   /* waiting for Message 1 (ANonce) */
+#define WPA2_STATE_MSG3      2   /* waiting for Message 3 (GTK) */
+#define WPA2_STATE_DONE      3   /* handshake complete */
+
+typedef struct {
+    uint8_t  pmk[32];            /* Pre-Master Key (from PBKDF2) */
+    uint8_t  anonce[32];         /* AP's Nonce */
+    uint8_t  snonce[32];         /* Our Nonce */
+    uint8_t  ptk[64];            /* Pairwise Transient Key: KCK||KEK||TK */
+    uint8_t  gtk[32];            /* Group Temporal Key */
+    uint8_t  mac_addr[6];        /* Our MAC address */
+    uint8_t  ap_mac[6];          /* AP's BSSID */
+    int      state;              /* WPA2_STATE_* */
+    int      completed;          /* 1 if handshake done */
+    uint64_t replay_counter;     /* current replay counter */
+} wpa2_state_t;
+
+static wpa2_state_t wpa;
 
 /* ===================================================================
  * Internal state
@@ -238,6 +306,23 @@ static int wifi_build_assoc_request(uint8_t* buf,
                          0x0C, 0x12, 0x18, 0x24 };
     off = wifi_append_ie(buf, off, IE_SUPPORTED_RATES, 8, rates);
 
+    /* Tag 48 — RSN IE (WPA2/CCMP/PSK) so the AP knows we want WPA2 */
+    if (wpa.state != WPA2_STATE_IDLE) {
+        uint8_t rsn[22];
+        int ri = 0;
+        rsn[ri++] = 0x01; rsn[ri++] = 0x00;           /* RSN Version 1 */
+        rsn[ri++] = 0x00; rsn[ri++] = 0x0F;
+        rsn[ri++] = 0xAC; rsn[ri++] = RSN_CIPHER_CCMP; /* Group cipher */
+        rsn[ri++] = 0x01; rsn[ri++] = 0x00;           /* Pairwise count */
+        rsn[ri++] = 0x00; rsn[ri++] = 0x0F;
+        rsn[ri++] = 0xAC; rsn[ri++] = RSN_CIPHER_CCMP; /* Pairwise cipher */
+        rsn[ri++] = 0x01; rsn[ri++] = 0x00;           /* AKM count */
+        rsn[ri++] = 0x00; rsn[ri++] = 0x0F;
+        rsn[ri++] = 0xAC; rsn[ri++] = RSN_AKM_PSK;    /* AKM PSK */
+        rsn[ri++] = 0x00; rsn[ri++] = 0x00;           /* RSN capab */
+        off = wifi_append_ie(buf, off, IE_RSN, RSN_IE_LEN, rsn);
+    }
+
     return off;
 }
 
@@ -286,6 +371,544 @@ static void wifi_send_assoc_request(mac_addr_t our_mac,
     int len = wifi_build_assoc_request(buf, our_mac, bssid,
                                         ssid, ssid_len);
     wifi_send_frame(buf, len);
+}
+
+/* ===================================================================
+ * SHA-1 hash (minimal, for WPA2 key derivation)
+ * =================================================================== */
+
+static void sha1_transform(uint32_t state[5], const uint8_t block[64])
+{
+    uint32_t a, b, c, d, e, f, k, temp;
+    uint32_t w[80];
+
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)block[i*4] << 24) |
+               ((uint32_t)block[i*4+1] << 16) |
+               ((uint32_t)block[i*4+2] << 8) |
+               (uint32_t)block[i*4+3];
+    for (int i = 16; i < 80; i++) {
+        w[i] = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+        w[i] = (w[i] << 1) | (w[i] >> 31);
+    }
+
+    a = state[0]; b = state[1]; c = state[2];
+    d = state[3]; e = state[4];
+
+    for (int i = 0; i < 80; i++) {
+        if (i < 20)      { f = (b & c) | (~b & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else              { f = b ^ c ^ d; k = 0xCA62C1D6; }
+
+        temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+        e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c;
+    state[3] += d; state[4] += e;
+}
+
+static void sha1(const uint8_t* data, size_t len, uint8_t hash[20])
+{
+    uint32_t state[5] = {
+        0x67452301, 0xEFCDAB89, 0x98BADCFE,
+        0x10325476, 0xC3D2E1F0
+    };
+    uint8_t block[64];
+    size_t offset = 0;
+
+    while (offset + 64 <= len) {
+        sha1_transform(state, data + offset);
+        offset += 64;
+    }
+
+    size_t remaining = len - offset;
+    memset(block, 0, 64);
+    memcpy(block, data + offset, remaining);
+    block[remaining] = 0x80;
+
+    if (remaining >= 56) {
+        sha1_transform(state, block);
+        memset(block, 0, 64);
+    }
+
+    uint64_t bitlen = (uint64_t)len * 8;
+    block[56] = (uint8_t)(bitlen >> 56);
+    block[57] = (uint8_t)(bitlen >> 48);
+    block[58] = (uint8_t)(bitlen >> 40);
+    block[59] = (uint8_t)(bitlen >> 32);
+    block[60] = (uint8_t)(bitlen >> 24);
+    block[61] = (uint8_t)(bitlen >> 16);
+    block[62] = (uint8_t)(bitlen >> 8);
+    block[63] = (uint8_t)(bitlen);
+    sha1_transform(state, block);
+
+    for (int i = 0; i < 5; i++) {
+        hash[i*4]   = (uint8_t)(state[i] >> 24);
+        hash[i*4+1] = (uint8_t)(state[i] >> 16);
+        hash[i*4+2] = (uint8_t)(state[i] >> 8);
+        hash[i*4+3] = (uint8_t)(state[i]);
+    }
+}
+
+/* ===================================================================
+ * HMAC-SHA1 (for WPA2 PRF and MIC)
+ * =================================================================== */
+
+static void hmac_sha1(const uint8_t* key, size_t keylen,
+                      const uint8_t* data, size_t datalen,
+                      uint8_t* out, size_t outlen)
+{
+    uint8_t k_ipad[64], k_opad[64];
+    uint8_t tmp_key[20];
+    uint8_t inner_hash[20];
+    uint8_t buf[384];
+
+    if (keylen > 64) {
+        sha1(key, keylen, tmp_key);
+        key    = tmp_key;
+        keylen = 20;
+    }
+
+    memset(k_ipad, 0x36, 64);
+    memset(k_opad, 0x5C, 64);
+    for (size_t i = 0; i < keylen; i++) {
+        k_ipad[i] ^= key[i];
+        k_opad[i] ^= key[i];
+    }
+
+    memcpy(buf, k_ipad, 64);
+    memcpy(buf + 64, data, datalen);
+    sha1(buf, 64 + datalen, inner_hash);
+
+    memcpy(buf, k_opad, 64);
+    memcpy(buf + 64, inner_hash, 20);
+    sha1(buf, 64 + 20, inner_hash);
+
+    size_t copy = outlen <= 20 ? outlen : 20;
+    memcpy(out, inner_hash, copy);
+}
+
+/* ===================================================================
+ * PBKDF2-HMAC-SHA1 (derive PMK from passphrase + SSID)
+ * =================================================================== */
+
+static void pbkdf2_sha1(const char* passphrase, const char* ssid,
+                        int iterations, uint8_t* out, int outlen)
+{
+    size_t plen = strlen(passphrase);
+    size_t slen = strlen(ssid);
+    uint8_t salt[36];
+    uint8_t U[20], T[20];
+
+    memcpy(salt, ssid, slen);
+
+    int blocks = (outlen + 19) / 20;
+    int offset = 0;
+
+    for (int blk = 1; blk <= blocks; blk++) {
+        salt[slen]     = (uint8_t)(blk >> 24);
+        salt[slen + 1] = (uint8_t)(blk >> 16);
+        salt[slen + 2] = (uint8_t)(blk >> 8);
+        salt[slen + 3] = (uint8_t)(blk);
+
+        hmac_sha1((const uint8_t*)passphrase, plen,
+                  salt, slen + 4, T, 20);
+        memcpy(U, T, 20);
+
+        for (int iter = 1; iter < iterations; iter++) {
+            hmac_sha1((const uint8_t*)passphrase, plen,
+                      U, 20, U, 20);
+            for (int i = 0; i < 20; i++)
+                T[i] ^= U[i];
+        }
+
+        int copy = outlen - offset;
+        if (copy > 20) copy = 20;
+        memcpy(out + offset, T, copy);
+        offset += copy;
+    }
+}
+
+/* ===================================================================
+ * Minimal AES-128 (for WPA2 GTK decryption in Message 3)
+ * =================================================================== */
+
+static const uint8_t wpa_aes_sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+};
+
+static uint8_t wpa_aes_xtime(uint8_t x)
+{
+    return (uint8_t)((x << 1) ^ ((x >> 7) * 0x1b));
+}
+
+static void wpa_aes128_key_expand(const uint8_t key[16], uint8_t rk[176])
+{
+    memcpy(rk, key, 16);
+    uint32_t rcon = 0x01000000;
+
+    for (int i = 4; i < 44; i++) {
+        uint8_t t[4];
+        memcpy(t, rk + (i - 1) * 4, 4);
+        if (i % 4 == 0) {
+            uint8_t tmp = t[0]; t[0] = t[1]; t[1] = t[2];
+            t[2] = t[3]; t[3] = tmp;
+            for (int j = 0; j < 4; j++)
+                t[j] = wpa_aes_sbox[t[j]];
+            t[0] ^= (uint8_t)(rcon >> 24);
+            rcon <<= 8;
+        }
+        for (int j = 0; j < 4; j++)
+            rk[i * 4 + j] = rk[(i - 4) * 4 + j] ^ t[j];
+    }
+}
+
+static void wpa_aes128_encrypt(const uint8_t in[16], uint8_t out[16],
+                                const uint8_t rk[176])
+{
+    uint8_t s[16];
+    memcpy(s, in, 16);
+    for (int i = 0; i < 16; i++) s[i] ^= rk[i];
+
+    for (int round = 1; round <= 10; round++) {
+        for (int i = 0; i < 16; i++) s[i] = wpa_aes_sbox[s[i]];
+
+        uint8_t t;
+        t=s[1]; s[1]=s[5]; s[5]=s[9]; s[9]=s[13]; s[13]=t;
+        t=s[2]; s[2]=s[10]; s[10]=t; t=s[6]; s[6]=s[14]; s[14]=t;
+        t=s[15]; s[15]=s[11]; s[11]=s[7]; s[7]=s[3]; s[3]=t;
+
+        if (round < 10) {
+            for (int c = 0; c < 4; c++) {
+                uint8_t a0=s[c*4], a1=s[c*4+1], a2=s[c*4+2], a3=s[c*4+3];
+                s[c*4]   = wpa_aes_xtime(a0)^wpa_aes_xtime(a1)^a1^a2^a3;
+                s[c*4+1] = a0^wpa_aes_xtime(a1)^wpa_aes_xtime(a2)^a2^a3;
+                s[c*4+2] = a0^a1^wpa_aes_xtime(a2)^wpa_aes_xtime(a3)^a3;
+                s[c*4+3] = wpa_aes_xtime(a0)^a0^a1^a2^wpa_aes_xtime(a3);
+            }
+        }
+
+        for (int i = 0; i < 16; i++) s[i] ^= rk[round * 16 + i];
+    }
+
+    memcpy(out, s, 16);
+}
+
+/* AES-128-CTR: XOR data with keystream (encrypt == decrypt for CTR) */
+static void wpa_aes128_ctr(uint8_t* data, size_t len,
+                           const uint8_t key[16], const uint8_t iv[16])
+{
+    uint8_t counter[16];
+    uint8_t round_keys[176];
+    uint8_t ks[16];
+
+    memcpy(counter, iv, 16);
+    wpa_aes128_key_expand(key, round_keys);
+
+    size_t off = 0;
+    while (off < len) {
+        wpa_aes128_encrypt(counter, ks, round_keys);
+        size_t blen = len - off;
+        if (blen > 16) blen = 16;
+        for (size_t i = 0; i < blen; i++)
+            data[off + i] ^= ks[i];
+        off += blen;
+        for (int i = 15; i >= 0; i--)
+            if (++counter[i] != 0) break;
+    }
+}
+
+/* ===================================================================
+ * WPA2 PRF-512 key derivation
+ *   PTK = PRF-512(PMK, "Pairwise key expansion",
+ *                  Min(AA,SPA)||Max(AA,SPA)||Min(ANonce,SNonce)||Max(...))
+ * =================================================================== */
+
+static void wpa2_prf512(const uint8_t pmk[32],
+                        const uint8_t aa[6], const uint8_t spa[6],
+                        const uint8_t anonce[32], const uint8_t snonce[32],
+                        uint8_t ptk[64])
+{
+    const char* label = "Pairwise key expansion";
+    size_t label_len = 22;
+
+    uint8_t addr1[6], addr2[6];
+    if (memcmp(aa, spa, 6) <= 0) {
+        memcpy(addr1, aa, 6); memcpy(addr2, spa, 6);
+    } else {
+        memcpy(addr1, spa, 6); memcpy(addr2, aa, 6);
+    }
+
+    uint8_t n1[32], n2[32];
+    if (memcmp(anonce, snonce, 32) <= 0) {
+        memcpy(n1, anonce, 32); memcpy(n2, snonce, 32);
+    } else {
+        memcpy(n1, snonce, 32); memcpy(n2, anonce, 32);
+    }
+
+    uint8_t data[76];
+    memcpy(data,      addr1, 6);
+    memcpy(data + 6,  addr2, 6);
+    memcpy(data + 12, n1,   32);
+    memcpy(data + 44, n2,   32);
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t input[102];
+        int off = 0;
+        memcpy(input + off, label, label_len); off += label_len;
+        input[off++] = 0x00;
+        memcpy(input + off, data, 76); off += 76;
+        input[off++] = 0x00;
+        input[off++] = (uint8_t)i;
+
+        uint8_t hmac_out[20];
+        hmac_sha1(pmk, 32, input, off, hmac_out, 20);
+        int copy = 64 - i * 20;
+        if (copy > 20) copy = 20;
+        memcpy(ptk + i * 20, hmac_out, copy);
+    }
+}
+
+/* ===================================================================
+ * WPA2 EAPOL frame send / receive
+ * =================================================================== */
+
+extern void get_random_bytes(void* buf, size_t len);
+
+static void wpa_generate_snonce(void)
+{
+    get_random_bytes(wpa.snonce, 32);
+}
+
+static void wpa_derive_ptk(void)
+{
+    mac_addr_t our_mac = e1000_get_mac();
+    memcpy(wpa.mac_addr, our_mac.bytes, 6);
+    wpa2_prf512(wpa.pmk, wpa.ap_mac, wpa.mac_addr,
+                wpa.anonce, wpa.snonce, wpa.ptk);
+}
+
+static void wpa2_compute_mic(const uint8_t* body, uint16_t body_len,
+                             const uint8_t kck[16], uint8_t mic[16])
+{
+    uint8_t full[20];
+    hmac_sha1(kck, 16, body, body_len, full, 20);
+    memcpy(mic, full, 16);
+}
+
+static void wifi_send_eapol(const uint8_t* body, uint16_t body_len,
+                            const uint8_t dst_mac[6])
+{
+    uint8_t pkt[300];
+    int off = 0;
+
+    memcpy(pkt + off, dst_mac, 6);           off += 6;
+    mac_addr_t our_mac = e1000_get_mac();
+    memcpy(pkt + off, our_mac.bytes, 6);      off += 6;
+    pkt[off++] = (uint8_t)((EAPOL_ETH_TYPE >> 8) & 0xFF);
+    pkt[off++] = (uint8_t)(EAPOL_ETH_TYPE & 0xFF);
+
+    pkt[off++] = EAPOL_8021X_VER;
+    pkt[off++] = EAPOL_TYPE_KEY;
+    pkt[off++] = (uint8_t)((body_len >> 8) & 0xFF);
+    pkt[off++] = (uint8_t)(body_len & 0xFF);
+
+    memcpy(pkt + off, body, body_len);
+    off += body_len;
+
+    e1000_send(pkt, (uint16_t)off);
+}
+
+static void wpa_send_message_2(void)
+{
+    uint8_t body[256];
+    int off = 0;
+
+    body[off++] = EAPOL_KEY_DESC_RSN;
+
+    uint16_t ki = KEY_INFO_VER_2 | KEY_INFO_PAIRWISE | KEY_INFO_MIC;
+    body[off++] = (uint8_t)(ki & 0xFF);
+    body[off++] = (uint8_t)((ki >> 8) & 0xFF);
+
+    body[off++] = 0; body[off++] = 0;
+
+    for (int i = 7; i >= 0; i--)
+        body[off++] = (uint8_t)(wpa.replay_counter >> (i * 8));
+
+    memcpy(body + off, wpa.snonce, 32); off += 32;
+
+    memset(body + off, 0, 16); off += 16;
+    memset(body + off, 0, 8);  off += 8;
+    memset(body + off, 0, 8);  off += 8;
+
+    int mic_off = off;
+    memset(body + off, 0, 16); off += 16;
+
+    body[off++] = 0; body[off++] = 0;
+
+    wpa2_compute_mic(body, (uint16_t)off, wpa.ptk, body + mic_off);
+
+    wifi_send_eapol(body, (uint16_t)off, wpa.ap_mac);
+    pr_info("wifi: WPA2 msg2 sent (SNonce ready)\n");
+}
+
+static void wpa_send_message_4(void)
+{
+    uint8_t body[256];
+    int off = 0;
+
+    body[off++] = EAPOL_KEY_DESC_RSN;
+
+    uint16_t ki = KEY_INFO_VER_2 | KEY_INFO_PAIRWISE |
+                  KEY_INFO_MIC | KEY_INFO_SECURE;
+    body[off++] = (uint8_t)(ki & 0xFF);
+    body[off++] = (uint8_t)((ki >> 8) & 0xFF);
+
+    body[off++] = 0; body[off++] = 0;
+
+    for (int i = 7; i >= 0; i--)
+        body[off++] = (uint8_t)(wpa.replay_counter >> (i * 8));
+
+    memset(body + off, 0, 32); off += 32;
+    memset(body + off, 0, 16); off += 16;
+    memset(body + off, 0, 8);  off += 8;
+    memset(body + off, 0, 8);  off += 8;
+
+    int mic_off = off;
+    memset(body + off, 0, 16); off += 16;
+
+    body[off++] = 0; body[off++] = 0;
+
+    wpa2_compute_mic(body, (uint16_t)off, wpa.ptk, body + mic_off);
+
+    wifi_send_eapol(body, (uint16_t)off, wpa.ap_mac);
+    pr_info("wifi: WPA2 msg4 sent — handshake confirmed\n");
+}
+
+/* Handle incoming EAPOL-Key frame (called from net.c for ethertype 0x888E) */
+void wifi_handle_eapol_frame(const uint8_t* data, uint16_t len)
+{
+    if (len < 4) return;
+
+    uint8_t  type    = data[1];
+    uint16_t body_len = ((uint16_t)data[2] << 8) | data[3];
+
+    if (type != EAPOL_TYPE_KEY) return;
+    if ((uint32_t)4 + body_len > len) return;
+    if (body_len < EAPOL_KEY_DATA_OFF) return;
+
+    const uint8_t* body = data + 4;
+
+    if (body[EAPOL_KEY_DESC_OFF] != EAPOL_KEY_DESC_RSN) return;
+
+    uint16_t key_info = body[EAPOL_KEY_INFO_OFF] |
+                        ((uint16_t)body[EAPOL_KEY_INFO_OFF + 1] << 8);
+
+    uint64_t replay = 0;
+    for (int i = 0; i < 8; i++)
+        replay = (replay << 8) | body[EAPOL_KEY_REPLAY_OFF + i];
+
+    const uint8_t* nonce = body + EAPOL_KEY_NONCE_OFF;
+    const uint8_t* iv    = body + EAPOL_KEY_IV_OFF;
+    const uint8_t* mic   = body + EAPOL_KEY_MIC_OFF;
+    uint16_t kd_len = body[EAPOL_KEY_DLEN_OFF] |
+                      ((uint16_t)body[EAPOL_KEY_DLEN_OFF + 1] << 8);
+
+    int ack     = (key_info & KEY_INFO_ACK) != 0;
+    int mic_f   = (key_info & KEY_INFO_MIC) != 0;
+    int secure  = (key_info & KEY_INFO_SECURE) != 0;
+    int ptype   = (key_info & KEY_INFO_PAIRWISE) != 0;
+    int ver     = key_info & KEY_INFO_VER_MASK;
+
+    pr_info("wifi: EAPOL-Key recv info=0x%04X ack=%d mic=%d sec=%d\n",
+            key_info, ack, mic_f, secure);
+
+    switch (wpa.state) {
+
+    case WPA2_STATE_MSG1:
+        if (ack && ptype && !mic_f && ver == KEY_INFO_VER_2) {
+            memcpy(wpa.anonce, nonce, 32);
+            wpa.replay_counter = replay;
+
+            wpa_generate_snonce();
+            wpa_derive_ptk();
+            wpa_send_message_2();
+            wpa.state = WPA2_STATE_MSG3;
+        }
+        break;
+
+    case WPA2_STATE_MSG3:
+        if (ack && mic_f && secure && ptype && ver == KEY_INFO_VER_2) {
+            uint8_t body_copy[256];
+            int copy_len = body_len;
+            if (copy_len > 255) copy_len = 255;
+            memcpy(body_copy, body, copy_len);
+            memset(body_copy + EAPOL_KEY_MIC_OFF, 0, 16);
+
+            uint8_t expected_mic[16];
+            wpa2_compute_mic(body_copy, (uint16_t)copy_len,
+                            wpa.ptk, expected_mic);
+
+            if (memcmp(mic, expected_mic, 16) != 0) {
+                pr_warn("wifi: WPA2 msg3 MIC mismatch\n");
+                break;
+            }
+
+            if (kd_len > 0 && EAPOL_KEY_DATA_OFF + kd_len <= (uint16_t)copy_len) {
+                uint8_t keydata[128];
+                int kd_copy = kd_len;
+                if (kd_copy > (int)sizeof(keydata) - 1)
+                    kd_copy = (int)sizeof(keydata) - 1;
+                memcpy(keydata, body_copy + EAPOL_KEY_DATA_OFF, kd_copy);
+
+                wpa_aes128_ctr(keydata, (size_t)kd_copy,
+                               wpa.ptk + 16, iv);
+
+                int kd_off = 0;
+                while (kd_off + 3 <= kd_copy) {
+                    uint8_t  kd_type = keydata[kd_off];
+                    uint16_t kd_item = keydata[kd_off + 1] |
+                                       ((uint16_t)keydata[kd_off + 2] << 8);
+                    if (kd_off + 3 + kd_item > kd_copy) break;
+
+                    if (kd_type == 1 && kd_item >= 24) {
+                        memcpy(wpa.gtk, keydata + kd_off + 1,
+                               kd_item > 32 ? 32 : kd_item);
+                        pr_info("wifi: WPA2 GTK extracted (%d bytes)\n",
+                                kd_item);
+                    }
+                    kd_off += 3 + kd_item;
+                }
+            }
+
+            wpa.replay_counter = replay;
+            wpa_send_message_4();
+            wpa.state = WPA2_STATE_DONE;
+            wpa.completed = 1;
+            pr_info("wifi: WPA2 4-way handshake complete!\n");
+        }
+        break;
+
+    default:
+        break;
+    }
 }
 
 /* ===================================================================
@@ -421,7 +1044,7 @@ static void wifi_wait_ms(uint32_t ms)
 
 void wifi_init(void)
 {
-    pr_info("wifi: initialising WLAN framework (802.11 mgmt frames)\n");
+    pr_info("wifi: initialising WLAN framework (802.11 mgmt frames + WPA2)\n");
 
     memset(scan_results, 0, sizeof(scan_results));
     memset(connected_ssid, 0, sizeof(connected_ssid));
@@ -432,11 +1055,12 @@ void wifi_init(void)
     is_authenticated = 0;
     is_associated    = 0;
     memset(assoc_bssid, 0, sizeof(assoc_bssid));
+    memset(&wpa, 0, sizeof(wpa));
     initialized   = 1;
 
     if (e1000_is_present()) {
-        pr_info("wifi: NIC present, probes sent as ethertype 0x%04X\n",
-                WIFI_ETH_TYPE);
+        pr_info("wifi: NIC present, probes ethertype 0x%04X, EAPOL 0x%04X\n",
+                WIFI_ETH_TYPE, EAPOL_ETH_TYPE);
     } else {
         pr_warn("wifi: no network hardware — WiFi unavailable\n");
     }
@@ -547,6 +1171,8 @@ void wifi_handle_frame(const uint8_t* data, uint16_t len)
                 assoc_id = aid;
                 is_associated = 1;
                 pr_info("wifi: associated (AID=%d)\n", assoc_id);
+                if (wpa.state == WPA2_STATE_MSG1)
+                    pr_info("wifi: waiting for WPA2 handshake ...\n");
             }
         }
         break;
@@ -601,6 +1227,19 @@ int wifi_connect(const char* ssid, const char* password)
         return -1;
     }
 
+    /* --- Derive PMK from passphrase + SSID (WPA2-PBKDF2) --- */
+    memset(&wpa, 0, sizeof(wpa));
+    memcpy(wpa.ap_mac, scan_results[found].bssid, 6);
+
+    if (password && password[0]) {
+        pbkdf2_sha1(password, ssid, 4096, wpa.pmk, 32);
+        pr_info("wifi: PMK derived from \"%s\" via PBKDF2\n", ssid);
+        wpa.state = WPA2_STATE_MSG1;
+    } else {
+        pr_info("wifi: open network (no WPA2)\n");
+        wpa.state = WPA2_STATE_IDLE;
+    }
+
     /* Set up connection state before beginning the 802.11 handshake
      * so that wifi_handle_frame() can drive the state machine. */
     connected     = 1;
@@ -637,12 +1276,25 @@ int wifi_connect(const char* ssid, const char* password)
         goto fail;
     }
 
-    /* --- Step 3: WPA2 4-way handshake (not implemented) --- */
-    pr_info("wifi: connected to \"%s\" (AID=%d, signal=%d%%)\n",
-            connected_ssid, assoc_id,
-            scan_results[found].signal_pct);
+    /* --- Step 3: WPA2 4-way handshake --- */
+    if (wpa.state == WPA2_STATE_MSG1) {
+        pr_info("wifi: waiting for WPA2 4-way handshake ...\n");
+        wifi_wait_ms(2000);
 
-    (void)password;  /* WPA2 handshake would go here */
+        if (!wpa.completed) {
+            pr_warn("wifi: WPA2 handshake timed out\n");
+            goto fail;
+        }
+
+        pr_info("wifi: connected to \"%s\" (AID=%d, signal=%d%%, WPA2)\n",
+                connected_ssid, assoc_id,
+                scan_results[found].signal_pct);
+    } else {
+        pr_info("wifi: connected to \"%s\" (AID=%d, signal=%d%%, open)\n",
+                connected_ssid, assoc_id,
+                scan_results[found].signal_pct);
+    }
+
     return 0;
 
 fail:
@@ -653,6 +1305,7 @@ fail:
     is_associated    = 0;
     memset(connected_ssid, 0, sizeof(connected_ssid));
     memset(assoc_bssid, 0, sizeof(assoc_bssid));
+    memset(&wpa, 0, sizeof(wpa));
     return -1;
 }
 
@@ -672,6 +1325,7 @@ int wifi_disconnect(void)
     is_associated    = 0;
     memset(connected_ssid, 0, sizeof(connected_ssid));
     memset(assoc_bssid, 0, sizeof(assoc_bssid));
+    memset(&wpa, 0, sizeof(wpa));
     return 0;
 }
 

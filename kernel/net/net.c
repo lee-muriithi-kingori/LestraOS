@@ -19,6 +19,7 @@
 
 #include <lestra/types.h>
 #include <lestra/net.h>
+#include <lestra/firewall.h>
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 #include <lestra/timer.h>
@@ -33,11 +34,14 @@ extern int        e1000_recv(void* buf, uint16_t bufsz);
 
 /* WiFi frame handler (defined in net/wifi.c) */
 extern void wifi_handle_frame(const uint8_t* data, uint16_t len);
+extern void wifi_handle_eapol_frame(const uint8_t* data, uint16_t len);
 
 /* ----- Ethernet header ----- */
 #define ETH_TYPE_IPV4       0x0800
 #define ETH_TYPE_ARP        0x0806
+#define ETH_TYPE_IPV6       0x86DD
 #define ETH_TYPE_WLAN_MGMT  0x88B4  /* 802.11 management frames over Ethernet */
+#define ETH_TYPE_EAPOL      0x888E  /* EAPOL (WPA2 4-way handshake) */
 
 struct eth_hdr {
     mac_addr_t  dst;
@@ -187,6 +191,22 @@ static ipv4_addr_t  my_gw   = IP_ZERO;
 static ipv4_addr_t  my_dns  = IP_ZERO;
 static mac_addr_t   my_mac  = MAC_ZERO;
 
+/* IPv6 state */
+static ipv6_addr_t  my_ip6       = IPV6_ZERO;
+static ipv6_addr_t  my_ip6_gw    = IPV6_ZERO;
+static int          ipv6_valid   = 0;   /* 1 once we have a global address */
+static int          ipv6_auto_done = 0;
+
+/* NDP cache */
+static struct ndp_cache_entry ndp_cache[NDP_CACHE_SIZE];
+
+/* Pending NDP resolution */
+static ipv6_addr_t  ndp_pending_ip  = IPV6_ZERO;
+static mac_addr_t   ndp_pending_mac = MAC_ZERO;
+static int          ndp_pending_done = 0;
+static uint64_t     ndp_pending_started = 0;
+static int          ndp_pending_tries = 0;
+
 /* DHCP state machine */
 typedef enum {
     DHCP_STATE_INIT = 0,
@@ -223,8 +243,17 @@ static void dhcp_start(void);
 static void dhcp_tick(void);
 static void dhcp_handle(struct ip_hdr* ip, uint8_t* data, uint16_t len);
 
+/* IPv6 handlers */
+static void handle_ipv6(uint8_t* data, uint16_t len);
+static void handle_icmpv6(ipv6_addr_t src, ipv6_addr_t dst, uint8_t* data, uint16_t len);
+static void handle_ndp(uint8_t* data, uint16_t len, mac_addr_t src_mac);
+static void ipv6_auto_config(void);
+static int  eth_send_ipv6_raw(ipv6_addr_t dst, uint8_t next_hdr,
+                               const void* payload, uint16_t payload_len);
+
 /* TCP entry (defined in tcp.c) */
 extern void tcp_handle(struct ip_hdr* ip, uint8_t* data, uint16_t len);
+extern void tcp_handle6(ipv6_addr_t src, ipv6_addr_t dst, uint8_t* data, uint16_t len);
 extern void tcp_tick(void);
 
 /* HTTP server (defined in http_server.c) */
@@ -357,6 +386,376 @@ static mac_addr_t arp_resolve(ipv4_addr_t ip, uint32_t timeout_ms) {
     return MAC_ZERO;
 }
 
+/* ----- NDP (Neighbor Discovery Protocol for IPv6) ----- */
+static mac_addr_t ndp_lookup(ipv6_addr_t ip) {
+    for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (ndp_cache[i].state != 0 && ipv6_eq(ndp_cache[i].ip, ip)) {
+            return ndp_cache[i].mac;
+        }
+    }
+    return MAC_ZERO;
+}
+
+static void ndp_cache_add(ipv6_addr_t ip, mac_addr_t mac, int state) {
+    if (ipv6_is_zero(ip)) return;
+    int empty = -1;
+    for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (ndp_cache[i].state == 0) { empty = i; break; }
+        if (ipv6_eq(ndp_cache[i].ip, ip)) {
+            ndp_cache[i].mac = mac;
+            ndp_cache[i].state = state;
+            ndp_cache[i].last_seen = timer_get_ms();
+            return;
+        }
+    }
+    if (empty >= 0) {
+        ndp_cache[empty].ip = ip;
+        ndp_cache[empty].mac = mac;
+        ndp_cache[empty].state = state;
+        ndp_cache[empty].last_seen = timer_get_ms();
+    }
+}
+
+/* ----- IPv6 checksum (pseudo-header + data) ----- */
+static uint16_t ipv6_l4_checksum(ipv6_addr_t src, ipv6_addr_t dst,
+                                  uint8_t proto,
+                                  const void* l4, uint16_t l4_len) {
+    uint32_t sum = 0;
+    /* Pseudo-header: src (16 bytes) + dst (16 bytes) + 4-byte length + next header */
+    for (int i = 0; i < 16; i += 2)
+        sum += ((uint16_t)src.bytes[i] << 8) | src.bytes[i+1];
+    for (int i = 0; i < 16; i += 2)
+        sum += ((uint16_t)dst.bytes[i] << 8) | dst.bytes[i+1];
+    sum += proto;
+    sum += l4_len;
+    return inet_checksum(l4, l4_len, sum);
+}
+
+static void ndp_send_solicit(ipv6_addr_t target) {
+    /* Build NS: ICMPv6 header (type=135, code=0, checksum) + reserved + target + SLL option */
+    uint8_t buf[sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr) +
+                sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_ns) + 8];
+    struct eth_hdr*    eth  = (struct eth_hdr*)&buf[0];
+    struct ipv6_hdr*   ip6  = (struct ipv6_hdr*)&buf[sizeof(struct eth_hdr)];
+    uint8_t*           icmp = &buf[sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr)];
+    struct icmpv6_hdr* ih   = (struct icmpv6_hdr*)icmp;
+    struct icmpv6_ns*  ns   = (struct icmpv6_ns*)(icmp + sizeof(struct icmpv6_hdr));
+    uint8_t*           opt  = icmp + sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_ns);
+
+    /* NDP target address = our link-local for source LL option */
+    ipv6_addr_t src_ll = ipv6_create_link_local(my_mac);
+
+    /* Multicast MAC for solicited-node: ff02::1:ffXX:XXXX */
+    mac_addr_t dst_mac;
+    dst_mac.bytes[0] = 0x33;
+    dst_mac.bytes[1] = 0x33;
+    dst_mac.bytes[2] = target.bytes[13];
+    dst_mac.bytes[3] = target.bytes[14];
+    dst_mac.bytes[4] = target.bytes[15];
+    dst_mac.bytes[5] = 0x00;
+
+    eth->dst = dst_mac;
+    eth->src = my_mac;
+    eth->ethertype = htons16(ETH_TYPE_IPV6);
+
+    /* IPv6 header */
+    uint32_t ver = (6u << 28);
+    ip6->ver_traffic_flow = htonl32(ver);
+    uint16_t payload_len = sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_ns) + 8;
+    ip6->payload_len = htons16(payload_len);
+    ip6->next_header = IPV6_PROTO_ICMPV6;
+    ip6->hop_limit = 255;
+    ip6->src = src_ll;
+    ip6->dst = target;
+
+    /* ICMPv6 header */
+    ih->type = ICMPV6_TYPE_NS;
+    ih->code = 0;
+    ih->checksum = 0;
+
+    /* NS body */
+    ns->reserved = 0;
+    ns->target = target;
+
+    /* Source LL addr option */
+    opt[0] = NDP_OPT_SOURCE_LLADDR;
+    opt[1] = 1;  /* 8 bytes */
+    memcpy(&opt[2], my_mac.bytes, 6);
+
+    /* ICMPv6 checksum over pseudo-header + ICMPv6 message */
+    ih->checksum = htons16(ipv6_l4_checksum(src_ll, target,
+                           IPV6_PROTO_ICMPV6, icmp, payload_len));
+
+    e1000_send(buf, sizeof(buf));
+}
+
+/* Resolve IPv6 address to MAC via NDP. Blocks up to timeout_ms. */
+static mac_addr_t ndp_resolve(ipv6_addr_t ip, uint32_t timeout_ms) {
+    mac_addr_t m = ndp_lookup(ip);
+    if (m.bytes[0] || m.bytes[1] || m.bytes[2] ||
+        m.bytes[3] || m.bytes[4] || m.bytes[5]) {
+        return m;
+    }
+    if (ipv6_is_multicast(ip)) {
+        /* Multicast MAC: 33:33:XX:XX:XX:XX */
+        mac_addr_t mc;
+        mc.bytes[0] = 0x33; mc.bytes[1] = 0x33;
+        mc.bytes[2] = ip.bytes[12]; mc.bytes[3] = ip.bytes[13];
+        mc.bytes[4] = ip.bytes[14]; mc.bytes[5] = ip.bytes[15];
+        return mc;
+    }
+    ipv6_addr_t my_ll = ipv6_create_link_local(my_mac);
+    if (ipv6_eq(ip, my_ll)) return my_mac;
+
+    ndp_pending_ip = ip;
+    ndp_pending_mac = MAC_ZERO;
+    ndp_pending_done = 0;
+    ndp_pending_started = timer_get_ms();
+    ndp_pending_tries = 0;
+    ndp_send_solicit(ip);
+
+    uint64_t deadline = ndp_pending_started + timeout_ms;
+    while (timer_get_ms() < deadline) {
+        if (ndp_pending_done == 1) return ndp_pending_mac;
+        if (timer_get_ms() > ndp_pending_started + (uint64_t)(ndp_pending_tries + 1) * 200) {
+            ndp_pending_tries++;
+            ndp_send_solicit(ip);
+        }
+        net_tick();
+    }
+    ndp_pending_done = -1;
+    return MAC_ZERO;
+}
+
+/* Send an IPv6 packet over Ethernet. Returns bytes sent or 0 on failure. */
+static int eth_send_ipv6_raw(ipv6_addr_t dst, uint8_t next_hdr,
+                              const void* payload, uint16_t payload_len) {
+    if (!net_link_up) return 0;
+
+    mac_addr_t dst_mac = ndp_resolve(dst, 1000);
+    int mac_any = dst_mac.bytes[0] | dst_mac.bytes[1] | dst_mac.bytes[2]
+                | dst_mac.bytes[3] | dst_mac.bytes[4] | dst_mac.bytes[5];
+    if (!mac_any && !ipv6_is_multicast(dst)) return 0;
+
+    uint16_t total = sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr) + payload_len;
+    if (total > NET_MAX_PKT) return 0;
+
+    static uint8_t buf[NET_MAX_PKT];
+    struct eth_hdr*  eth = (struct eth_hdr*)&buf[0];
+    struct ipv6_hdr* ip6 = (struct ipv6_hdr*)&buf[sizeof(struct eth_hdr)];
+    uint8_t*         pl  = &buf[sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr)];
+
+    eth->dst = dst_mac;
+    eth->src = my_mac;
+    eth->ethertype = htons16(ETH_TYPE_IPV6);
+
+    uint32_t ver = (6u << 28);
+    ip6->ver_traffic_flow = htonl32(ver);
+    ip6->payload_len = htons16(payload_len);
+    ip6->next_header = next_hdr;
+    ip6->hop_limit = 64;
+    ip6->src = ipv6_create_link_local(my_mac);
+    ip6->dst = dst;
+
+    memcpy(pl, payload, payload_len);
+
+    return e1000_send(buf, total);
+}
+
+/* Public wrapper for tcp.c */
+int eth_send_ipv6_pub(ipv6_addr_t dst, uint8_t next_hdr,
+                       const void* payload, uint16_t payload_len) {
+    return eth_send_ipv6_raw(dst, next_hdr, payload, payload_len);
+}
+
+/* ----- ICMPv6 handler ----- */
+static uint16_t net_ping6_expect_id = 0;
+static uint16_t net_ping6_expect_seq = 0;
+static int      net_ping6_got_reply = 0;
+
+static void handle_icmpv6(ipv6_addr_t src, ipv6_addr_t dst, uint8_t* data, uint16_t len) {
+    if (len < 4) return;
+    struct icmpv6_hdr* hdr = (struct icmpv6_hdr*)data;
+
+    switch (hdr->type) {
+    case ICMPV6_TYPE_ECHO_REQUEST: {
+        /* Reply: swap src/dst, type -> 129 */
+        uint8_t buf[sizeof(struct icmpv6_hdr) + 64];
+        uint16_t paylen = len;
+        if (paylen > sizeof(buf)) paylen = sizeof(buf);
+        memcpy(buf, data, paylen);
+        struct icmpv6_hdr* rh = (struct icmpv6_hdr*)buf;
+        rh->type = ICMPV6_TYPE_ECHO_REPLY;
+        rh->code = 0;
+        rh->checksum = 0;
+        rh->checksum = htons16(ipv6_l4_checksum(dst, src, IPV6_PROTO_ICMPV6, buf, paylen));
+        eth_send_ipv6_raw(src, IPV6_PROTO_ICMPV6, buf, paylen);
+        break;
+    }
+    case ICMPV6_TYPE_ECHO_REPLY: {
+        struct icmpv6_echo* ec = (struct icmpv6_echo*)(data + 4);
+        if (ntohs16(ec->id) == net_ping6_expect_id &&
+            ntohs16(ec->seq) == net_ping6_expect_seq) {
+            net_ping6_got_reply = 1;
+        }
+        break;
+    }
+    case ICMPV6_TYPE_NS: {
+        /* Neighbor Solicitation: reply with Neighbor Advertisement */
+        struct icmpv6_ns* ns = (struct icmpv6_ns*)(data + 4);
+        if (len < sizeof(struct icmpv6_hdr) + 4 + 16) return;
+        ipv6_addr_t target = ns->target;
+
+        /* Cache the sender's MAC if SLL option present */
+        if (len >= sizeof(struct icmpv6_hdr) + 4 + 16 + 8) {
+            uint8_t* opt = data + sizeof(struct icmpv6_hdr) + 4 + 16;
+            if (opt[0] == NDP_OPT_SOURCE_LLADDR && opt[1] == 1) {
+                mac_addr_t sender_mac;
+                memcpy(sender_mac.bytes, &opt[2], 6);
+                ndp_cache_add(src, sender_mac, 2);
+            }
+        }
+
+        /* Only reply if target is our address */
+        ipv6_addr_t my_ll = ipv6_create_link_local(my_mac);
+        if (ipv6_eq(target, my_ll) || ipv6_eq(target, my_ip6)) {
+            /* Build NA */
+            uint8_t buf[sizeof(struct icmpv6_hdr) + 4 + 16 + 8];
+            memset(buf, 0, sizeof(buf));
+            struct icmpv6_hdr* na_hdr = (struct icmpv6_hdr*)buf;
+            struct icmpv6_na*  na = (struct icmpv6_na*)(buf + 4);
+            na_hdr->type = ICMPV6_TYPE_NA;
+            na_hdr->code = 0;
+            na->flags = htonl32(0x60000000); /* R=0, S=1, O=1 */
+            na->target = target;
+            /* Target LL addr option */
+            uint8_t* opt = buf + sizeof(struct icmpv6_hdr) + 4 + 16;
+            opt[0] = NDP_OPT_TARGET_LLADDR;
+            opt[1] = 1;
+            memcpy(&opt[2], my_mac.bytes, 6);
+
+            uint16_t paylen = sizeof(struct icmpv6_hdr) + 4 + 16 + 8;
+            na_hdr->checksum = 0;
+            na_hdr->checksum = htons16(ipv6_l4_checksum(my_ll, src,
+                                     IPV6_PROTO_ICMPV6, buf, paylen));
+            /* solicited NA unicast to sender */
+            eth_send_ipv6_raw(src, IPV6_PROTO_ICMPV6, buf, paylen);
+        }
+        break;
+    }
+    case ICMPV6_TYPE_NA: {
+        if (len < sizeof(struct icmpv6_hdr) + 4 + 16) return;
+        struct icmpv6_na* na = (struct icmpv6_na*)(data + 4);
+        mac_addr_t na_mac = MAC_ZERO;
+        /* Extract target LL addr option */
+        if (len >= sizeof(struct icmpv6_hdr) + 4 + 16 + 8) {
+            uint8_t* opt = data + sizeof(struct icmpv6_hdr) + 4 + 16;
+            if (opt[0] == NDP_OPT_TARGET_LLADDR && opt[1] == 1) {
+                memcpy(na_mac.bytes, &opt[2], 6);
+            }
+        }
+        int mac_any = na_mac.bytes[0] | na_mac.bytes[1] | na_mac.bytes[2]
+                    | na_mac.bytes[3] | na_mac.bytes[4] | na_mac.bytes[5];
+        if (mac_any) {
+            ndp_cache_add(na->target, na_mac, 2);
+        }
+        if (ndp_pending_done == 0 && ipv6_eq(na->target, ndp_pending_ip)) {
+            if (mac_any) ndp_pending_mac = na_mac;
+            ndp_pending_done = 1;
+        }
+        break;
+    }
+    case ICMPV6_TYPE_RA: {
+        /* Router Advertisement: auto-configure our IPv6 address */
+        if (!ipv6_auto_done || !ipv6_valid) {
+            /* Cache router's link-local as default gateway */
+            if (ipv6_is_link_local(src) && ipv6_is_zero(my_ip6_gw)) {
+                my_ip6_gw = src;
+                pr_info("IPv6: default gateway set from RA\n");
+            }
+            handle_ndp(data, len, MAC_ZERO);
+        }
+        break;
+    }
+    }
+}
+
+/* ----- IPv6 auto-configuration ----- */
+static void ipv6_auto_config(void) {
+    if (ipv6_auto_done) return;
+    ipv6_auto_done = 1;
+
+    /* Our link-local address is derived from MAC */
+    my_ip6 = ipv6_create_link_local(my_mac);
+    ipv6_valid = 1;
+    pr_info("IPv6: link-local address configured\n");
+
+    /* Send Router Solicitation to ff02::2 */
+    uint8_t buf[sizeof(struct icmpv6_hdr) + 4];
+    memset(buf, 0, sizeof(buf));
+    struct icmpv6_hdr* rs = (struct icmpv6_hdr*)buf;
+    rs->type = ICMPV6_TYPE_RS;
+    rs->code = 0;
+
+    ipv6_addr_t all_routers = IPV6_ALL_ROUTERS;
+    uint16_t paylen = sizeof(struct icmpv6_hdr) + 4;
+    rs->checksum = 0;
+    rs->checksum = htons16(ipv6_l4_checksum(my_ip6, all_routers,
+                           IPV6_PROTO_ICMPV6, buf, paylen));
+
+    eth_send_ipv6_raw(all_routers, IPV6_PROTO_ICMPV6, buf, paylen);
+    pr_info("IPv6: sent Router Solicitation\n");
+}
+
+/* Handle NDP messages (RA with prefix info for SLAAC) */
+static void handle_ndp(uint8_t* data, uint16_t len, mac_addr_t src_mac) {
+    (void)src_mac;
+    if (len < sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_ra)) return;
+    struct icmpv6_hdr* hdr = (struct icmpv6_hdr*)data;
+    if (hdr->type != ICMPV6_TYPE_RA) return;
+
+    /* The router's link-local address is my_ip6_gw (set by caller in handle_icmpv6).
+     * Walk options to find Prefix Information for SLAAC. */
+    uint8_t* opt = data + sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_ra);
+    uint8_t* end = data + len;
+    while (opt + 2 <= end) {
+        uint8_t opt_type = opt[0];
+        uint8_t opt_len  = opt[1];
+        if (opt_len == 0 || opt + opt_len * 8 > end) break;
+        if (opt_type == NDP_OPT_PREFIX_INFO && opt_len == 4) {
+            struct ndp_prefix_info* pinfo = (struct ndp_prefix_info*)opt;
+            if (pinfo->flags & 0x40) {  /* A bit: autonomous address-configuration */
+                /* Form global address: prefix + our interface ID */
+                ipv6_addr_t new_addr = IPV6_ZERO;
+                int prefix_bytes = (pinfo->prefix_len + 7) / 8;
+                if (prefix_bytes > 16) prefix_bytes = 16;
+                memcpy(new_addr.bytes, pinfo->prefix.bytes, prefix_bytes);
+                /* Fill remaining bytes with our EUI-64 (interface ID) */
+                ipv6_addr_t ll = ipv6_create_link_local(my_mac);
+                for (int i = prefix_bytes; i < 16; i++) {
+                    new_addr.bytes[i] = ll.bytes[i];
+                }
+                my_ip6 = new_addr;
+                ipv6_valid = 1;
+
+                /* Cache the router's link-local as gateway */
+                /* (gateway was already set in handle_icmpv6 RA case) */
+                pr_info("IPv6: SLAAC - address %02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                        ":%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                        new_addr.bytes[0], new_addr.bytes[1],
+                        new_addr.bytes[2], new_addr.bytes[3],
+                        new_addr.bytes[4], new_addr.bytes[5],
+                        new_addr.bytes[6], new_addr.bytes[7],
+                        new_addr.bytes[8], new_addr.bytes[9],
+                        new_addr.bytes[10], new_addr.bytes[11],
+                        new_addr.bytes[12], new_addr.bytes[13],
+                        new_addr.bytes[14], new_addr.bytes[15]);
+            }
+        }
+        opt += opt_len * 8;
+    }
+}
+
 /* ----- Ethernet send ----- */
 /* Send an IPv4 packet to `dst_ip`. Handles gateway routing and ARP. */
 static int eth_send_ipv4(ipv4_addr_t dst_ip, uint8_t proto,
@@ -412,6 +811,13 @@ static int eth_send_ipv4(ipv4_addr_t dst_ip, uint8_t proto,
     ip->checksum = 0;
     ip->src      = my_ip;
     ip->dst      = dst_ip;
+
+    /* Firewall check (outgoing) */
+    enum fw_action fw_act = fw_check(ip, 1);
+    if (fw_act == FW_DROP) {
+        return 0;
+    }
+
     /* ip_checksum returns a value in HOST byte order (the one's-complement
      * of the sum). The wire format expects network (big-endian) byte
      * order, so we must htons16 it before storing into the struct field
@@ -499,6 +905,31 @@ int udp_send(ipv4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port,
     udp_pending_len = 0;
 
     if (!eth_send_ipv4(dst_ip, IP_PROTO_UDP, buf, total)) {
+        return 0;
+    }
+    return total;
+}
+
+/* Send a UDP datagram over IPv6. Returns bytes sent or 0 on failure. */
+int udp_send6(ipv6_addr_t dst_ip, uint16_t src_port, uint16_t dst_port,
+              const void* payload, uint16_t payload_len) {
+    uint8_t buf[sizeof(struct udp_hdr) + 1500];
+    struct udp_hdr* u = (struct udp_hdr*)buf;
+    u->src_port = htons16(src_port);
+    u->dst_port = htons16(dst_port);
+    u->length   = htons16(sizeof(struct udp_hdr) + payload_len);
+    /* IPv6 mandates a pseudo-header checksum for UDP */
+    ipv6_addr_t src_ll = ipv6_create_link_local(my_mac);
+    memcpy(&buf[sizeof(struct udp_hdr)], payload, payload_len);
+    uint16_t total = sizeof(struct udp_hdr) + payload_len;
+    u->checksum = 0;
+    u->checksum = htons16(ipv6_l4_checksum(src_ll, dst_ip, IPV6_PROTO_UDP, buf, total));
+
+    udp_expect_src_port = dst_port;
+    udp_expect_dst_port = src_port;
+    udp_pending_len = 0;
+
+    if (!eth_send_ipv6_raw(dst_ip, IPV6_PROTO_UDP, buf, total)) {
         return 0;
     }
     return total;
@@ -931,6 +1362,43 @@ static void handle_arp(uint8_t* data, uint16_t len, mac_addr_t src_mac) {
     }
 }
 
+/* ----- IPv6 packet dispatch ----- */
+static void handle_ipv6(uint8_t* data, uint16_t len) {
+    if (len < sizeof(struct ipv6_hdr)) return;
+    struct ipv6_hdr* ip6 = (struct ipv6_hdr*)data;
+
+    uint32_t ver_flow = ntohl32(ip6->ver_traffic_flow);
+    uint8_t version = (ver_flow >> 28) & 0xF;
+    if (version != 6) return;
+
+    uint16_t payload_len = ntohs16(ip6->payload_len);
+    uint8_t  next_header = ip6->next_header;
+
+    /* Verify destination matches us */
+    ipv6_addr_t my_ll = ipv6_create_link_local(my_mac);
+    int for_us = ipv6_eq(ip6->dst, my_ip6) ||
+                 ipv6_eq(ip6->dst, my_ll) ||
+                 ipv6_eq(ip6->dst, IPV6_LOOPBACK) ||
+                 ipv6_is_multicast(ip6->dst);
+    if (!for_us) return;
+
+    uint8_t* l4 = &data[sizeof(struct ipv6_hdr)];
+    uint16_t l4_len = (payload_len <= len - sizeof(struct ipv6_hdr)) ?
+                       payload_len : len - sizeof(struct ipv6_hdr);
+
+    switch (next_header) {
+        case IPV6_PROTO_ICMPV6:
+            handle_icmpv6(ip6->src, ip6->dst, l4, l4_len);
+            break;
+        case IPV6_PROTO_TCP:
+            tcp_handle6(ip6->src, ip6->dst, l4, l4_len);
+            break;
+        case IPV6_PROTO_UDP:
+            /* TODO: dispatch to handle_udp6 when ready */
+            break;
+    }
+}
+
 static void handle_ipv4(uint8_t* data, uint16_t len) {
     if (len < sizeof(struct ip_hdr)) return;
     struct ip_hdr* ip = (struct ip_hdr*)data;
@@ -945,6 +1413,31 @@ static void handle_ipv4(uint8_t* data, uint16_t len) {
 
     uint8_t* l4 = &data[ip_hdr_len];
     uint16_t l4_len = len - ip_hdr_len;
+
+    /* Firewall check (incoming) */
+    enum fw_action fw_act = fw_check(ip, 0);
+    if (fw_act == FW_DROP) {
+        return;
+    }
+    if (fw_act == FW_REJECT) {
+        /* Send ICMP port unreachable (type 3, code 3) for TCP/UDP */
+        if (ip->proto == IP_PROTO_TCP || ip->proto == IP_PROTO_UDP) {
+            uint8_t icmp_buf[sizeof(struct icmp_hdr) + sizeof(struct ip_hdr) + 8];
+            memset(icmp_buf, 0, sizeof(icmp_buf));
+            struct icmp_hdr* icmph = (struct icmp_hdr*)icmp_buf;
+            icmph->type = 3;   /* Destination Unreachable */
+            icmph->code = 3;   /* Port Unreachable */
+            icmph->checksum = 0;
+            /* Copy the original IP header + first 8 bytes of payload */
+            uint16_t orig_ihl_bytes = ip_hdr_len;
+            memcpy(&icmp_buf[sizeof(struct icmp_hdr)], ip, orig_ihl_bytes > 20 ? 20 : orig_ihl_bytes);
+            uint16_t copy_len = (l4_len > 8) ? 8 : l4_len;
+            memcpy(&icmp_buf[sizeof(struct icmp_hdr) + orig_ihl_bytes], l4, copy_len);
+            icmph->checksum = htons16(ip_checksum(icmp_buf, sizeof(icmp_buf)));
+            eth_send_ipv4(ip->src, IP_PROTO_ICMP, icmp_buf, sizeof(icmp_buf));
+        }
+        return;
+    }
 
     switch (ip->proto) {
         case IP_PROTO_ICMP:
@@ -973,8 +1466,14 @@ static void handle_ethernet(uint8_t* data, uint16_t len) {
         case ETH_TYPE_IPV4:
             handle_ipv4(payload, payload_len);
             break;
+        case ETH_TYPE_IPV6:
+            handle_ipv6(payload, payload_len);
+            break;
         case ETH_TYPE_WLAN_MGMT:
             wifi_handle_frame(payload, payload_len);
+            break;
+        case ETH_TYPE_EAPOL:
+            wifi_handle_eapol_frame(payload, payload_len);
             break;
         /* ignore other protocols */
     }
@@ -990,7 +1489,10 @@ void net_init(void) {
     my_mac = e1000_get_mac();
     net_initialized = 1;
     net_link_up = 1;   /* link is up from driver perspective; IP not yet */
+    fw_init();
     dhcp_start();
+    /* IPv6 auto-configuration (link-local + SLAAC) */
+    ipv6_auto_config();
     /* Apply static network config if set (overrides DHCP) */
     extern void net_config_apply(void);
     net_config_apply();
@@ -1014,19 +1516,40 @@ void net_tick(void) {
         int n = e1000_recv(buf, sizeof(buf));
         if (n <= 0) break;
         rx_count++;
-        /* Check for ICMP Echo Reply (for our own pings). */
-        if (n >= (int)sizeof(struct eth_hdr) + (int)sizeof(struct ip_hdr)) {
+        /* Check for ICMP Echo Reply (for our own pings) or ICMPv6 Echo Reply. */
+        if (n >= (int)sizeof(struct eth_hdr)) {
             struct eth_hdr* eth = (struct eth_hdr*)buf;
-            if (ntohs16(eth->ethertype) == ETH_TYPE_IPV4) {
+            if (ntohs16(eth->ethertype) == ETH_TYPE_IPV4 &&
+                n >= (int)(sizeof(struct eth_hdr) + sizeof(struct ip_hdr))) {
                 struct ip_hdr* ip = (struct ip_hdr*)&buf[sizeof(struct eth_hdr)];
                 if (ip->proto == IP_PROTO_ICMP) {
                     uint8_t ihl = ip->ver_ihl & 0x0F;
-                    struct icmp_hdr* icmp = (struct icmp_hdr*)&buf[sizeof(struct eth_hdr) + ihl*4];
-                    if (icmp->type == 0 &&
-                        ntohs16(icmp->id) == net_ping_expect_id &&
-                        ntohs16(icmp->seq) == net_ping_expect_seq) {
-                        net_ping_got_reply = 1;
-                        continue;
+                    if (sizeof(struct eth_hdr) + ihl*4 + sizeof(struct icmp_hdr) <= (size_t)n) {
+                        struct icmp_hdr* icmp = (struct icmp_hdr*)&buf[sizeof(struct eth_hdr) + ihl*4];
+                        if (icmp->type == 0 &&
+                            ntohs16(icmp->id) == net_ping_expect_id &&
+                            ntohs16(icmp->seq) == net_ping_expect_seq) {
+                            net_ping_got_reply = 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            /* Check for ICMPv6 Echo Reply */
+            if (ntohs16(eth->ethertype) == ETH_TYPE_IPV6 &&
+                n >= (int)(sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr) + 8)) {
+                struct ipv6_hdr* ip6 = (struct ipv6_hdr*)&buf[sizeof(struct eth_hdr)];
+                if (ip6->next_header == IPV6_PROTO_ICMPV6) {
+                    struct icmpv6_hdr* icmp6 = (struct icmpv6_hdr*)
+                        &buf[sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr)];
+                    if (icmp6->type == ICMPV6_TYPE_ECHO_REPLY &&
+                        n >= (int)(sizeof(struct eth_hdr) + sizeof(struct ipv6_hdr) + 8)) {
+                        struct icmpv6_echo* ec = (struct icmpv6_echo*)(icmp6 + 1);
+                        if (ntohs16(ec->id) == net_ping6_expect_id &&
+                            ntohs16(ec->seq) == net_ping6_expect_seq) {
+                            net_ping6_got_reply = 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -1066,3 +1589,156 @@ int eth_send_ipv4_pub(ipv4_addr_t dst_ip, uint8_t proto,
 void net_set_mask(ipv4_addr_t mask) { my_mask = mask; }
 void net_set_gw(ipv4_addr_t gw)     { my_gw = gw; }
 void net_set_dns(ipv4_addr_t dns)   { my_dns = dns; }
+
+/* ----- IPv6 public API ----- */
+int net_ipv6_is_valid(void) { return ipv6_valid; }
+ipv6_addr_t net_get_ipv6(void) { return my_ip6; }
+ipv6_addr_t net_get_ipv6_gw(void) { return my_ip6_gw; }
+
+int net_ping6(ipv6_addr_t target, uint16_t seq, uint32_t timeout_ms) {
+    if (!net_link_up || !ipv6_valid) return 0;
+
+    /* Build ICMPv6 Echo Request */
+    uint8_t buf[sizeof(struct icmpv6_hdr) + sizeof(struct icmpv6_echo) + 32];
+    memset(buf, 0, sizeof(buf));
+    struct icmpv6_hdr*  icmp6 = (struct icmpv6_hdr*)buf;
+    struct icmpv6_echo* ec    = (struct icmpv6_echo*)(buf + 4);
+    icmp6->type = ICMPV6_TYPE_ECHO_REQUEST;
+    icmp6->code = 0;
+    ec->id   = htons16(0xBEEF);
+    ec->seq  = htons16(seq);
+
+    uint16_t paylen = sizeof(buf);
+    icmp6->checksum = 0;
+    icmp6->checksum = htons16(ipv6_l4_checksum(my_ip6, target,
+                             IPV6_PROTO_ICMPV6, buf, paylen));
+
+    net_ping6_expect_id = ntohs16(ec->id);
+    net_ping6_expect_seq = ntohs16(ec->seq);
+    net_ping6_got_reply = 0;
+
+    if (!eth_send_ipv6_raw(target, IPV6_PROTO_ICMPV6, buf, paylen))
+        return 0;
+
+    uint64_t deadline = timer_get_ms() + timeout_ms;
+    while (timer_get_ms() < deadline) {
+        if (net_ping6_got_reply) return 1;
+        net_tick();
+    }
+    return 0;
+}
+
+/* ----- DNS dual-stack ----- */
+int net_resolve_dual(const char* hostname, ipv4_addr_t* out4, ipv6_addr_t* out6) {
+    int got4 = 0, got6 = 0;
+
+    /* Try to parse as IPv6 literal (contains ':') */
+    int has_colon = 0;
+    for (const char* p = hostname; *p; p++) {
+        if (*p == ':') { has_colon = 1; break; }
+    }
+    if (has_colon) {
+        /* Parse IPv6 hex address */
+        ipv6_addr_t addr = IPV6_ZERO;
+        int group = 0, shift = 0;
+        int skip_group = -1; /* where :: expands from */
+        const char* p = hostname;
+        if (hostname[0] == '[') p++;  /* allow [addr] bracket form */
+        while (*p && *p != ']' && group < 8) {
+            if (*p == ':') {
+                if (p[1] == ':') {
+                    skip_group = group;
+                    p += 2;
+                    if (*p == ':') { p++; continue; }
+                    continue;
+                }
+                group++;
+                shift = 0;
+                p++;
+            } else {
+                int val = -1;
+                if (*p >= '0' && *p <= '9') val = *p - '0';
+                else if (*p >= 'a' && *p <= 'f') val = *p - 'a' + 10;
+                else if (*p >= 'A' && *p <= 'F') val = *p - 'A' + 10;
+                if (val < 0) break;
+                addr.bytes[group*2]   = (addr.bytes[group*2] << 4) | val;
+                shift++;
+                if (shift > 4) break;
+                p++;
+            }
+        }
+        if (shift > 0 || group > 0 || skip_group >= 0) {
+            /* Compact the address if :: was used */
+            if (skip_group >= 0) {
+                int end = group;
+                int skip_count = 7 - end;
+                for (int i = end; i >= 0 && i >= skip_group; i--) {
+                    addr.bytes[(i + skip_count)*2]   = addr.bytes[i*2];
+                    addr.bytes[(i + skip_count)*2+1] = addr.bytes[i*2+1];
+                }
+                for (int i = skip_group; i < skip_group + skip_count && i < 8; i++) {
+                    addr.bytes[i*2] = 0;
+                    addr.bytes[i*2+1] = 0;
+                }
+            }
+            if (out6) *out6 = addr;
+            return 1;
+        }
+    }
+
+    /* Try AAAA first */
+    if (out6) {
+        /* Build AAAA query */
+        static uint8_t qbuf[512];
+        struct dns_hdr* hdr = (struct dns_hdr*)qbuf;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->id = htons16(0x4243);
+        hdr->flags = htons16(0x0100);
+        hdr->qdcount = htons16(1);
+        uint8_t* p = &qbuf[sizeof(struct dns_hdr)];
+        int namelen = dns_encode_name(p, sizeof(qbuf) - sizeof(struct dns_hdr) - 4, hostname);
+        if (namelen >= 0) {
+            p += namelen;
+            *p++ = 0; *p++ = 28;  /* qtype = AAAA (28) */
+            *p++ = 0; *p++ = 1;   /* qclass = IN */
+            uint16_t qlen = (uint16_t)(p - qbuf);
+            if (udp_send(my_dns, 12346, DNS_PORT, qbuf, qlen)) {
+                static uint8_t rbuf[1500];
+                int rlen = udp_recv_wait(rbuf, sizeof(rbuf), 2000);
+                if (rlen >= (int)sizeof(struct dns_hdr)) {
+                    struct dns_hdr* rhdr = (struct dns_hdr*)rbuf;
+                    if (rhdr->id == htons16(0x4243)) {
+                        uint16_t ancount = ntohs16(rhdr->ancount);
+                        uint8_t* q = &rbuf[sizeof(struct dns_hdr)];
+                        char tmp[DNS_MAX_NAME];
+                        int consumed = dns_decode_name(rbuf, rlen, q, tmp, sizeof(tmp));
+                        if (consumed >= 0) {
+                            q += consumed + 4;
+                            for (int i = 0; i < (int)ancount; i++) {
+                                consumed = dns_decode_name(rbuf, rlen, q, tmp, sizeof(tmp));
+                                if (consumed < 0) break;
+                                q += consumed;
+                                if (q + 10 > rbuf + rlen) break;
+                                uint16_t qtype = (q[0] << 8) | q[1];
+                                uint16_t rdlen = (q[8] << 8) | q[9];
+                                q += 10;
+                                if (qtype == 28 && rdlen == 16) {
+                                    memcpy(out6->bytes, q, 16);
+                                    got6 = 1;
+                                }
+                                q += rdlen;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Then try A record */
+    if (out4) {
+        got4 = net_resolve(hostname, out4);
+    }
+
+    return got4 || got6;
+}

@@ -17,4 +17,8 @@ const char* wifi_get_connected_ssid(void);
  * stripping the Ethernet header). */
 void wifi_handle_frame(const uint8_t* data, uint16_t len);
 
+/* Called by net.c when an EAPOL frame (ethertype 0x888E) arrives.
+ * Used for the WPA/WPA2 4-way handshake. */
+void wifi_handle_eapol_frame(const uint8_t* data, uint16_t len);
+
 #endif

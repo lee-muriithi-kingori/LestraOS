@@ -32,6 +32,7 @@
 #include <lestra/sandbox.h>
 #include <lestra/service.h>
 #include <lestra/ssh_server.h>
+#include <lestra/firewall.h>
 #include <string.h>
 
 #define CMD_MAX_LEN  512
@@ -131,9 +132,19 @@ static void cmd_help(void) {
     printk("    ai providers            List supported providers + endpoints\n");
     printk("\n");
     printk("  Network:\n");
-    printk("    network                 Show network status (IP, MAC, gateway, DNS)\n");
-    printk("    ping <host-or-ip>       Send ICMP echo request (e.g. 'ping 10.0.2.2')\n");
+    printk("    network                 Show network status (IPv4 + IPv6)\n");
+    printk("    ping <host-or-ip>       Send ICMPv4 echo request (e.g. 'ping 10.0.2.2')\n");
+    printk("    ping6 <host-or-ip>      Send ICMPv6 echo request (e.g. 'ping6 fe80::1')\n");
+    printk("    ifconfig                Show both IPv4 and IPv6 addresses\n");
     printk("    wget <url>              HTTP GET to a URL (e.g. 'wget http://example.com/')\n");
+    printk("\n");
+    printk("  Firewall (firewall):\n");
+    printk("    firewall add <n> <accept|drop|reject> [proto src dst sport dport dir log]\n");
+    printk("    firewall remove <name|id>              Remove a rule\n");
+    printk("    firewall list                         List all rules\n");
+    printk("    firewall flush                        Remove all rules\n");
+    printk("    firewall status                       Show stats and default policies\n");
+    printk("    firewall default <in|out> <accept|drop|reject>\n");
     printk("\n");
     printk("  VPS / Service Management (lee):\n");
     printk("    lee strt ssh            Start SSH remote shell (port 2222)\n");
@@ -605,11 +616,49 @@ static void cmd_network(int argc, char** argv) {
         ipv4_addr_t gw = net_get_gateway();
         ipv4_addr_t dns = net_get_dns();
         printk("  Status:     UP (DHCP complete)\n");
-        printk("  IP:         %u.%u.%u.%u\n", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+        printk("  IPv4:       %u.%u.%u.%u\n", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
         printk("  Gateway:    %u.%u.%u.%u\n", gw.bytes[0], gw.bytes[1], gw.bytes[2], gw.bytes[3]);
         printk("  DNS:        %u.%u.%u.%u\n", dns.bytes[0], dns.bytes[1], dns.bytes[2], dns.bytes[3]);
     } else {
         printk("  Status:     DOWN (DHCP not yet complete or no NIC)\n");
+    }
+    if (net_ipv6_is_valid()) {
+        ipv6_addr_t ip6 = net_get_ipv6();
+        char addr_str[40];
+        ipv6_addr_to_str(ip6, addr_str, sizeof(addr_str));
+        printk("  IPv6:       %s\n", addr_str);
+    } else {
+        printk("  IPv6:       not configured\n");
+    }
+    printk("\n");
+}
+
+static void cmd_ifconfig(int argc, char** argv) {
+    (void)argc; (void)argv;
+    printk("\nNetwork interfaces:\n");
+    printk("  %s:\n", net_get_iface_name());
+    mac_addr_t mac = net_get_mac();
+    printk("    MAC:      %x:%x:%x:%x:%x:%x\n",
+           mac.bytes[0], mac.bytes[1], mac.bytes[2],
+           mac.bytes[3], mac.bytes[4], mac.bytes[5]);
+    if (net_is_up()) {
+        ipv4_addr_t ip = net_get_ip();
+        ipv4_addr_t mask = net_get_gateway();  /* approximate */
+        ipv4_addr_t gw = net_get_gateway();
+        ipv4_addr_t dns = net_get_dns();
+        printk("    IPv4:     %u.%u.%u.%u\n", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+        printk("    Gateway:  %u.%u.%u.%u\n", gw.bytes[0], gw.bytes[1], gw.bytes[2], gw.bytes[3]);
+        printk("    DNS:      %u.%u.%u.%u\n", dns.bytes[0], dns.bytes[1], dns.bytes[2], dns.bytes[3]);
+    } else {
+        printk("    IPv4:     (DHCP pending)\n");
+    }
+    if (net_ipv6_is_valid()) {
+        ipv6_addr_t ip6 = net_get_ipv6();
+        char addr_str[40];
+        ipv6_addr_to_str(ip6, addr_str, sizeof(addr_str));
+        printk("    IPv6:     %s\n", addr_str);
+    } else {
+        printk("    IPv6:     (auto-config pending)\n");
     }
     printk("\n");
 }
@@ -637,6 +686,47 @@ static void cmd_ping(int argc, char** argv) {
         }
     } else {
         printk("Could not resolve %s\n", argv[1]);
+    }
+}
+
+static void cmd_ping6(int argc, char** argv) {
+    if (argc < 2) {
+        printk("Usage: ping6 <host-or-ipv6>\n");
+        printk("Example: ping6 fe80::1\n");
+        printk("         ping6 google.com  (AAAA lookup)\n");
+        return;
+    }
+    if (!net_ipv6_is_valid()) {
+        printk("IPv6 not configured yet\n");
+        return;
+    }
+    ipv6_addr_t ip6;
+    ipv4_addr_t ip4_unused;
+    /* Check if it's an IPv6 literal (contains ':') */
+    int has_colon = 0;
+    for (const char* p = argv[1]; *p; p++) if (*p == ':') { has_colon = 1; break; }
+    if (has_colon) {
+        /* Parse literal IPv6 - use the same parser as net_resolve_dual */
+        memset(&ip6, 0, sizeof(ip6));
+        ipv4_addr_t dummy4;
+        net_resolve_dual(argv[1], &dummy4, &ip6);
+    } else {
+        /* DNS resolve AAAA */
+        if (!net_resolve_dual(argv[1], &ip4_unused, &ip6)) {
+            printk("Could not resolve %s (no AAAA record)\n", argv[1]);
+            return;
+        }
+    }
+    char addr_str[40];
+    ipv6_addr_to_str(ip6, addr_str, sizeof(addr_str));
+    printk("PING6 %s (%s)...\n", argv[1], addr_str);
+    uint32_t start = (uint32_t)timer_get_ms();
+    int ok = net_ping6(ip6, 1, 3000);
+    uint32_t elapsed = (uint32_t)timer_get_ms() - start;
+    if (ok) {
+        printk("Reply from %s: time=%u ms\n", addr_str, (unsigned)elapsed);
+    } else {
+        printk("Request timed out (waited %u ms)\n", (unsigned)elapsed);
     }
 }
 
@@ -815,9 +905,9 @@ static void cmd_file(int argc, char** argv) {
 static void cmd_lee(int argc, char** argv) {
     if (argc < 2) {
         printk("Usage: lee <strt|stop|status|sandbox|service|net|help>\n");
-        printk("  lee strt server [port]    Start sandbox HTTP server (default 8080)\n");
+        printk("  lee strt server [port] [--tls]  Start sandbox HTTP(S) server\n");
         printk("  lee strt ssh [port]       Start SSH-like remote shell (default 2222)\n");
-        printk("  lee strt sandbox [id]     Start sandboxed environment (id=1 or 2)\n");
+        printk("  lee strt sandbox [id] [size_mb]  Start sandbox (id=1|2, default 16MB storage)\n");
         printk("  lee stop server           Stop the HTTP server\n");
         printk("  lee stop ssh              Stop the SSH server\n");
         printk("  lee stop sandbox [id]     Stop a specific sandbox\n");
@@ -960,33 +1050,53 @@ static void cmd_lee(int argc, char** argv) {
             return;
         }
         if (strcmp(argv[2], "server") == 0) {
-            int port = 8080;
-            if (argc >= 4) {
-                port = 0;
-                for (char* p = argv[3]; *p >= '0' && *p <= '9'; p++)
-                    port = port * 10 + (*p - '0');
-                if (port <= 0 || port > 65535) port = 8080;
+            int port = 0;
+            int tls = 0;
+            for (int i = 3; i < argc; i++) {
+                if (strcmp(argv[i], "--tls") == 0) {
+                    tls = 1;
+                } else {
+                    port = 0;
+                    for (char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                        port = port * 10 + (*p - '0');
+                    if (port <= 0 || port > 65535) port = 0;
+                }
             }
+            if (port <= 0) port = tls ? 8443 : 8080;
             if (sandbox_server_is_running()) {
                 printk("HTTP server already running on port %d\n",
                        sandbox_server_port());
             } else {
-                sandbox_server_start(port);
-                printk("HTTP sandbox server started on port %d\n", port);
+                if (tls) {
+                    sandbox_server_start_tls(port);
+                    printk("HTTPS sandbox server started on port %d (TLS)\n", port);
+                } else {
+                    sandbox_server_start(port);
+                    printk("HTTP sandbox server started on port %d\n", port);
+                }
             }
         } else if (strcmp(argv[2], "ssh") == 0) {
             service_start("ssh");
         } else if (strcmp(argv[2], "sandbox") == 0) {
             int id = 0;
+            int size_mb = 16; /* default 16MB */
             if (argc >= 4) {
                 id = 0;
                 for (char* p = argv[3]; *p >= '0' && *p <= '9'; p++)
                     id = id * 10 + (*p - '0');
             }
+            if (argc >= 5) {
+                size_mb = 0;
+                for (char* p = argv[4]; *p >= '0' && *p <= '9'; p++)
+                    size_mb = size_mb * 10 + (*p - '0');
+                if (size_mb < 1) size_mb = 1;
+                if (size_mb > 256) size_mb = 256;
+            }
             if (id == 0) {
-                id = sandbox_create(NULL, 0);
+                uint64_t storage = (uint64_t)size_mb * 1024 * 1024;
+                id = sandbox_create(NULL, 0, storage);
                 if (id > 0) {
-                    printk("Created sandbox %d\n", id);
+                    printk("Created sandbox %d (%dMB storage)\n", id, size_mb);
                 } else {
                     printk("Failed to create sandbox (max %d reached)\n",
                            SANDBOX_MAX);
@@ -1061,6 +1171,229 @@ static void cmd_lee(int argc, char** argv) {
     printk("Type 'lee help' for available commands.\n");
 }
 
+/* ----- firewall subcommands ------------------------------------------- */
+static void cmd_firewall(int argc, char** argv) {
+    if (argc < 2) {
+        printk("Usage: firewall <add|remove|list|flush|status|default> [args]\n");
+        printk("  firewall add <name> <accept|drop|reject> [options]\n");
+        printk("    Options:\n");
+        printk("      proto <tcp|udp|icmp|any>    Protocol to match\n");
+        printk("      src <ip>                    Source IP address\n");
+        printk("      dst <ip>                    Destination IP address\n");
+        printk("      srcmask <mask>              Source mask (default 255.255.255.255)\n");
+        printk("      dstmask <mask>              Destination mask (default 255.255.255.255)\n");
+        printk("      sport <port>                Source port (0 = any)\n");
+        printk("      dport <port>                Destination port (0 = any)\n");
+        printk("      dir <in|out|both>           Direction (default both)\n");
+        printk("      log                         Log matches\n");
+        printk("  firewall remove <name>         Remove a rule by name\n");
+        printk("  firewall remove <id>           Remove a rule by numeric ID\n");
+        printk("  firewall list                  List all rules\n");
+        printk("  firewall flush                 Remove all rules\n");
+        printk("  firewall status                Show stats and default policies\n");
+        printk("  firewall default <in|out> <accept|drop|reject>\n");
+        printk("\nExamples:\n");
+        printk("  firewall add block-telnet drop proto tcp dport 23 dir both\n");
+        printk("  firewall add allow-http accept proto tcp dport 80 dir in\n");
+        printk("  firewall default in drop\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        fw_list_rules();
+    } else if (strcmp(argv[1], "flush") == 0) {
+        fw_flush();
+    } else if (strcmp(argv[1], "status") == 0) {
+        fw_status();
+    } else if (strcmp(argv[1], "remove") == 0) {
+        if (argc < 3) {
+            printk("Usage: firewall remove <name|id>\n");
+            return;
+        }
+        /* Try numeric ID first */
+        int is_num = 1;
+        for (char* p = argv[2]; *p; p++) {
+            if (*p < '0' || *p > '9') { is_num = 0; break; }
+        }
+        if (is_num && argv[2][0]) {
+            int id = 0;
+            for (char* p = argv[2]; *p >= '0' && *p <= '9'; p++)
+                id = id * 10 + (*p - '0');
+            if (fw_remove_rule_by_id(id) == 0) {
+                printk("Removed rule %d\n", id);
+            } else {
+                printk("Rule %d not found\n", id);
+            }
+        } else {
+            if (fw_remove_rule(argv[2]) == 0) {
+                printk("Removed rule: %s\n", argv[2]);
+            } else {
+                printk("Rule not found: %s\n", argv[2]);
+            }
+        }
+    } else if (strcmp(argv[1], "default") == 0) {
+        if (argc < 4) {
+            printk("Usage: firewall default <in|out> <accept|drop|reject>\n");
+            return;
+        }
+        int dir = -1;
+        if (strcmp(argv[2], "in") == 0) dir = 0;
+        else if (strcmp(argv[2], "out") == 0) dir = 1;
+        if (dir < 0) {
+            printk("Direction must be 'in' or 'out'\n");
+            return;
+        }
+        enum fw_action act;
+        if (strcmp(argv[3], "accept") == 0) act = FW_ACCEPT;
+        else if (strcmp(argv[3], "drop") == 0) act = FW_DROP;
+        else if (strcmp(argv[3], "reject") == 0) act = FW_REJECT;
+        else {
+            printk("Action must be 'accept', 'drop', or 'reject'\n");
+            return;
+        }
+        fw_set_default(dir, act);
+        printk("Default %s policy set to %s\n", argv[2], argv[3]);
+    } else if (strcmp(argv[1], "add") == 0) {
+        if (argc < 4) {
+            printk("Usage: firewall add <name> <accept|drop|reject> [options]\n");
+            return;
+        }
+        const char* name = argv[2];
+        enum fw_action action;
+        if (strcmp(argv[3], "accept") == 0) action = FW_ACCEPT;
+        else if (strcmp(argv[3], "drop") == 0) action = FW_DROP;
+        else if (strcmp(argv[3], "reject") == 0) action = FW_REJECT;
+        else {
+            printk("Action must be 'accept', 'drop', or 'reject'\n");
+            return;
+        }
+
+        /* Parse optional arguments */
+        enum fw_proto proto = FW_PROTO_ANY;
+        ipv4_addr_t src_ip = IP_ZERO, dst_ip = IP_ZERO;
+        ipv4_addr_t src_mask = ipv4(255,255,255,255);
+        ipv4_addr_t dst_mask = ipv4(255,255,255,255);
+        uint16_t src_port = 0, dst_port = 0;
+        int direction = 2; /* both */
+        int logged = 0;
+
+        int i = 4;
+        while (i < argc) {
+            if (strcmp(argv[i], "proto") == 0 && i + 1 < argc) {
+                i++;
+                if (strcmp(argv[i], "tcp") == 0) proto = FW_PROTO_TCP;
+                else if (strcmp(argv[i], "udp") == 0) proto = FW_PROTO_UDP;
+                else if (strcmp(argv[i], "icmp") == 0) proto = FW_PROTO_ICMP;
+                else if (strcmp(argv[i], "any") == 0) proto = FW_PROTO_ANY;
+                else printk("Unknown protocol: %s (use tcp|udp|icmp|any)\n", argv[i]);
+            } else if (strcmp(argv[i], "src") == 0 && i + 1 < argc) {
+                i++;
+                /* Parse IP: split on '/' for optional mask */
+                char* slash = NULL;
+                for (char* p = argv[i]; *p; p++) {
+                    if (*p == '/') { *p = '\0'; slash = p + 1; break; }
+                }
+                /* Parse dotted quad */
+                int vals[4] = {0,0,0,0}, vi = 0;
+                const char* s = argv[i];
+                while (*s && vi < 4) {
+                    if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                    else if (*s == '.') vi++;
+                    s++;
+                }
+                src_ip = ipv4(vals[0], vals[1], vals[2], vals[3]);
+                if (slash) {
+                    vals[0] = vals[1] = vals[2] = vals[3] = 0;
+                    vi = 0; s = slash;
+                    while (*s && vi < 4) {
+                        if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                        else if (*s == '.') vi++;
+                        s++;
+                    }
+                    src_mask = ipv4(vals[0], vals[1], vals[2], vals[3]);
+                }
+            } else if (strcmp(argv[i], "dst") == 0 && i + 1 < argc) {
+                i++;
+                char* slash = NULL;
+                for (char* p = argv[i]; *p; p++) {
+                    if (*p == '/') { *p = '\0'; slash = p + 1; break; }
+                }
+                int vals[4] = {0,0,0,0}, vi = 0;
+                const char* s = argv[i];
+                while (*s && vi < 4) {
+                    if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                    else if (*s == '.') vi++;
+                    s++;
+                }
+                dst_ip = ipv4(vals[0], vals[1], vals[2], vals[3]);
+                if (slash) {
+                    vals[0] = vals[1] = vals[2] = vals[3] = 0;
+                    vi = 0; s = slash;
+                    while (*s && vi < 4) {
+                        if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                        else if (*s == '.') vi++;
+                        s++;
+                    }
+                    dst_mask = ipv4(vals[0], vals[1], vals[2], vals[3]);
+                }
+            } else if (strcmp(argv[i], "srcmask") == 0 && i + 1 < argc) {
+                i++;
+                int vals[4] = {0,0,0,0}, vi = 0;
+                const char* s = argv[i];
+                while (*s && vi < 4) {
+                    if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                    else if (*s == '.') vi++;
+                    s++;
+                }
+                src_mask = ipv4(vals[0], vals[1], vals[2], vals[3]);
+            } else if (strcmp(argv[i], "dstmask") == 0 && i + 1 < argc) {
+                i++;
+                int vals[4] = {0,0,0,0}, vi = 0;
+                const char* s = argv[i];
+                while (*s && vi < 4) {
+                    if (*s >= '0' && *s <= '9') vals[vi] = vals[vi]*10 + (*s-'0');
+                    else if (*s == '.') vi++;
+                    s++;
+                }
+                dst_mask = ipv4(vals[0], vals[1], vals[2], vals[3]);
+            } else if (strcmp(argv[i], "sport") == 0 && i + 1 < argc) {
+                i++;
+                src_port = 0;
+                for (char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    src_port = src_port * 10 + (*p - '0');
+            } else if (strcmp(argv[i], "dport") == 0 && i + 1 < argc) {
+                i++;
+                dst_port = 0;
+                for (char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    dst_port = dst_port * 10 + (*p - '0');
+            } else if (strcmp(argv[i], "dir") == 0 && i + 1 < argc) {
+                i++;
+                if (strcmp(argv[i], "in") == 0) direction = 0;
+                else if (strcmp(argv[i], "out") == 0) direction = 1;
+                else if (strcmp(argv[i], "both") == 0) direction = 2;
+                else printk("Unknown direction: %s (use in|out|both)\n", argv[i]);
+            } else if (strcmp(argv[i], "log") == 0) {
+                logged = 1;
+            } else {
+                printk("Unknown option: %s\n", argv[i]);
+            }
+            i++;
+        }
+
+        int id = fw_add_rule(name, action, proto,
+                             src_ip, src_mask, dst_ip, dst_mask,
+                             src_port, dst_port, direction, logged);
+        if (id >= 0) {
+            printk("Added rule %d: %s %s\n", id, name,
+                   action == FW_ACCEPT ? "ACCEPT" : action == FW_DROP ? "DROP" : "REJECT");
+        } else {
+            printk("Failed to add rule (table full, max %d)\n", FW_MAX_RULES);
+        }
+    } else {
+        printk("Unknown firewall subcommand: %s\n", argv[1]);
+    }
+}
+
 /* ----- command dispatch ----------------------------------------------- */
 static void execute_command(void) {
     if (argc == 0) return;
@@ -1091,7 +1424,9 @@ static void execute_command(void) {
     else if (strcmp(cmd, "ai") == 0) cmd_ai(argc, argv);
     else if (strcmp(cmd, "file") == 0) cmd_file(argc, argv);
     else if (strcmp(cmd, "network") == 0) cmd_network(argc, argv);
+    else if (strcmp(cmd, "ifconfig") == 0) cmd_ifconfig(argc, argv);
     else if (strcmp(cmd, "ping") == 0) cmd_ping(argc, argv);
+    else if (strcmp(cmd, "ping6") == 0) cmd_ping6(argc, argv);
     else if (strcmp(cmd, "wget") == 0) cmd_wget(argc, argv);
     else if (strcmp(cmd, "claude") == 0) cmd_claude(argc, argv);
     else if (strcmp(cmd, "glm") == 0) cmd_glm(argc, argv);
@@ -1300,6 +1635,7 @@ static void execute_command(void) {
         }
     }
     else if (strcmp(cmd, "lee") == 0) cmd_lee(argc, argv);
+    else if (strcmp(cmd, "firewall") == 0) cmd_firewall(argc, argv);
     else if (strcmp(cmd, "sysinfo") == 0) {
         printk("\n=== System Information ===\n");
         printk("OS:        Lestra OS 1.0.0-alpha\n");
@@ -1330,6 +1666,12 @@ static void execute_command(void) {
             }
         } else {
             printk("Network:   DOWN\n");
+        }
+        if (net_ipv6_is_valid()) {
+            ipv6_addr_t ip6 = net_get_ipv6();
+            char addr_str[40];
+            ipv6_addr_to_str(ip6, addr_str, sizeof(addr_str));
+            printk("IPv6:      %s\n", addr_str);
         }
         /* Battery */
         printk("Battery:   %d%% (%s)\n", battery_get_percent(),

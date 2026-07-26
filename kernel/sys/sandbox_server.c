@@ -23,6 +23,16 @@
 #include <lestra/timer.h>
 #include <string.h>
 
+/* TLS server API (from tls_server.c) */
+struct tls_server_conn;
+extern void tls_server_init(void);
+extern int  tls_server_accept(struct tcp_conn* tcp, struct tls_server_conn** out);
+extern int  tls_server_send(struct tls_server_conn* ctx, const void* data, uint16_t len);
+extern int  tls_server_recv(struct tls_server_conn* ctx, void* buf, uint16_t bufsz, uint32_t timeout_ms);
+extern void tls_server_close(struct tls_server_conn* ctx);
+extern int  tls_server_is_active(struct tls_server_conn* ctx);
+extern int  tls_server_cert_pem(struct tls_server_conn* ctx, char* buf, int bufsz);
+
 #define SB_MAX_CONNS 4
 
 struct sb_http_conn {
@@ -36,6 +46,10 @@ static int server_running = 0;
 static int server_port    = 8080;
 static int listen_idx     = -1;
 static struct sb_http_conn sb_conns[SB_MAX_CONNS];
+
+/* TLS support */
+static int use_tls = 0;
+static struct tls_server_conn* tls_conns[SB_MAX_CONNS];
 
 /* Output buffer per sandbox for capturing stdout */
 #define OUTPUT_BUF_SIZE 4096
@@ -191,6 +205,7 @@ static const char* web_ui_html =
     "<h2>Create Sandbox</h2>"
     "Name: <input id=\"sname\" value=\"sandbox\"> "
     "Port: <input id=\"sport\" value=\"8081\" size=\"6\"> "
+    "Storage (MB): <input id=\"sstor\" value=\"16\" size=\"4\"> "
     "<button onclick=\"createSb()\">Create</button>"
     "<div id=\"status\">Ready.</div>"
     "<script>"
@@ -205,14 +220,17 @@ static const char* web_ui_html =
     "h+='<b>['+s.id+'] '+s.name+'</b> — '+"
     "(s.active?'RUNNING (pid '+s.pid+')':'STOPPED')+'<br>';"
     "h+='Port: '+s.port+' | Net: '+(s.network_disabled?'off':'on')+' | '"
-    "+'Mem: '+(s.memory_limit/1048576)+'MB<br>';"
+    "+'Mem: '+(s.memory_limit/1048576)+'MB | '"
+    "+'Storage: '+(s.storage_size/1048576)+'MB '"
+    "+(s.storage_mounted?'(mounted)':'(unmounted)')+'<br>';"
     "h+='<button onclick=\"startSb('+s.id+')\">Start</button> ';"
     "h+='<button onclick=\"stopSb('+s.id+')\">Stop</button> ';"
     "h+='<button onclick=\"destroySb('+s.id+')\">Destroy</button><br>';"
     "h+='</div>';});document.getElementById('sandboxes').innerHTML=h;});}"
     "function createSb(){let n=document.getElementById('sname').value;"
     "let p=parseInt(document.getElementById('sport').value)||0;"
-    "api('POST','/api/sandbox/create',{name:n,port:p}).then(t=>{"
+    "let s=parseInt(document.getElementById('sstor').value)||16;"
+    "api('POST','/api/sandbox/create',{name:n,port:p,storage_mb:s}).then(t=>{"
     "log(t);load();});}"
     "function startSb(id){let c=prompt('Command to run:','echo hello');"
     "if(c)api('POST','/api/sandbox/'+id+'/start',{cmd:c}).then(t=>{"
@@ -240,12 +258,15 @@ static int build_sandboxes_json(char* buf, int bufsize) {
                          "{\"id\":%d,\"pid\":%d,\"name\":\"%s\","
                          "\"active\":%d,\"network_disabled\":%d,"
                          "\"memory_limit\":%lu,\"memory_used\":%lu,"
-                         "\"max_open_fds\":%d,\"port\":%d}",
+                         "\"max_open_fds\":%d,\"port\":%d,"
+                         "\"storage_size\":%lu,\"storage_mounted\":%d}",
                          info.id, info.pid, info.name,
                          info.active, info.network_disabled,
                          (unsigned long)info.memory_limit,
                          (unsigned long)info.memory_used,
-                         info.max_open_fds, info.port);
+                         info.max_open_fds, info.port,
+                         (unsigned long)info.storage_size,
+                         info.storage_mounted);
     }
     off += ksnprintf(buf + off, bufsize - off, "]}");
     return off;
@@ -302,6 +323,24 @@ static int handle_request(const char* raw, int raw_len,
                                    web_ui_html, (int)strlen(web_ui_html));
     }
 
+    /* GET /api/cert — return self-signed TLS certificate in PEM */
+    if (strcmp(req.method, "GET") == 0 &&
+        strcmp(req.path, "/api/cert") == 0) {
+        if (!use_tls) {
+            return http_bad_request(resp_buf, resp_bufsize,
+                                    "TLS not enabled on this server");
+        }
+        static char pem_buf[2048];
+        int pem_len = tls_server_cert_pem(NULL, pem_buf, sizeof(pem_buf));
+        if (pem_len <= 0) {
+            return http_error(resp_buf, resp_bufsize, 500,
+                              "Failed to generate certificate");
+        }
+        return http_response_build(resp_buf, resp_bufsize,
+                                   200, "OK", "application/x-pem-file",
+                                   pem_buf, pem_len);
+    }
+
     /* GET /api/sandboxes */
     if (strcmp(req.method, "GET") == 0 &&
         strcmp(req.path, "/api/sandboxes") == 0) {
@@ -316,15 +355,20 @@ static int handle_request(const char* raw, int raw_len,
         char name[SANDBOX_NAME_LEN] = {0};
         json_get_string(req.body, "name", name, sizeof(name));
         int port = json_get_int(req.body, "port", 0);
+        int storage_mb = json_get_int(req.body, "storage_mb", 16);
+        if (storage_mb < 1) storage_mb = 1;
+        if (storage_mb > 256) storage_mb = 256;
+        uint64_t storage = (uint64_t)storage_mb * 1024 * 1024;
 
-        int id = sandbox_create(name[0] ? name : NULL, port);
+        int id = sandbox_create(name[0] ? name : NULL, port, storage);
         if (id < 0) {
             return http_bad_request(resp_buf, resp_bufsize,
                                     "Failed to create sandbox (max reached?)");
         }
-        char body[128];
+        char body[192];
         ksnprintf(body, sizeof(body),
-                  "{\"id\":%d,\"message\":\"sandbox created\"}", id);
+                  "{\"id\":%d,\"storage_mb\":%d,\"message\":\"sandbox created\"}",
+                  id, storage_mb);
         return http_created(resp_buf, resp_bufsize, body);
     }
 
@@ -423,10 +467,12 @@ void sandbox_server_start(int port) {
         pr_warn("sandbox_server: already running on port %d\n", server_port);
         return;
     }
+    use_tls = 0;
     server_port = port > 0 ? port : 8080;
     memset(output_buf, 0, sizeof(output_buf));
     memset(output_len, 0, sizeof(output_len));
     memset(sb_conns, 0, sizeof(sb_conns));
+    memset(tls_conns, 0, sizeof(tls_conns));
 
     listen_idx = tcp_listen((uint16_t)server_port, SB_MAX_CONNS);
     if (listen_idx < 0) {
@@ -434,13 +480,40 @@ void sandbox_server_start(int port) {
         return;
     }
     server_running = 1;
-    pr_info("sandbox_server: listening on port %d\n", server_port);
+    pr_info("sandbox_server: listening on port %d (plain HTTP)\n", server_port);
+}
+
+void sandbox_server_start_tls(int port) {
+    if (server_running) {
+        pr_warn("sandbox_server: already running on port %d\n", server_port);
+        return;
+    }
+    use_tls = 1;
+    server_port = port > 0 ? port : 8443;
+    memset(output_buf, 0, sizeof(output_buf));
+    memset(output_len, 0, sizeof(output_len));
+    memset(sb_conns, 0, sizeof(sb_conns));
+    memset(tls_conns, 0, sizeof(tls_conns));
+
+    tls_server_init();
+
+    listen_idx = tcp_listen((uint16_t)server_port, SB_MAX_CONNS);
+    if (listen_idx < 0) {
+        pr_warn("sandbox_server: failed to listen on port %d\n", server_port);
+        return;
+    }
+    server_running = 1;
+    pr_info("sandbox_server: listening on port %d (TLS)\n", server_port);
 }
 
 void sandbox_server_stop(void) {
     if (!server_running) return;
 
     for (int i = 0; i < SB_MAX_CONNS; i++) {
+        if (tls_conns[i]) {
+            tls_server_close(tls_conns[i]);
+            tls_conns[i] = NULL;
+        }
         if (sb_conns[i].active && sb_conns[i].tcp) {
             tcp_close_conn(sb_conns[i].tcp);
             sb_conns[i].active = 0;
@@ -479,7 +552,22 @@ void sandbox_server_tick(void) {
             sb_conns[slot].tcp = ac;
             sb_conns[slot].active = 1;
             sb_conns[slot].req_len = 0;
+            tls_conns[slot] = NULL;
             pr_info("sandbox_server: new client on slot %d\n", slot);
+
+            /* If TLS mode, do the handshake now */
+            if (use_tls) {
+                struct tls_server_conn* tlsc = NULL;
+                if (tls_server_accept(ac, &tlsc) == 0 && tlsc) {
+                    tls_conns[slot] = tlsc;
+                    pr_info("sandbox_server: TLS handshake complete on slot %d\n", slot);
+                } else {
+                    pr_warn("sandbox_server: TLS handshake failed on slot %d, closing\n", slot);
+                    tcp_close_conn(ac);
+                    sb_conns[slot].active = 0;
+                    tls_conns[slot] = NULL;
+                }
+            }
         } else {
             pr_warn("sandbox_server: connection slots full, dropping\n");
             tcp_close_conn(ac);
@@ -492,21 +580,45 @@ void sandbox_server_tick(void) {
         struct tcp_conn* tc = hc->tcp;
 
         if (!tc->in_use || tc->state == TCP_CLOSED) {
+            if (tls_conns[i]) { tls_server_close(tls_conns[i]); tls_conns[i] = NULL; }
             hc->active = 0;
             continue;
         }
 
-        if (tc->rx_len > 0) {
-            int space = (int)sizeof(hc->req) - hc->req_len - 1;
-            if (space > 0 && tc->rx_len > 0) {
-                int n = tc->rx_len;
-                if (n > space) n = space;
-                memcpy(&hc->req[hc->req_len], tc->rx_buf, n);
+        /* Read data — via TLS or plain TCP */
+        if (use_tls && tls_conns[i] && tls_server_is_active(tls_conns[i])) {
+            /* TLS mode: read decrypted data */
+            char tls_buf[2048];
+            int n = tls_server_recv(tls_conns[i], tls_buf, sizeof(tls_buf) - 1, 0);
+            if (n > 0) {
+                tls_buf[n] = '\0';
+                int space = (int)sizeof(hc->req) - hc->req_len - 1;
+                if (space > 0 && n > space) n = space;
+                memcpy(&hc->req[hc->req_len], tls_buf, n);
                 hc->req_len += n;
-                memmove(tc->rx_buf, &tc->rx_buf[n], tc->rx_len - n);
-                tc->rx_len -= n;
+            } else if (n == -2) {
+                /* TLS alert — connection closed */
+                hc->active = 0;
+                tls_server_close(tls_conns[i]);
+                tls_conns[i] = NULL;
+                continue;
             }
+        } else if (!use_tls) {
+            /* Plain TCP mode */
+            if (tc->rx_len > 0) {
+                int space = (int)sizeof(hc->req) - hc->req_len - 1;
+                if (space > 0 && tc->rx_len > 0) {
+                    int n = tc->rx_len;
+                    if (n > space) n = space;
+                    memcpy(&hc->req[hc->req_len], tc->rx_buf, n);
+                    hc->req_len += n;
+                    memmove(tc->rx_buf, &tc->rx_buf[n], tc->rx_len - n);
+                    tc->rx_len -= n;
+                }
+            }
+        }
 
+        if (hc->req_len > 0) {
             int complete = 0;
             for (int j = 0; j + 3 < hc->req_len; j++) {
                 if (hc->req[j] == '\r' && hc->req[j+1] == '\n' &&
@@ -520,14 +632,24 @@ void sandbox_server_tick(void) {
                 char resp[8192];
                 int rlen = handle_request(hc->req, hc->req_len,
                                           resp, sizeof(resp));
-                if (rlen > 0)
-                    tcp_send_conn(tc, resp, (uint16_t)rlen);
+                if (rlen > 0) {
+                    if (use_tls && tls_conns[i] && tls_server_is_active(tls_conns[i])) {
+                        tls_server_send(tls_conns[i], resp, (uint16_t)rlen);
+                    } else {
+                        tcp_send_conn(tc, resp, (uint16_t)rlen);
+                    }
+                }
+                if (use_tls && tls_conns[i]) {
+                    tls_server_close(tls_conns[i]);
+                    tls_conns[i] = NULL;
+                }
                 tcp_close_conn(tc);
                 hc->active = 0;
             }
         }
 
         if (tc->rx_closed && !hc->active) {
+            if (tls_conns[i]) { tls_server_close(tls_conns[i]); tls_conns[i] = NULL; }
             hc->active = 0;
         }
     }
