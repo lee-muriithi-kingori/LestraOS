@@ -82,9 +82,9 @@ Lestra OS is a monolithic kernel operating system for x86_64 architecture, desig
 
 Lestra OS uses a Virtual File System (VFS) with pluggable backends:
 - **initrd** - Initial ramdisk for boot files
-- **ext4** - Standard Linux filesystem (planned)
-- **procfs** - Process information (planned)
-- **devfs** - Device files (planned)
+- **ext2** - Working (`kernel/fs/ext2/`); ext4 was never implemented, only ext2
+- **procfs** - Working (`kernel/fs/procfs.c`) — /proc/self/{exe,maps,auxv,cmdline}, /proc/meminfo, /proc/cpuinfo
+- **devfs** - Working (`kernel/fs/devfs.c`) — /dev/null, /dev/zero, /dev/urandom, /dev/tty
 
 ## Process Management
 

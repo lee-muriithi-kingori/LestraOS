@@ -39,36 +39,21 @@ and are cleared on reboot. This is intentional for security.
 
 ## Chatting
 
-Plain chat (no tools):
+This used to be simulated (no network stack existed yet). It isn't
+anymore — `ai chat` and `ai agent` now go over the real network:
+`net_resolve()` does a DNS query, `tcp_connect`/`tls_connect` opens the
+connection (TLS 1.2 for `https://` endpoints), and the response is a real
+HTTP reply from whatever provider or local server you pointed it at.
+Requires `ai keys set <provider> <key>` first, and DHCP to have completed
+(`network` command shows status). Exact terminal output depends on the
+provider's response and isn't reproduced here to avoid it going stale
+again — try it against a local Ollama/llama.cpp server first if you want
+a fast, free way to confirm the transport works end-to-end.
 
-```
-lestra:/$ ai chat what is the meaning of life
-[AI chat] sending prompt (28 chars)...
-
---- AI Response ---
-[simulated response from OpenAI (model: gpt-4o). Real HTTP requires a
-TCP/IP stack — see docs/NETWORK.md.]
-
-I received your prompt: "what is the meaning of life". With a real
-network stack I would respond with the assistant message.
-```
-
-Agentic chat (with tools):
-
-```
-lestra:/$ ai agent show me system memory
-[AI agent] running agentic loop with tools...
-
---- Agent Output ---
-=== Agentic Chat (simulated) ===
-
-User: show me system memory
-
-[calling tool: meminfo]
-Result: total=4095mb used=64mb free=4031mb
-
-Assistant: I executed the requested tool and reported the result above.
-```
+Tool-calling in `ai agent` (`meminfo`, `pkg_install`, etc.) is done
+**locally** by detecting keywords in the prompt before it's sent, not via
+provider-side function-calling — the JSON body sent to the provider is
+just `{"model":...,"messages":[...]}`, no tools schema included.
 
 ## Available tools
 
@@ -109,10 +94,10 @@ conversation, allowing the AI to:
 │  - ai_chat() — single-shot                         │
 │  - ai_chat_with_tools() — agentic loop             │
 ├────────────────────────────────────────────────────┤
-│  HTTP layer (stub)                                 │
-│  - ai_http_post() — currently simulated            │
-│  - Replace with real HTTP client when TCP/IP stack │
-│    is available (see docs/NETWORK.md, planned)     │
+│  HTTP(S) layer — real                              │
+│  - ai_http_post() — DNS + TCP/TLS + HTTP request/  │
+│    response, dispatches to tls_* for https://      │
+│    endpoints, tcp_* otherwise                      │
 ├────────────────────────────────────────────────────┤
 │  Tool implementations                              │
 │  - shell       → kernel/core/shell.c (dispatch)    │
@@ -123,21 +108,27 @@ conversation, allowing the AI to:
 └────────────────────────────────────────────────────┘
 ```
 
-## What's needed for real AI calls
+## Current limitations of real AI calls
 
-To make the AI subsystem actually call provider APIs (instead of returning
-simulated responses), the following are needed:
+All five of the previously-listed prerequisites are done: hand-rolled
+TCP/IP (`kernel/net/net.c`), DNS (`net_resolve()`), TLS 1.2 client
+(`kernel/net/tls.c`), the HTTP request/response cycle in
+`ai_http_post()`, and a minimal JSON extractor (searches for `"content":`
+in the response body — not a real parser, so it'll miss anything the
+provider returns in a different shape).
 
-1. **TCP/IP stack** — implement or port lwIP into `kernel/net/`
-2. **DNS resolver** — translate `api.openai.com` to an IP address
-3. **TLS client** — providers require HTTPS. Port mbedTLS or similar
-4. **HTTP client** — build request with `Authorization: Bearer <key>`
-5. **JSON parser** — parse the response body to extract the assistant
-   message and `tool_calls` array
+Known rough edges, honestly:
 
-When all five are available, only `ai_http_post()` in `kernel/ai/ai.c`
-needs to be rewritten. Everything else (key management, tool framework,
-dispatch loop) stays the same.
+- No `tool_calls` handling — the JSON extractor only looks for
+  `"content":"..."`, so provider-side function-calling responses
+  (as opposed to the local keyword-based tool dispatch in `ai agent`)
+  aren't parsed.
+- No response streaming — the whole body is buffered before any of it
+  is shown.
+- TLS is 1.2 only (cipher suite `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`),
+  not 1.3 — some providers may reject or downgrade.
+- `net_resolve()` needs DHCP to have handed out a DNS server; if that
+  hasn't completed yet, `ai chat` will fail until it has.
 
 ## Provider-specific request formats
 

@@ -5,15 +5,19 @@
  * Implements:
  *   - Per-provider API key storage (in-memory; keys never persist to disk)
  *   - Tool registry with built-in tools (shell, file ops, package mgmt)
- *   - Chat loop with simulated agentic tool-calling
+ *   - Chat loop that makes real provider API calls over the network
  *
- * IMPORTANT: A real OS would need a TCP/IP stack + HTTP client + TLS to
- * actually call provider APIs. Without that, the chat function returns
- * a clearly-labeled simulated response that demonstrates the agentic UX.
+ * ai_http_post() below does a real DNS lookup (net_resolve), real TCP
+ * connect/send/recv (kernel/net/tcp.c), and a real TLS 1.2 handshake for
+ * HTTPS endpoints (kernel/net/tls.c — AES-128-GCM, ECDHE P-256, X.509,
+ * RSA signature verification). This is not simulated. It builds an
+ * OpenAI-compatible JSON body, sends it with a Bearer auth header, and
+ * parses the HTTP response.
  *
- * When a network stack is added (planned: see docs/NETWORK.md), the only
- * function that needs to change is `ai_http_post()` below — everything
- * else (key management, tool framework, dispatch loop) stays the same.
+ * NOTE: this comment used to say the network stack didn't exist yet and
+ * that chat responses were faked — that was true early on but is stale
+ * now that TCP/TLS/DNS all landed. Keep this comment in sync with
+ * ai_http_post() if that function changes again.
  */
 
 #include <lestra/types.h>
@@ -402,18 +406,16 @@ void ai_tool_uptime(const char* args, char* out, size_t out_size) {
     out[n] = 0;
 }
 
-/* ----- HTTP placeholder ----------------------------------------------- */
-/* In a real OS this function would:
- *   1. Open a TCP socket to the provider's host (port 443)
- *   2. Negotiate TLS
- *   3. Build a JSON request body with the prompt + tools schema
- *   4. POST to the endpoint with Authorization header
- *   5. Parse JSON response and extract the assistant message
- *
- * Without a network stack, we simulate this by:
- *   - Returning a help message that explains what would happen
- *   - Demonstrating tool-calling by detecting keywords in the prompt
- *     and routing to the appropriate tool
+/* ----- Real HTTP(S) request to the provider ---------------------------- */
+/* Does the real thing:
+ *   1. Resolves the host via net_resolve() (real DNS query)
+ *   2. Opens a TCP socket to the provider's host
+ *   3. For HTTPS endpoints, negotiates TLS via tls.c
+ *   4. Builds a JSON request body (prompt only — no tools schema sent
+ *      to the provider; tool-calling here is local keyword detection,
+ *      not provider-side function calling)
+ *   5. POSTs to the endpoint with a Bearer Authorization header
+ *   6. Reads and returns the raw HTTP response body
  */
 static int ai_http_post(int provider, const char* prompt,
                         char* response, size_t response_size) {
@@ -424,14 +426,20 @@ static int ai_http_post(int provider, const char* prompt,
         return -1;
     }
 
-    /* HTTPS endpoints are now supported — tls.c has real P-256 ECDHE
-     * and AES-128-GCM (see kernel/net/p256.c). The HTTP client auto-
-     * detects the scheme and does a TLS handshake if needed. */
-    if (provider_endpoints[provider][0] == 'h' &&
-        provider_endpoints[provider][1] == 't' &&
-        provider_endpoints[provider][2] == 't' &&
-        provider_endpoints[provider][3] == 'p' &&
-        provider_endpoints[provider][4] == 's') {
+    /* BUG FIX: this used to only log "using real TLS" here and then fall
+     * through to plain tcp_connect()/tcp_send() below — it never actually
+     * called into tls.c. That meant the API key and prompt were sent in
+     * cleartext over a raw TCP socket to port 443 for every https://
+     * endpoint (which is the default for every provider except a local
+     * proxy). `use_tls` now actually drives which transport is used
+     * below (tls_connect/tls_send/tls_recv/tls_close vs
+     * tcp_connect/tcp_send/tcp_recv_wait/tcp_close). */
+    int use_tls = (provider_endpoints[provider][0] == 'h' &&
+                   provider_endpoints[provider][1] == 't' &&
+                   provider_endpoints[provider][2] == 't' &&
+                   provider_endpoints[provider][3] == 'p' &&
+                   provider_endpoints[provider][4] == 's');
+    if (use_tls) {
         pr_info("ai: %s endpoint is HTTPS — using real TLS (P-256 ECDHE)\n",
                 provider_display[provider]);
     }
@@ -503,10 +511,23 @@ static int ai_http_post(int provider, const char* prompt,
         return -1;
     }
 
-    if (!tcp_connect(ip, port, 5000)) {
-        ksnprintf(response, response_size,
-                  "[TCP connect to %s:%u failed]", host, (unsigned)port);
-        return -1;
+    extern int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname);
+    extern int tls_send(const void* data, uint16_t len);
+    extern int tls_recv(void* buf, uint16_t bufsz, uint32_t timeout_ms);
+    extern void tls_close(void);
+
+    if (use_tls) {
+        if (!tls_connect(ip, port, host)) {
+            ksnprintf(response, response_size,
+                      "[TLS connect/handshake to %s:%u failed]", host, (unsigned)port);
+            return -1;
+        }
+    } else {
+        if (!tcp_connect(ip, port, 5000)) {
+            ksnprintf(response, response_size,
+                      "[TCP connect to %s:%u failed]", host, (unsigned)port);
+            return -1;
+        }
     }
 
     static char req[3072];
@@ -526,15 +547,17 @@ static int ai_http_post(int provider, const char* prompt,
     memcpy(&req[reqlen], body, blen);
     reqlen += blen;
 
-    /* Send request in chunks (TCP send is capped at 1400 bytes). */
+    /* Send request in chunks (TCP send is capped at 1400 bytes; TLS
+     * records go through the same cap since tls_send wraps one send). */
     int sent = 0;
     while (sent < reqlen) {
         int chunk = reqlen - sent;
         if (chunk > 1400) chunk = 1400;
-        int n = tcp_send(&req[sent], (uint16_t)chunk);
+        int n = use_tls ? tls_send(&req[sent], (uint16_t)chunk)
+                         : tcp_send(&req[sent], (uint16_t)chunk);
         if (n <= 0) {
-            tcp_close();
-            ksnprintf(response, response_size, "[tcp_send failed]");
+            if (use_tls) tls_close(); else tcp_close();
+            ksnprintf(response, response_size, use_tls ? "[tls_send failed]" : "[tcp_send failed]");
             return -1;
         }
         sent += n;
@@ -545,12 +568,13 @@ static int ai_http_post(int provider, const char* prompt,
     uint16_t total = 0;
     uint32_t timeout = 8000;
     while (total < sizeof(rbuf) - 1) {
-        int n = tcp_recv_wait(&rbuf[total], (uint16_t)(sizeof(rbuf) - 1 - total), timeout);
+        int n = use_tls ? tls_recv(&rbuf[total], (uint16_t)(sizeof(rbuf) - 1 - total), timeout)
+                         : tcp_recv_wait(&rbuf[total], (uint16_t)(sizeof(rbuf) - 1 - total), timeout);
         if (n <= 0) break;
         total += (uint16_t)n;
         timeout = 1500;
     }
-    tcp_close();
+    if (use_tls) tls_close(); else tcp_close();
     rbuf[total] = '\0';
 
     if (total == 0) {

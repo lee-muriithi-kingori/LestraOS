@@ -130,9 +130,19 @@ static void proc_map_page(struct process* p, uint64_t vaddr, uint64_t phys, uint
     vmm_map_page(p->pml4, vaddr, phys, flags);
 }
 
-/* Copy all user pages (PAGE_USER set) from parent's address space to child's. */
+/* Copy all user pages (PAGE_USER set) from parent's address space to child's.
+ * FIX: was only walking PML4 indices 0-3 (the shared kernel range copied
+ * by pointer in create_proc_pml4()), which never contains the user stack —
+ * proc_setup_stack() maps the stack at 0x00007FFFFFE00000, which falls in
+ * PML4 index 255. That meant fork() silently never copied the child's
+ * stack; the child would page-fault (or worse) the instant it touched it.
+ * Now walks the full PML4 range so every private mapping — stack, ELF
+ * segments, anything else proc_map_page put outside indices 0-3 — actually
+ * gets copied. vmm_map_page()/proc_map_page() creates any missing
+ * intermediate page tables in the child on demand, so no extra setup is
+ * needed here. */
 static void copy_user_pages(struct process* parent, struct process* child) {
-    for (int p4 = 0; p4 < 4; p4++) {
+    for (int p4 = 0; p4 < 512; p4++) {
         if (!(parent->pml4[p4] & PAGE_PRESENT)) continue;
         uint64_t* pdpt = (uint64_t*)(parent->pml4[p4] & ~0xFFFULL);
         for (int p3 = 0; p3 < 512; p3++) {

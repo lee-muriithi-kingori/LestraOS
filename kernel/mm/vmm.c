@@ -175,9 +175,51 @@ uintptr_t* vmm_create_address_space(void) {
     return (uintptr_t*)pml4;
 }
 
+/* Free every page table (and mapped leaf page) reachable from a single
+ * PDPT entry. Only ever called on PML4 indices >= 4, which are private
+ * to this address space (indices 0-3 are shared with boot_pml4 across
+ * every process and the kernel — see create_proc_pml4() in scheduler.c
+ * — and must never be freed here). */
+static void free_pdpt_subtree(phys_addr_t pdpt_phys) {
+    uint64_t* pdpt = (uint64_t*)pdpt_phys;
+    for (int p3 = 0; p3 < PDPT_ENTRIES; p3++) {
+        if (!(pdpt[p3] & PAGE_PRESENT)) continue;
+        if (pdpt[p3] & PAGE_HUGE) continue; /* 1GB huge page: nothing to recurse into */
+
+        phys_addr_t pd_phys = pdpt[p3] & ~0xFFFULL;
+        uint64_t* pd = (uint64_t*)pd_phys;
+        for (int p2 = 0; p2 < PD_ENTRIES; p2++) {
+            if (!(pd[p2] & PAGE_PRESENT)) continue;
+            if (pd[p2] & PAGE_HUGE) continue; /* 2MB huge page: nothing to recurse into */
+
+            phys_addr_t pt_phys = pd[p2] & ~0xFFFULL;
+            uint64_t* pt = (uint64_t*)pt_phys;
+            for (int p1 = 0; p1 < PT_ENTRIES; p1++) {
+                if (!(pt[p1] & PAGE_PRESENT)) continue;
+                /* Free the mapped leaf page itself (stack, ELF segments,
+                 * anything proc_map_page put here). */
+                pmm_free_page(pt[p1] & ~0xFFFULL);
+            }
+            pmm_free_page(pt_phys);
+        }
+        pmm_free_page(pd_phys);
+    }
+    pmm_free_page(pdpt_phys);
+}
+
 void vmm_destroy_address_space(uintptr_t* pml4) {
     if (!pml4) return;
-    /* TODO: Free all page tables */
+
+    /* PML4 indices 0-3 are shared kernel mappings copied by pointer in
+     * create_proc_pml4() — freeing them would corrupt the kernel and
+     * every other process's address space. Only free indices 4-511,
+     * which are private to this process (e.g. the user stack at
+     * PML4[255], and any ELF segments mapped outside the low range). */
+    for (int p4 = 4; p4 < PML4_ENTRIES; p4++) {
+        if (!(pml4[p4] & PAGE_PRESENT)) continue;
+        free_pdpt_subtree(pml4[p4] & ~0xFFFULL);
+    }
+
     pmm_free_page((phys_addr_t)(uintptr_t)pml4);
 }
 

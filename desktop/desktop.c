@@ -2,9 +2,13 @@
  * Lestra OS - Desktop Environment
  * Copyright (c) 2026 lestramk.org
  *
- * For now, the "desktop" is the VGA text-mode UI provided by kernel/ui/.
- * When framebuffer graphics are added (planned), this module will own the
- * graphical desktop, windows, and compositor.
+ * NOT CURRENTLY USED. desktop_init()/desktop_run() are never called —
+ * kernel_main.c calls compositor_init()/compositor_run() from
+ * kernel/gui/ directly instead. That's the real, working framebuffer
+ * GUI (compositor, widgets, top bar, app grid, file explorer, terminal,
+ * task manager, etc). This file predates that and was never wired back
+ * in. There's also a second, unbuilt duplicate at kernel/desktop/desktop.c
+ * (not referenced by the Makefile at all) — pick one and delete the other.
  */
 #include <lestra/types.h>
 #include <lestra/printk.h>

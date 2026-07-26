@@ -20,14 +20,14 @@ of the stack — from hardware interrupts to userspace syscalls.
 | Custom C library (libc) | Core functions |
 | Custom shell (lsh) with full command set | Working |
 | Memory manager (PMM bitmap + VMM paging + heap) | Working |
-| Preemptive scheduler | Stub (single-task mode) |
+| Preemptive scheduler | **Working** — real round-robin scheduler, context switching, fork/exec/wait/zombies |
 | VFS (in-memory) + initrd loader | Working |
-| System calls (SYSCALL/SYSRET) | Stub |
+| System calls (SYSCALL/SYSRET) | **Working** — real entry path, 29 syscalls dispatched |
 | **Package manager (lestra-pkg) — 60+ prebuilt packages** | **NEW** |
-| **AI subsystem (multi-provider, agentic tools)** | **NEW** |
+| **AI subsystem (multi-provider, agentic tools)** | **NEW** — real HTTP client; HTTPS providers work via in-tree TLS 1.2 |
 | **Cyberpunk UI (3 themes, panels, menus)** | **NEW** |
-| Framebuffer desktop | Planned |
-| TCP/IP stack (for real AI calls) | Planned |
+| Framebuffer desktop | **Working** — real compositor (`kernel/gui/`), wired into boot in `kernel_main.c`. Software-rendered only, no GPU accel, no USB HID |
+| TCP/IP stack + TLS 1.2 (client + server) | **Working** — ARP/ICMP/UDP/DHCP, real TLS handshake (AES-GCM, ECDHE P-256, X.509, RSA) |
 
 ## What was fixed in this version
 
@@ -155,20 +155,21 @@ make clean
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  User Space (planned)                                │
+│  User Space — working (fork/exec/wait, ELF loader)   │
 │  [Lestra Shell] [sysinfo] [init] [bin/*]            │
 ├─────────────────────────────────────────────────────┤
 │  libc — memcpy, memset, strlen, printf,             │
 │         malloc/free, read, write, exit               │
 ├─────────────────────────────────────────────────────┤
-│  System Calls (SYSCALL/SYSRET interface)             │
+│  System Calls (SYSCALL/SYSRET interface, 29 calls)   │
 ├─────────────────────────────────────────────────────┤
 │  Kernel                                              │
-│  [Print] [Panic] [GDT] [IDT] [IRQ] [VMM]           │
+│  [Print] [Panic] [GDT] [IDT] [IRQ] [VMM] [Sched]    │
 │  [VGA]  [Keyboard] [Serial] [PIT Timer] [Heap]      │
-│  [VFS + initrd] [UI] [Package Manager] [AI]         │
+│  [VFS + ext2 + initrd] [UI] [GUI compositor]         │
+│  [Package Manager] [AI] [TCP/IP + TLS 1.2]          │
 ├─────────────────────────────────────────────────────┤
-│  Hardware: CPU, RAM, Keyboard, Serial, PIT          │
+│  Hardware: CPU, RAM, Keyboard, Serial, PIT, NIC     │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -185,16 +186,21 @@ LestraOS/
 │   ├── core/       # kernel_main, panic, printk, shell
 │   ├── drivers/    # vga, keyboard, serial, pit
 │   ├── mm/         # PMM, VMM, heap
-│   ├── sched/      # Scheduler (stub)
-│   ├── syscall/    # SYSCALL/SYSRET + dispatch
-│   ├── fs/         # VFS (in-memory) + initrd loader
-│   ├── ui/         # Cyberpunk UI (themes, panels, menus)
+│   ├── sched/      # Real preemptive round-robin scheduler + context switch
+│   ├── syscall/    # SYSCALL/SYSRET + dispatch (29 syscalls)
+│   ├── fs/         # VFS + ext2 driver + procfs + devfs + initrd loader
+│   ├── net/        # TCP/IP stack: ARP, ICMP, UDP, DHCP, DNS, TCP, TLS 1.2 client+server
+│   ├── gui/        # Framebuffer compositor (widgets, top bar, app grid,
+│   │                 file explorer, terminal, task manager) — wired into
+│   │                 boot via kernel_main.c
+│   ├── ui/         # Cyberpunk text-mode UI (themes, panels, menus)
 │   ├── ai/         # AI subsystem (providers, tools, chat)  ← NEW
 │   └── include/    # Kernel headers
 ├── libc/           # Custom C library
 ├── user/           # Userspace programs (init, shell, sysinfo)
 ├── pkg/            # Package manager (lestra-pkg)  ← ENHANCED
-├── desktop/        # Desktop environment (stub)
+├── desktop/        # Dead code — not called anywhere; kernel_main.c calls
+│                     kernel/gui/ directly instead. Delete or repurpose.
 ├── installer/      # OS installer (host-side)
 ├── docs/           # Architecture, build, boot, AI docs
 └── Makefile
@@ -223,15 +229,17 @@ make clean        # Clean all
 
 ## Roadmap
 
-- [ ] TCP/IP stack (lwIP port) — for real AI API calls
-- [ ] DNS resolver
-- [ ] TLS 1.3 client (mbedTLS port)
-- [ ] Real preemptive scheduler with context switching
-- [ ] ext2 filesystem driver
-- [ ] Framebuffer graphics + desktop environment
-- [ ] Userspace process loading (ELF loader)
+- [x] TCP/IP stack (ARP, ICMP, UDP, DHCP) — hand-rolled, not lwIP
+- [x] TLS 1.2 client + server (AES-GCM, ECDHE P-256, X.509, RSA) — see `kernel/net/tls.c`
+- [x] Real preemptive scheduler with context switching — see `kernel/sched/`
+- [x] ext2 filesystem driver — see `kernel/fs/ext2/`
+- [x] Userspace process loading (ELF loader) — see `kernel/exec/elf.c`
+- [x] DNS resolver — see `net_resolve()` in `kernel/net/net.c` (real UDP query + A-record parsing)
+- [ ] TLS 1.3 (currently 1.2 only)
 - [ ] POSIX-compatible libc
-- [ ] Real package installation (vs simulated)
+- [ ] Real package execution — downloads work and land on disk, but there's no ELF package runtime yet to unpack/exec them (see `kernel/pkg/lestra-pkg.c` for the honest breakdown of what "install" currently does)
+- [ ] WiFi driver (ath9k/rtl) — currently simulated, no real hardware support
+- [ ] USB host controller driver
 
 ## Contributing
 

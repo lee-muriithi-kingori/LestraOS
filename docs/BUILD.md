@@ -93,16 +93,18 @@ LestraOS/
 │   ├── core/          # kernel_main, printk, panic, shell
 │   ├── drivers/       # vga, keyboard, serial, pit
 │   ├── mm/            # PMM, VMM, heap
-│   ├── sched/         # Scheduler (stub)
-│   ├── syscall/       # SYSCALL/SYSRET + dispatch
-│   ├── fs/            # VFS (in-memory) + initrd loader
-│   ├── ui/            # Cyberpunk UI (themes, panels, menus)
+│   ├── sched/         # Real preemptive round-robin scheduler + context switch
+│   ├── syscall/       # SYSCALL/SYSRET + dispatch (29 syscalls)
+│   ├── fs/            # VFS + ext2 driver + procfs + devfs + initrd loader
+│   ├── net/           # TCP/IP: ARP, ICMP, UDP, DHCP, DNS, TCP, TLS 1.2 client+server
+│   ├── gui/           # Framebuffer compositor — wired into boot via kernel_main.c
+│   ├── ui/            # Cyberpunk text-mode UI (themes, panels, menus)
 │   ├── ai/            # AI subsystem (NEW)
 │   └── include/       # Kernel headers
 ├── libc/              # Custom C library
 ├── user/              # Userspace programs
 ├── pkg/               # Package manager (60+ prebuilt)
-├── desktop/           # Desktop environment stub
+├── desktop/           # Dead code — not called; kernel_main.c uses kernel/gui/ directly
 ├── installer/         # Host-side OS installer
 ├── scripts/           # Build scripts (was build/, moved to avoid make clean collision)
 │   ├── mkinitrd.py    # packs user binaries into initrd.img
