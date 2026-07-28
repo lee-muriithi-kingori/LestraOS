@@ -48,8 +48,10 @@ void serial_puts(uint16_t port, const char* str) {
 }
 
 char serial_getchar(uint16_t port) {
-    while ((inb(port + 5) & 0x01) == 0);
-    return inb(port);
+    for (int i = 0; i < 100000; i++) {
+        if (inb(port + 5) & 0x01) return inb(port);
+    }
+    return 0;  /* timeout — no data available */
 }
 
 bool serial_has_data(uint16_t port) {

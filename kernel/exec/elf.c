@@ -113,9 +113,10 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
 }
 
 static void user_map_data(uintptr_t* pml4, uint64_t vaddr, const void* data,
-                          size_t data_len, int writable) {
+                          size_t data_len, int writable, int executable) {
     uint64_t flags = PAGE_PRESENT | PAGE_USER;
     if (writable) flags |= PAGE_WRITABLE;
+    if (!executable) flags |= PAGE_NX;
 
     size_t num_pages = (data_len + PAGE_SIZE - 1) / PAGE_SIZE;
     for (size_t i = 0; i < num_pages; i++) {
@@ -157,22 +158,24 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
                 (unsigned)ph->p_vaddr, (unsigned)ph->p_filesz,
                 (unsigned)ph->p_memsz);
 
-        int writable = (ph->p_flags & PF_W) != 0;
+        int writable   = (ph->p_flags & PF_W) != 0;
+        int executable = (ph->p_flags & PF_X) != 0;
         const void* segment_data = (const char*)elf_data + ph->p_offset;
 
-        user_map_data(user_pml4, ph->p_vaddr, segment_data, ph->p_filesz, writable);
+        user_map_data(user_pml4, ph->p_vaddr, segment_data, ph->p_filesz, writable, executable);
 
         if (ph->p_memsz > ph->p_filesz) {
             uint64_t bss_start = ph->p_vaddr + ph->p_filesz;
             bss_start = (bss_start + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
             uint64_t bss_end = ph->p_vaddr + ph->p_memsz;
             size_t bss_pages = (bss_end - bss_start + PAGE_SIZE - 1) / PAGE_SIZE;
+            uint64_t bss_flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
+            if (!executable) bss_flags |= PAGE_NX;
             for (size_t p = 0; p < bss_pages; p++) {
                 phys_addr_t phys = pmm_alloc_page();
                 if (phys) {
                     memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
-                    user_map_page(user_pml4, bss_start + p * PAGE_SIZE, phys,
-                                  PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
+                    user_map_page(user_pml4, bss_start + p * PAGE_SIZE, phys, bss_flags);
                 }
             }
         }
@@ -185,7 +188,7 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
         if (phys) {
             memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
             user_map_page(user_pml4, USER_STACK_BOTTOM + i * PAGE_SIZE,
-                          phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
+                          phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
         }
     }
     user_stack_ptr = USER_STACK_TOP - 16;

@@ -259,10 +259,11 @@ enable_paging:
     mov eax, boot_pml4
     mov cr3, eax
 
-    ; Enable long mode via EFER MSR
+    ; Enable long mode via EFER MSR, also enable NXE so the
+    ; NX (No-eXecute) page-table bit (bit 63) is honored.
     mov ecx, 0xC0000080     ; EFER MSR
     rdmsr
-    or eax, 1 << 8          ; LME (Long Mode Enable)
+    or eax, (1 << 8) | (1 << 11)  ; LME + NXE
     wrmsr
 
     ; Enable paging

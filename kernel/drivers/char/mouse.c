@@ -80,7 +80,11 @@ static int mouse_initialized = 0;
 static int fb_width  = 1024;
 static int fb_height = 768;
 
-/* Callback for event notification (set by input subsystem) */
+/* Callback for event notification (set by input subsystem).
+ * Invoked directly from the IRQ handler — any operation in the callback
+ * must be safe in interrupt context (no spinlocks, no blocking I/O).
+ * If the callback needs to do heavy work, it should queue a deferred
+ * task and return immediately. */
 static mouse_event_callback_t event_callback = NULL;
 
 /* ----- PS/2 controller helpers ----- */
@@ -188,13 +192,18 @@ static void mouse_irq_handler(struct interrupt_frame* frame) {
         return;
     }
 
-    /* Update absolute position (clamped to framebuffer bounds) */
-    mouse_x += dx;
-    mouse_y += dy;
-    if (mouse_x < 0) mouse_x = 0;
-    if (mouse_y < 0) mouse_y = 0;
-    if (mouse_x >= fb_width)  mouse_x = fb_width - 1;
-    if (mouse_y >= fb_height) mouse_y = fb_height - 1;
+    /* Update absolute position (clamped to framebuffer bounds).
+     * Use 64-bit intermediates to avoid signed integer overflow UB. */
+    {
+        long new_x = (long)mouse_x + dx;
+        long new_y = (long)mouse_y + dy;
+        if (new_x < 0)           new_x = 0;
+        if (new_y < 0)           new_y = 0;
+        if (new_x >= fb_width)   new_x = fb_width - 1;
+        if (new_y >= fb_height)  new_y = fb_height - 1;
+        mouse_x = (int)new_x;
+        mouse_y = (int)new_y;
+    }
 
     /* Update button state */
     mouse_buttons = flags & 0x07;  /* Left=bit0, Right=bit1, Middle=bit2 */

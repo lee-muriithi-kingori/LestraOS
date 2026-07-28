@@ -40,7 +40,7 @@
 #define ARG_MAX_NUM  32
 
 static char input_buffer[CMD_MAX_LEN];
-static char* argv[ARG_MAX_NUM];
+static char* argv[ARG_MAX_NUM + 1];
 static int argc = 0;
 static char cwd[64] = "/";
 
@@ -105,6 +105,7 @@ static void cmd_help(void) {
     printk("    neofetch     System info with ASCII art\n");
     printk("    test         Run system tests\n");
     printk("    echo         Print arguments\n");
+    printk("    cd [path]    Change current directory (default: /)\n");
     printk("    clear        Clear screen\n");
     printk("    reboot       Reboot system\n");
     printk("    shutdown     Shutdown system\n");
@@ -1270,7 +1271,7 @@ void cmd_mount(int argc, char** argv) {
     /* Show mount info or mount a filesystem. */
     if (argc >= 3 && strcmp(argv[1], "ext2") == 0) {
         /* Mount ext2 at the specified target path. */
-        int rc = vfs_mount(argv[2], argv[2], "ext2");
+        int rc = vfs_mount("sda1", argv[2], "ext2");
         if (rc == 0) {
             printk("ext2 filesystem mounted at %s\n", argv[2]);
             /* Show the directory listing. */
@@ -1947,6 +1948,20 @@ static void execute_command(void) {
 
     if (strcmp(cmd, "help") == 0) cmd_help();
     else if (strcmp(cmd, "echo") == 0) cmd_echo();
+    else if (strcmp(cmd, "cd") == 0) {
+        if (argc < 2) {
+            /* No arg: go to root */
+            strcpy(cwd, "/");
+        } else {
+            if (argv[1][0] == '/') {
+                strncpy(cwd, argv[1], sizeof(cwd) - 1);
+            } else {
+                strncat(cwd, "/", sizeof(cwd) - strlen(cwd) - 1);
+                strncat(cwd, argv[1], sizeof(cwd) - strlen(cwd) - 1);
+            }
+            cwd[sizeof(cwd) - 1] = '\0';
+        }
+    }
     else if (strcmp(cmd, "clear") == 0) cmd_clear();
     else if (strcmp(cmd, "uname") == 0) cmd_uname();
     else if (strcmp(cmd, "free") == 0) cmd_free();

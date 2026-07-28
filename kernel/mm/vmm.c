@@ -23,6 +23,10 @@ typedef uint64_t pdpte_t;
 typedef uint64_t pde_t;
 typedef uint64_t pte_t;
 
+/* Page-table level at which a PTE was found — used by vmm_get_phys
+ * to distinguish 1GB (PDPT level) from 2MB (PD level) huge pages. */
+typedef enum { LEVEL_PT = 0, LEVEL_PD, LEVEL_PDPT } pt_level_t;
+
 /* Kernel PML4 - defined in boot assembly */
 extern uint64_t boot_pml4[512];
 
@@ -34,19 +38,20 @@ extern uint64_t boot_pml4[512];
  *
  * Now returns a sentinel non-NULL pointer for huge-mapped addresses
  * (callers should check `*pte & PAGE_HUGE` if they care). */
-static pte_t* get_pte(uintptr_t virt) {
+static pte_t* get_pte_level(uintptr_t* pml4, uintptr_t virt, pt_level_t* out_level) {
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
     uint64_t pd_idx   = (virt >> 21) & 0x1FF;
     uint64_t pt_idx   = (virt >> 12) & 0x1FF;
 
-    if (!(boot_pml4[pml4_idx] & PAGE_PRESENT)) return NULL;
+    if (!(pml4[pml4_idx] & PAGE_PRESENT)) return NULL;
 
-    uint64_t* pdpt = (uint64_t*)(boot_pml4[pml4_idx] & ~0xFFF);
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) return NULL;
 
     /* PDPT entry itself could be a 1GB huge page */
     if (pdpt[pdpt_idx] & PAGE_HUGE) {
+        if (out_level) *out_level = LEVEL_PDPT;
         return &pdpt[pdpt_idx];  /* 1GB huge page */
     }
 
@@ -55,11 +60,17 @@ static pte_t* get_pte(uintptr_t virt) {
 
     /* PD entry can be a 2MB huge page (this is what boot.asm uses) */
     if (pd[pd_idx] & PAGE_HUGE) {
+        if (out_level) *out_level = LEVEL_PD;
         return &pd[pd_idx];  /* 2MB huge page */
     }
 
+    if (out_level) *out_level = LEVEL_PT;
     uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
     return &pt[pt_idx];
+}
+
+static pte_t* get_pte(uintptr_t* pml4, uintptr_t virt) {
+    return get_pte_level(pml4, virt, NULL);
 }
 
 void vmm_init(void) {
@@ -135,8 +146,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
 
 /* Unmap a page */
 void vmm_unmap_page(uintptr_t* pml4, virt_addr_t virt) {
-    (void)pml4;
-    pte_t* pte = get_pte(virt);
+    pte_t* pte = get_pte(pml4, virt);
     if (pte && (*pte & PAGE_PRESENT)) {
         /* Don't unmap huge pages from under us — that would break the
          * identity mapping set up by boot.asm. Just no-op. */
@@ -151,23 +161,20 @@ void vmm_unmap_page(uintptr_t* pml4, virt_addr_t virt) {
  * is formed from bits 51:21 of the entry plus bits 20:0 of the virt.
  * For a 1GB huge page, it's bits 51:30 of entry + bits 29:0 of virt. */
 phys_addr_t vmm_get_phys(uintptr_t* pml4, virt_addr_t virt) {
-    (void)pml4;
-    pte_t* pte = get_pte(virt);
+    pt_level_t level;
+    pte_t* pte = get_pte_level(pml4, virt, &level);
     if (pte && (*pte & PAGE_PRESENT)) {
         if (*pte & PAGE_HUGE) {
-            /* Check if it's a 1GB or 2MB huge page by looking at which
-             * level we found it. We detect by checking if the entry's
-             * physical address is aligned to 1GB. */
-            uint64_t entry = *pte & 0x000FFFFFFFFFF000ULL;  /* bits 51:12 */
-            if ((entry & 0x3FFFFFFF) == 0) {
-                /* 1GB huge page: entry is 1GB-aligned */
-                return (entry & ~0x3FFFFFFF) | (virt & 0x3FFFFFFF);
+            uint64_t entry = *pte & 0x000FFFFFFFFFF000ULL;
+            if (level == LEVEL_PDPT) {
+                /* 1GB huge page */
+                return (entry & ~0x3FFFFFFFULL) | (virt & 0x3FFFFFFF);
             } else {
-                /* 2MB huge page */
-                return (entry & ~0x1FFFFF) | (virt & 0x1FFFFF);
+                /* 2MB huge page (LEVEL_PD) */
+                return (entry & ~0x1FFFFFULL) | (virt & 0x1FFFFF);
             }
         }
-        return (*pte & ~0xFFF) | (virt & 0xFFF);
+        return (*pte & ~0xFFFULL) | (virt & 0xFFF);
     }
     return 0;
 }

@@ -196,7 +196,7 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
         /* Growth allowed: fault is below current bottom but above
          * stack_bottom - 8 MB (prevent unbounded growth). */
         if (fault_addr < stack_bottom &&
-            fault_addr >= stack_bottom - (8UL * 1024 * 1024)) {
+            (stack_bottom - fault_addr) <= (8UL * 1024 * 1024)) {
             phys_addr_t phys = pmm_alloc_page();
             if (!phys) {
                 panicf("PF: stack growth — OOM at 0x%x", (unsigned)fault_addr);
@@ -205,7 +205,7 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
 
             uint64_t page_addr = ALIGN_DOWN(fault_addr, PAGE_SIZE);
             vmm_map_page(cur->pml4, page_addr, phys,
-                         PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
+                         PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
             cur->stack_bottom = page_addr;
 
             pr_info("PF: stack grown down to 0x%x (PID %d)\n",
@@ -231,7 +231,7 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
 
                 uint64_t page_addr = ALIGN_DOWN(fault_addr, PAGE_SIZE);
                 vmm_map_page(cur->pml4, page_addr, phys,
-                             PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
+                             PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
 
                 pr_info("PF: demand paging at 0x%x (PID %d)\n",
                         (unsigned)page_addr, cur->pid);

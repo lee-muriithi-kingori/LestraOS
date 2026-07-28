@@ -77,8 +77,8 @@ static void mark_region(phys_addr_t start, phys_addr_t end) {
  * FIX: same ALIGN_DOWN -> ALIGN_UP correction. */
 static void free_region(phys_addr_t start, phys_addr_t end) {
     if (end <= start) return;
-    size_t start_pfn = addr_to_pfn(ALIGN_UP(start, PAGE_SIZE));
-    size_t end_pfn = addr_to_pfn(ALIGN_DOWN(end, PAGE_SIZE));
+    size_t start_pfn = addr_to_pfn(ALIGN_DOWN(start, PAGE_SIZE));
+    size_t end_pfn = addr_to_pfn(ALIGN_UP(end, PAGE_SIZE));
 
     for (size_t pfn = start_pfn; pfn < end_pfn && pfn < highest_pfn; pfn++) {
         if (bitmap_test(pfn)) {

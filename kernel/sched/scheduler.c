@@ -32,6 +32,11 @@ extern void context_switch(struct cpu_state* old_state, struct cpu_state* new_st
 extern uint64_t elf_load(const void* elf_data, size_t elf_size);
 extern void elf_jump_to_user(uint64_t entry, uint64_t stack, uintptr_t pml4);
 
+/* elf_load populates these globals — the caller copies them into the
+ * process struct before elf_load is called again for another process. */
+extern uintptr_t* user_pml4;
+extern uint64_t   user_stack_ptr;
+
 /* External: page table helpers */
 extern void vmm_map_page(uintptr_t* pml4, virt_addr_t vaddr, phys_addr_t paddr, uint64_t flags);
 extern phys_addr_t vmm_get_phys(uintptr_t* pml4, virt_addr_t vaddr);
@@ -212,7 +217,7 @@ static void proc_setup_stack(struct process* p) {
         if (!phys) return;
         memset((void*)phys, 0, PAGE_SIZE);
         proc_map_page(p, stack_start + i * PAGE_SIZE,
-                      phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
+                      phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
     }
     p->user_stack_ptr = stack_top - 16;
     p->stack_bottom = stack_start;   /* Track stack bottom for growth */
@@ -325,17 +330,31 @@ int proc_create(const char* name, const void* elf_data, size_t elf_size) {
     p->parent_pid = current ? current->pid : 0;
     strncpy(p->name, name, sizeof(p->name) - 1);
 
-    p->pml4 = create_proc_pml4();
-    if (!p->pml4) { p->state = PROC_FREE; return -1; }
+    /* Load the ELF binary — this sets up the user address space,
+     * maps segments, allocates user stack, and returns entry point.
+     * elf_load populates globals user_pml4/user_stack_ptr which we
+     * copy into the process struct. */
+    uint64_t entry = elf_load(elf_data, elf_size);
+    if (!entry) {
+        pr_warn("sched: elf_load failed for '%s'\n", name);
+        p->state = PROC_FREE;
+        return -1;
+    }
+    p->entry_point = entry;
+    p->pml4 = (uint64_t*)user_pml4;
+    p->user_stack_ptr = user_stack_ptr;
+    p->stack_bottom = 0x00007FFFFFE00000ULL - (256 * 1024);
 
     p->kernel_stack = kmalloc(16384);
-    if (!p->kernel_stack) { p->state = PROC_FREE; return -1; }
+    if (!p->kernel_stack) {
+        vmm_destroy_address_space(p->pml4);
+        p->state = PROC_FREE;
+        return -1;
+    }
     p->kernel_stack_top = (uint64_t)p->kernel_stack + 16384;
 
     p->saved_state = (struct cpu_state*)(p->kernel_stack_top - sizeof(struct cpu_state));
     memset(p->saved_state, 0, sizeof(struct cpu_state));
-
-    proc_setup_stack(p);
 
     /* Initialize per-process fd table with stdin/stdout/stderr */
     fd_table_init(p);
@@ -346,7 +365,8 @@ int proc_create(const char* name, const void* elf_data, size_t elf_size) {
     p->saved_state->cs = 0x1B;
     p->saved_state->rip = p->entry_point;
 
-    pr_info("sched: created process %d '%s'\n", p->pid, p->name);
+    pr_info("sched: created process %d '%s' entry=0x%x\n",
+            p->pid, p->name, (unsigned)p->entry_point);
     return p->pid;
 }
 

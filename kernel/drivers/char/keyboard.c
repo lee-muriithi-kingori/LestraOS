@@ -62,6 +62,27 @@ static volatile char key_buffer[KEY_BUFFER_SIZE];
 static volatile uint8_t key_buffer_head = 0;
 static volatile uint8_t key_buffer_tail = 0;
 
+/* Extended scancode prefix (0xE0) handling.
+ * Keys like arrows, Home/End, keypad Enter, and Right Ctrl/Alt
+ * send a two-byte sequence starting with 0xE0 in scancode set 1. */
+static bool e0_prefix = false;
+
+/* Extended scancode to ASCII lookup for 0xE0-prefixed keys.
+ * Only keys that produce ASCII characters are mapped:
+ *   0x1C -> '\n' (keypad Enter)
+ *   0x35 -> '/'  (keypad /)
+ * All other extended scancodes (arrows, F-keys, etc.) are 0. */
+static const char e0_scancode_to_ascii[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, '/',0, 0, 0, 0, 0, 0, 0,
+};
+/* Index 0x1C (28) for KP Enter needs special handling since the array
+ * doesn't extend that far — we handle it inline in the IRQ handler. */
+
 static void keyboard_irq_handler(struct interrupt_frame* frame) {
     (void)frame;
 
@@ -74,13 +95,66 @@ static void keyboard_irq_handler(struct interrupt_frame* frame) {
         key_handler(scancode, 0);
     }
 
+    /* Handle 0xE0 extended prefix byte.
+     * Most extended keys arrive as two bytes: 0xE0 then <extended scancode>.
+     * The second byte's release has bit 7 set, same as regular scancodes. */
+    if (scancode == 0xE0) {
+        e0_prefix = true;
+        return;
+    }
+
+    if (e0_prefix) {
+        /* Extended scancode — second byte after 0xE0 prefix. */
+        uint8_t ext = scancode & 0x7F;  /* strip release bit for matching */
+        e0_prefix = false;
+
+        /* Right Ctrl (0xE0 0x1D / 0x9D) */
+        if (ext == KEY_LCTRL) {
+            ctrl_pressed = !(scancode & 0x80);
+            return;
+        }
+        /* Right Alt / AltGr (0xE0 0x38 / 0xB8) */
+        if (ext == KEY_LALT) {
+            alt_pressed = !(scancode & 0x80);
+            return;
+        }
+        /* Keypad Enter (0xE0 0x1C / 0x9C) */
+        if (ext == 0x1C && !(scancode & 0x80)) {
+            uint8_t next = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next != key_buffer_tail) {
+                key_buffer[key_buffer_head] = '\n';
+                key_buffer_head = next;
+            }
+            return;
+        }
+        /* Ignore releases of other extended keys */
+        if (scancode & 0x80) return;
+        /* Try extended ASCII lookup — only '/' (keypad, 0x35) has ASCII */
+        if (ext < sizeof(e0_scancode_to_ascii) && e0_scancode_to_ascii[ext]) {
+            uint8_t next = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next != key_buffer_tail) {
+                key_buffer[key_buffer_head] = e0_scancode_to_ascii[ext];
+                key_buffer_head = next;
+            }
+        }
+        return;
+    }
+
     /* Handle special keys */
-    if (scancode == KEY_LSHIFT || scancode == KEY_RSHIFT) {
+    if (scancode == KEY_LSHIFT) {
         shift_pressed = true;
         return;
     }
-    if ((scancode & 0x7F) == KEY_LSHIFT || (scancode & 0x7F) == KEY_RSHIFT) {
-        if (scancode & 0x80) shift_pressed = false;
+    if (scancode == (KEY_LSHIFT | 0x80)) {
+        shift_pressed = false;
+        return;
+    }
+    if (scancode == KEY_RSHIFT) {
+        shift_pressed = true;
+        return;
+    }
+    if (scancode == (KEY_RSHIFT | 0x80)) {
+        shift_pressed = false;
         return;
     }
     if (scancode == KEY_LCTRL) {
@@ -138,6 +212,7 @@ void keyboard_init(void) {
     ctrl_pressed = false;
     alt_pressed = false;
     caps_lock = false;
+    e0_prefix = false;
     key_buffer_head = 0;
     key_buffer_tail = 0;
     

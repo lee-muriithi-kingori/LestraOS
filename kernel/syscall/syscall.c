@@ -649,10 +649,14 @@ static int64_t sys_getdents(int64_t fd_num, void* dirp, size_t count) {
 static int64_t sys_reboot(int64_t cmd) {
     if (cmd == 0) {
         printk("Shutting down...\n");
+        extern void shutdown_system(void);
+        shutdown_system();
     } else {
         printk("Rebooting...\n");
+        extern void reboot_system(void);
+        reboot_system();
     }
-    outb(0x64, 0xFE);
+    /* Should not reach here — shutdown/reboot should halt or reset. */
     while (1) { hlt(); }
     return 0;
 }
@@ -1251,7 +1255,7 @@ void syscall_init(void) {
 }
 
 int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
-                         uint64_t a3, uint64_t a4, uint64_t a5) {
+                         uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     int64_t ret;
 
     /* Route to the Linux compatibility shim if the current process is
@@ -1261,7 +1265,7 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
      * without recompiling them. */
     struct process* cur = task_current();
     if (cur && cur->is_linux_process) {
-        ret = linux_compat_dispatch(num, a1, a2, a3, a4, a5, 0);
+        ret = linux_compat_dispatch(num, a1, a2, a3, a4, a5, a6);
         /* After every syscall (Linux or native), check whether a
          * signal is pending and deliver it by rewriting the saved
          * RIP to point at the user's signal handler. */
@@ -1280,7 +1284,7 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
         case LESTRA_SYS_EXECVE:      ret = sys_execve((const char*)a1, (char* const*)a2, (char* const*)a3); break;
         case LESTRA_SYS_GETPID:      ret = sys_getpid(); break;
         case LESTRA_SYS_BRK:         ret = sys_brk((void*)a1); break;
-        case LESTRA_SYS_MMAP:        ret = sys_mmap((void*)a1, a2, (int)a3, (int)a4, (int)a5, 0); break;
+        case LESTRA_SYS_MMAP:        ret = sys_mmap((void*)a1, a2, (int)a3, (int)a4, (int)a5, (off_t)a6); break;
         case LESTRA_SYS_MUNMAP:      ret = sys_munmap((void*)a1, a2); break;
         case LESTRA_SYS_GETTIMEOFDAY: ret = sys_gettimeofday(); break;
         case LESTRA_SYS_SLEEP:       ret = sys_sleep(a1); break;
@@ -1313,7 +1317,7 @@ int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
         case LESTRA_SYS_CLOCK_GETTIME: ret = sys_clock_gettime((int)a1, (void*)a2); break;
         case LESTRA_SYS_GETRLIMIT:    ret = sys_getrlimit((int)a1, (void*)a2); break;
         case LESTRA_SYS_SETRLIMIT:    ret = sys_setrlimit((int)a1, (const void*)a2); break;
-        case LESTRA_SYS_FUTEX:        ret = sys_futex((uint32_t*)a1, (int)a2, (uint32_t)a3, a4, (uint32_t*)a5, 0); break;
+        case LESTRA_SYS_FUTEX:        ret = sys_futex((uint32_t*)a1, (int)a2, (uint32_t)a3, a4, (uint32_t*)a5, (uint32_t)a6); break;
         case LESTRA_SYS_SOCKET:       ret = sys_socket((int)a1, (int)a2, (int)a3); break;
         case LESTRA_SYS_BIND:         ret = sys_bind((int64_t)a1, (const void*)a2, (int)a3); break;
         case LESTRA_SYS_CONNECT:      ret = sys_connect((int64_t)a1, (const void*)a2, (int)a3); break;
