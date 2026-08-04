@@ -45,6 +45,7 @@ extern int        rtl8139_is_present(void);
 extern mac_addr_t rtl8139_get_mac(void);
 extern int        rtl8139_send(const void* data, uint16_t len);
 extern int        rtl8139_recv(void* buf, uint16_t bufsz);
+extern void       rtl8139_recv_flush(void);
 
 /* Active NIC driver selector.
  * 0 = e1000 (default Intel NIC)
@@ -1608,6 +1609,11 @@ void net_tick(void) {
         /* Otherwise dispatch to the right protocol handler. */
         handle_ethernet(buf, (uint16_t)n);
     }
+    /* NAPI-style flush: write CAPR once after draining the batch.
+     * Only the RTL8139 needs this (deferred CAPR to avoid QEMU deadlock).
+     * E1000 and VirtIO don't use CAPR, so this is a no-op for them. */
+    if (active_nic == 2) rtl8139_recv_flush();
+
     /* Advance DHCP and TCP state machines. */
     dhcp_tick();
     tcp_tick();

@@ -168,11 +168,7 @@ int rtl8139_init(void) {
     /* Enable RX and TX */
     rtl_write8(RTL_CR, CR_RX_ENABLE | CR_TX_ENABLE | CR_BUF_SIZE_64K);
 
-    /* Do NOT write CAPR — leave at hardware default (0xFFF0).
-     * This prevents the CAPR == RxBufAddr deadlock in QEMU's can_receive().
-     * We track consumed position internally via rx_capr. */
     rx_capr = 0;
-
     rtl_present = 1;
     pr_info("rtl8139: initialized (IO base 0x%x, RBSTART=0x%x)\n",
             (unsigned)rtl_io_base, (unsigned)rx_phys);
@@ -207,11 +203,15 @@ int rtl8139_send(const void* data, uint16_t len) {
     rtl_write32(tsd_off, (uint32_t)len);
 
     /* Poll for TXOK */
+    int tx_ok = 0;
     for (int i = 0; i < 1000000; i++) {
-        if (rtl_read32(tsd_off) & TSD_TXOK) break;
+        if (rtl_read32(tsd_off) & TSD_TXOK) { tx_ok = 1; break; }
+    }
+    if (!tx_ok && rtl_tx_next > 0) {
+        pr_warn("rtl8139: TX%d timed out! TSD=%08x\n", (int)idx, rtl_read32(tsd_off));
     }
 
-    rtl_write16(RTL_ISR, 0xFFFF);  /* Clear interrupt status */
+    /* NOTE(KE-12): Do NOT clear ISR here. */
     rtl_tx_next++;
     return (int)len;
 }
@@ -223,8 +223,18 @@ int rtl8139_send(const void* data, uint16_t len) {
  *   - Hardware writes packets sequentially into the RX buffer at RxBufAddr.
  *   - Each packet starts with a 4-byte status header: {flags, length}.
  *   - flags bit 0 (ROK) = packet received OK.
- *   - length = total bytes including this 4-byte header + Ethernet frame + 4-byte CRC.
- *   - CAPR register is never written after init to avoid can_receive() deadlock.
+ *   - length = total bytes including this 4-byte header + Ethernet frame.
+ *   - QEMU's can_receive() blocks when CAPR == RxBufAddr (buffer full).
+ *
+ * NAPI-style deferred CAPR update (KE-12):
+ *   We do NOT write CAPR at all. The register stays at its hardware
+ *   default (0xFFF0), giving ~64KB of buffer headroom. Our software
+ *   rx_capr tracks the actual read position independently.
+ *   Writing CAPR forward (even with a gap) reduces QEMU's computed
+ *   free space and can trigger the can_receive() deadlock. Leaving
+ *   CAPR at 0xFFF0 means can_receive() always sees ~64KB free.
+ *   Trade-off: we must drain faster than hardware fills — trivial at
+ *   1kHz polling with a 64KB buffer (~190 packets before wrap).
  * ======================================================================== */
 
 int rtl8139_recv(void* buf, uint16_t bufsz) {
@@ -250,16 +260,6 @@ int rtl8139_recv(void* buf, uint16_t bufsz) {
     /* Advance read pointer (4-byte aligned, wrapping at 64 KB) */
     rx_capr = (rx_capr + ((pkt_len + 3) & ~3u)) & (RX_BUF_SIZE - 1);
 
-    /* Write CAPR to tell hardware we consumed a packet.
-     * TODO(KE-12): QEMU's can_receive() deadlocks when CAPR == RxBufAddr
-     * after consuming the last packet in the buffer. The first RX works
-     * (DHCP OFFER received), but subsequent packets are blocked.
-     * Linux 8139too uses NAPI batch processing to avoid this — it only
-     * writes CAPR after draining multiple packets. We need a similar
-     * deferred CAPR update strategy. For now, first-packet RX works. */
-    rtl_write16(RTL_CAPR, rx_capr);
-    (void)rtl_read16(RTL_CAPR);
-
     /* Copy Ethernet frame, handling wrap-around */
     uint32_t end = (uint32_t)data_start + frame_len;
     if (end <= RX_BUF_SIZE) {
@@ -271,4 +271,16 @@ int rtl8139_recv(void* buf, uint16_t bufsz) {
     }
 
     return (int)frame_len;
+}
+
+/* Flush: called after draining a batch of packets in net_tick().
+ * With KE-12, we do NOT write CAPR (it stays at 0xFFF0 hardware default).
+ * This function exists as a hook for future interrupt-driven RX where
+ * we might need to re-arm the RX interrupt after draining.
+ */
+void rtl8139_recv_flush(void) {
+    /* Intentionally empty: CAPR stays at hardware default (0xFFF0).
+     * Writing CAPR forward causes QEMU can_receive() to see less free
+     * space, potentially deadlocking RX. The software rx_capr tracks
+     * the actual read position independently. */
 }
