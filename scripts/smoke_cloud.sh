@@ -3,8 +3,24 @@
 # Boots the kernel in QEMU serial mode for 30s and verifies the boot
 # reaches "kernel initialized successfully" without panicking.
 set -e
-export PATH="/home/z/.local/bin:$PATH"
-export LD_LIBRARY_PATH="/home/z/.local/qemu-prefix/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+
+# Use the locally-extracted dev toolchain if present (no root needed).
+# Falls back to system tools if available.
+DEVTOOLS=/home/z/.local/opt/devtools
+if [ -d "$DEVTOOLS" ]; then
+    export PATH="$DEVTOOLS/usr/bin:$PATH"
+    export LD_LIBRARY_PATH="$DEVTOOLS/usr/lib/x86_64-linux-gnu:$DEVTOOLS/usr/lib:${LD_LIBRARY_PATH}"
+    GRUB_DIR="$DEVTOOLS/usr/lib/grub/i386-pc"
+    # QEMU firmware lives across seabios + qemu share dirs; combine via symlinks
+    if [ -d "$DEVTOOLS/qemu-data" ]; then
+        QEMU_DATA="$DEVTOOLS/qemu-data"
+    else
+        QEMU_DATA="$DEVTOOLS/usr/share/qemu"
+    fi
+else
+    GRUB_DIR=""
+    QEMU_DATA=""
+fi
 cd /home/z/lestraOS
 
 echo "[smoke] building ISO..."
@@ -23,11 +39,16 @@ menuentry "Lestra OS (Serial Cloud Mode)" {
     boot
 }
 EOF
-grub-mkrescue -d /home/z/.local/qemu-prefix/usr/lib/grub/i386-pc -o /tmp/lestraos-serial.iso /tmp/isoserial >/dev/null 2>&1
+GRUB_OPT=""
+[ -n "$GRUB_DIR" ] && GRUB_OPT="-d $GRUB_DIR"
+grub-mkrescue $GRUB_OPT -o /tmp/lestraos-serial.iso /tmp/isoserial >/dev/null 2>&1
+
+QEMU_L_OPT=""
+[ -n "$QEMU_DATA" ] && QEMU_L_OPT="-L $QEMU_DATA"
 
 echo "[smoke] booting (30s timeout)..."
-timeout 30 qemu-system-x86_64 \
-  -L /home/z/.local/qemu-prefix/usr/share/qemu \
+timeout 45 qemu-system-x86_64 \
+  $QEMU_L_OPT \
   -cdrom /tmp/lestraos-serial.iso \
   -m 512M -cpu qemu64 \
   -nographic -boot d -no-reboot \

@@ -34,6 +34,7 @@
 #include <lestra/vfs.h>
 #include <lestra/pipe.h>
 #include <lestra/socket.h>
+#include <lestra/uaccess.h>
 #include <string.h>
 
 /* errno constants used by syscalls. Mirror libc/include/errno.h if
@@ -364,30 +365,49 @@ static char cwd[MAX_PATH_LEN] = "/";
 
 static int64_t sys_open(const char* path, int flags) {
     if (!path) return -EFAULT;
+    if (!access_ok(path, 1)) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EFAULT;
+
+    /* Copy the user path into a kernel buffer first. Under SMAP this
+     * is mandatory (direct user deref would #PF); today it's a safe
+     * no-op wrapper but it future-proofs the syscall. */
+    char upath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(upath, path, sizeof(upath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0) return -EINVAL;     /* empty path */
+    if (upath[0] == '\0') return -EINVAL;
 
     /* Resolve relative paths against the per-process CWD.
      * If the path doesn't start with '/', prepend the CWD. */
     char resolved[MAX_PATH_LEN];
-    if (path[0] != '/') {
+    const char* kpath = upath;
+    if (upath[0] != '/') {
         /* Relative path: prepend cwd */
         size_t cwd_len = strlen(cwd);
-        size_t path_len = strlen(path);
+        size_t path_len = strlen(upath);
         /* Handle "./" prefix — just strip it */
-        if (path[0] == '.' && (path[1] == '/' || path[1] == '\0')) {
-            path += 1;
-            if (*path == '/') path++;
-            path_len = strlen(path);
+        if (upath[0] == '.' && (upath[1] == '/' || upath[1] == '\0')) {
+            const char* p = upath + 1;
+            if (*p == '/') p++;
+            path_len = strlen(p);
+            if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+            memcpy(resolved, cwd, cwd_len);
+            if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
+                resolved[cwd_len] = '/';
+                cwd_len++;
+            }
+            memcpy(resolved + cwd_len, p, path_len + 1);
+        } else {
+            if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
+            memcpy(resolved, cwd, cwd_len);
+            if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
+                resolved[cwd_len] = '/';
+                cwd_len++;
+            }
+            memcpy(resolved + cwd_len, upath, path_len + 1);
         }
-        if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
-        memcpy(resolved, cwd, cwd_len);
-        if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
-            resolved[cwd_len] = '/';
-            cwd_len++;
-        }
-        memcpy(resolved + cwd_len, path, path_len + 1);
-        path = resolved;
+        kpath = resolved;
     }
 
     /* Find a free fd slot (starting from 3, since 0-2 are reserved) */
@@ -401,7 +421,7 @@ static int64_t sys_open(const char* path, int flags) {
     if (local_fd < 0) return -EMFILE;
 
     /* Open the file in VFS to get a global VFS fd */
-    int vfs_fd = vfs_open(path, flags);
+    int vfs_fd = vfs_open(kpath, flags);
     if (vfs_fd < 0) return -ENOENT;
 
     /* Set up the per-process fd entry */
@@ -440,31 +460,52 @@ static int64_t sys_close(int64_t fd_num) {
 
 static int64_t sys_waitpid(int64_t pid, int* status, int options) {
     (void)options;
+    /* status may be NULL (POSIX allows it). Validate only if non-NULL. */
+    if (status && !access_ok(status, sizeof(int))) return -EFAULT;
+    int kstatus = 0;
+    int* kstatus_ptr = status ? &kstatus : NULL;
+    int64_t ret;
     if (pid > 0) {
-        return (int64_t)proc_wait_blocking((int)pid, status);
+        ret = (int64_t)proc_wait_blocking((int)pid, kstatus_ptr);
+    } else {
+        /* Wait for any child */
+        ret = -ECHILD;
+        for (int i = 1; i < MAX_PROCS; i++) {
+            int rc = proc_wait(i, kstatus_ptr);
+            if (rc > 0) { ret = (int64_t)rc; break; }
+        }
     }
-    /* Wait for any child */
-    for (int i = 1; i < MAX_PROCS; i++) {
-        int rc = proc_wait(i, status);
-        if (rc > 0) return (int64_t)rc;
+    /* Copy the status word back to user space if requested. */
+    if (status && ret > 0) {
+        if (put_user(kstatus, status) < 0) return -EFAULT;
     }
-    return -ECHILD;
+    return ret;
 }
 
 static int64_t sys_execve(const char* path, char* const argv[], char* const envp[]) {
     if (!path) return -EFAULT;
+    if (!access_ok(path, 1)) return -EFAULT;
+    /* Copy user path into kernel buffer (SMAP-safe). */
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+
     /* If the binary is dynamically linked, hand off to the in-kernel
      * dynamic linker (ldso.c). Otherwise, run the static ELF loader.
-     * ldso_is_dynamic does a cheap peek at PT_INTERP/PT_DYNAMIC. */
-    if (ldso_is_dynamic(path)) {
-        pr_info("syscall: execve(%s) -> ldso_load_and_run\n", path);
-        return (int64_t)ldso_load_and_run(path,
+     * ldso_is_dynamic does a cheap peek at PT_INTERP/PT_DYNAMIC.
+     * NOTE: argv/envp are still passed as raw user pointers — the
+     * ldso/elf layer is responsible for copying them in. Converting
+     * that layer is TIER 2c (deferred). */
+    if (ldso_is_dynamic(kpath)) {
+        pr_info("syscall: execve(%s) -> ldso_load_and_run\n", kpath);
+        return (int64_t)ldso_load_and_run(kpath,
                                           argv ? (int)0 : 0,
                                           (char**)argv,
                                           (char**)envp);
     }
-    pr_info("syscall: execve(%s) -> elf_exec\n", path);
-    return (int64_t)elf_exec(path);
+    pr_info("syscall: execve(%s) -> elf_exec\n", kpath);
+    return (int64_t)elf_exec(kpath);
 }
 
 static int64_t sys_getpid(void) {
@@ -534,50 +575,82 @@ static int64_t sys_sleep(uint64_t ms) {
 
 static int64_t sys_getcwd(char* buf, size_t size) {
     if (!buf || size == 0) return -EFAULT;
+    if (!access_ok(buf, size)) return -EFAULT;
     size_t len = strlen(cwd) + 1;
     if (len > size) return -ERANGE;
-    memcpy(buf, cwd, len);
-    return 0;
+    if (copy_to_user(buf, cwd, len) < 0) return -EFAULT;
+    return (int64_t)len;
 }
 
 static int64_t sys_chdir(const char* path) {
     if (!path) return -EFAULT;
-    /* Reject paths we can't possibly cd into. */
-    if (strlen(path) >= MAX_PATH_LEN) return -ENAMETOOLONG;
+    if (!access_ok(path, 1)) return -EFAULT;
+    /* Copy user path into kernel buffer (SMAP-safe). */
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    if (strlen(kpath) >= MAX_PATH_LEN) return -ENAMETOOLONG;
     /* VFS has no real directories yet, but we accept any non-empty
      * path that starts with '/'. Relative-path resolution is left
      * for a future commit. */
-    if (path[0] != '/') {
+    if (kpath[0] != '/') {
         /* Append to cwd. */
         char tmp[MAX_PATH_LEN];
         size_t n = ksnprintf(tmp, sizeof(tmp), "%s%s%s",
                              cwd,
                              (cwd[strlen(cwd)-1] == '/') ? "" : "/",
-                             path);
+                             kpath);
         if (n >= sizeof(tmp)) return -ENAMETOOLONG;
         strncpy(cwd, tmp, sizeof(cwd) - 1);
     } else {
-        strncpy(cwd, path, sizeof(cwd) - 1);
+        strncpy(cwd, kpath, sizeof(cwd) - 1);
         cwd[sizeof(cwd) - 1] = '\0';
     }
     return 0;
 }
 
 static int64_t sys_mkdir(const char* path, uint32_t mode) {
-    int rc = vfs_mkdir(path, mode ? (mode & 0777) : 0755);
-    return (rc < 0) ? -EROFS : 0;
+    if (!path) return -EFAULT;
+    if (!access_ok(path, 1)) return -EFAULT;
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    int vrc = vfs_mkdir(kpath, mode ? (mode & 0777) : 0755);
+    return (vrc < 0) ? -EROFS : 0;
 }
 
 static int64_t sys_rmdir(const char* path) {
-    (void)path;
+    if (!path) return -EFAULT;
+    if (!access_ok(path, 1)) return -EFAULT;
+    /* Validate the user pointer is readable (even though we don't
+     * use the path yet — future-proofs against SMAP #PF when rmdir
+     * gets a real implementation). */
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
     /* VFS doesn't support rmdir yet. */
     return -EROFS;
 }
 
 static int64_t sys_stat(const char* path, void* st) {
     if (!path || !st) return -EFAULT;
-    int rc = vfs_stat(path, (struct stat*)st);
-    return (rc < 0) ? -ENOENT : 0;
+    if (!access_ok(path, 1)) return -EFAULT;
+    if (!access_ok(st, sizeof(struct stat))) return -EFAULT;
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    /* Fill a kernel-local stat struct, then copy_to_user at the end.
+     * This avoids passing the user pointer into vfs_stat (which
+     * would be a SMAP violation once CR4.SMAP is flipped). */
+    struct stat ks;
+    memset(&ks, 0, sizeof(ks));
+    int vrc = vfs_stat(kpath, &ks);
+    if (vrc < 0) return -ENOENT;
+    if (copy_to_user(st, &ks, sizeof(ks)) < 0) return -EFAULT;
+    return 0;
 }
 
 static int64_t sys_lseek(int64_t fd_num, off_t offset, int whence) {
@@ -611,8 +684,13 @@ static int64_t sys_lseek(int64_t fd_num, off_t offset, int whence) {
 
 static int64_t sys_unlink(const char* path) {
     if (!path) return -EFAULT;
-    int rc = vfs_unlink(path);
-    return (rc < 0) ? -ENOENT : 0;
+    if (!access_ok(path, 1)) return -EFAULT;
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    int vrc = vfs_unlink(kpath);
+    return (vrc < 0) ? -ENOENT : 0;
 }
 
 static int64_t sys_getdents(int64_t fd_num, void* dirp, size_t count) {
@@ -663,13 +741,18 @@ static int64_t sys_reboot(int64_t cmd) {
 
 static int64_t sys_uname(void* buf) {
     if (!buf) return -EFAULT;
-    memset(buf, 0, 256);
-    strcpy((char*)buf, "LestraOS");
+    if (!access_ok(buf, 256)) return -EFAULT;
+    /* Build the uname struct in a kernel buffer, then copy_to_user. */
+    char kbuf[256];
+    memset(kbuf, 0, sizeof(kbuf));
+    strcpy(kbuf, "LestraOS");
+    if (copy_to_user(buf, kbuf, sizeof(kbuf)) < 0) return -EFAULT;
     return 0;
 }
 
 static int64_t sys_pipe(int* user_fds) {
     if (!user_fds) return -EFAULT;
+    if (!access_ok(user_fds, 2 * sizeof(int))) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EFAULT;
 
@@ -699,8 +782,9 @@ static int64_t sys_pipe(int* user_fds) {
     cur->fds[fd_write].offset = 0;
     cur->fds[fd_write].flags = O_WRONLY;
 
-    user_fds[0] = fd_read;
-    user_fds[1] = fd_write;
+    /* Copy the two fds back to user space via put_user. */
+    if (put_user(fd_read,  &user_fds[0]) < 0) return -EFAULT;
+    if (put_user(fd_write, &user_fds[1]) < 0) return -EFAULT;
     return 0;
 }
 
@@ -737,15 +821,19 @@ static int64_t sys_dup2(int oldfd, int newfd) {
 
 static int64_t sys_chmod(const char* path, uint32_t mode) {
     if (!path) return -EFAULT;
-    /* VFS doesn't have a chmod operation yet. Return -ENOSYS so
-     * callers know the feature isn't implemented rather than
-     * silently succeeding with no effect. */
+    if (!access_ok(path, 1)) return -EFAULT;
+    /* Validate the user pointer (future-proof for SMAP). We don't
+     * use the path yet because VFS has no chmod op. */
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
     (void)mode;
     return -ENOSYS;
 }
 
 static int64_t sys_fstat(int64_t fd_num, void* st) {
     if (!st) return -EFAULT;
+    if (!access_ok(st, sizeof(struct stat))) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EBADF;
     if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
@@ -753,57 +841,58 @@ static int64_t sys_fstat(int64_t fd_num, void* st) {
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
 
-    /* For VFS fds, stat the underlying VFS resource by fd number.
-     * We don't have vfs_fstat(), so we construct a stat from what
-     * we know (offset = file position, no real inode data). */
-    struct stat* s = (struct stat*)st;
-    memset(s, 0, sizeof(*s));
+    /* Build the stat struct in kernel space, then copy_to_user at
+     * the end — SMAP-safe. */
+    struct stat ks;
+    memset(&ks, 0, sizeof(ks));
 
     if (entry->type == FD_SPECIAL) {
         /* stdin/stdout/stderr — treat as character device */
-        s->mode = S_IFCHR | 0666;
-        s->uid = 0;
-        s->gid = 0;
-        s->size = 0;
-        return 0;
-    }
-
-    if (entry->type == FD_VFS) {
+        ks.mode = S_IFCHR | 0666;
+        ks.uid = 0;
+        ks.gid = 0;
+        ks.size = 0;
+    } else if (entry->type == FD_VFS) {
         /* Try to get stat via vfs_stat on the open resource.
          * Since vfs_stat takes a path and we only have a fd,
          * we fill in what we can. For memfs files, lseek
          * SEEK_END gives the file size. */
         off_t end = vfs_lseek(entry->resource, 0, 2);
         if (end >= 0) {
-            s->mode = S_IFREG | 0644;
-            s->size = (uint64_t)end;
+            ks.mode = S_IFREG | 0644;
+            ks.size = (uint64_t)end;
         } else {
             /* Unsupported VFS fd type (ext2, procfs, devfs) —
              * provide a generic stat. */
-            s->mode = S_IFREG | 0644;
-            s->size = 0;
+            ks.mode = S_IFREG | 0644;
+            ks.size = 0;
         }
-        s->uid = 0;
-        s->gid = 0;
-        s->atime = timer_get_ms();
-        s->mtime = timer_get_ms();
-        s->ctime = timer_get_ms();
-        return 0;
+        ks.uid = 0;
+        ks.gid = 0;
+        ks.atime = timer_get_ms();
+        ks.mtime = timer_get_ms();
+        ks.ctime = timer_get_ms();
+    } else if (entry->type == FD_PIPE) {
+        ks.mode = S_IFIFO | 0666;
+        ks.uid = 0;
+        ks.gid = 0;
+        ks.size = 0;
+    } else {
+        return -EBADF;
     }
 
-    if (entry->type == FD_PIPE) {
-        s->mode = S_IFIFO | 0666;
-        s->uid = 0;
-        s->gid = 0;
-        s->size = 0;
-        return 0;
-    }
-
-    return -EBADF;
+    if (copy_to_user(st, &ks, sizeof(ks)) < 0) return -EFAULT;
+    return 0;
 }
 
 static int64_t sys_access(const char* path, int mode) {
     if (!path) return -EFAULT;
+    if (!access_ok(path, 1)) return -EFAULT;
+    /* Copy user path into kernel buffer (SMAP-safe). */
+    char kpath[MAX_PATH_LEN];
+    int rc = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (rc < 0) return -EFAULT;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
     /* access() checks whether the calling process can access a file.
      * In our single-user root system, any existing file is accessible.
      * Check that the file exists via VFS lookup; if it does, return 0.
@@ -811,17 +900,17 @@ static int64_t sys_access(const char* path, int mode) {
     (void)mode;
     /* Resolve relative path against cwd like sys_open does. */
     char resolved[MAX_PATH_LEN];
-    const char* check_path = path;
-    if (path[0] != '/') {
+    const char* check_path = kpath;
+    if (kpath[0] != '/') {
         size_t cwd_len = strlen(cwd);
-        size_t path_len = strlen(path);
+        size_t path_len = strlen(kpath);
         if (cwd_len + 1 + path_len >= MAX_PATH_LEN) return -ENAMETOOLONG;
         memcpy(resolved, cwd, cwd_len);
         if (cwd_len > 0 && cwd[cwd_len - 1] != '/') {
             resolved[cwd_len] = '/';
             cwd_len++;
         }
-        memcpy(resolved + cwd_len, path, path_len + 1);
+        memcpy(resolved + cwd_len, kpath, path_len + 1);
         check_path = resolved;
     }
     struct vnode* vn = vfs_lookup(check_path);
@@ -831,6 +920,12 @@ static int64_t sys_access(const char* path, int mode) {
 
 static int64_t sys_rename(const char* oldpath, const char* newpath) {
     if (!oldpath || !newpath) return -EFAULT;
+    if (!access_ok(oldpath, 1) || !access_ok(newpath, 1)) return -EFAULT;
+    /* Validate both user pointers (future-proof for SMAP). */
+    char kold[MAX_PATH_LEN], knew[MAX_PATH_LEN];
+    int rc1 = strncpy_from_user(kold, oldpath, sizeof(kold));
+    int rc2 = strncpy_from_user(knew, newpath, sizeof(knew));
+    if (rc1 < 0 || rc2 < 0) return -EFAULT;
     /* VFS doesn't support rename yet. Return -ENOSYS. */
     return -ENOSYS;
 }
@@ -916,96 +1011,109 @@ static int64_t sys_times(void* buf) {
     /* Return elapsed ticks in milliseconds. Fill in tms struct if
      * the caller provided a buffer. Since we don't track per-process
      * CPU time separately, all fields are approximate. */
-    struct tms* t = (struct tms*)buf;
-    if (t) {
+    if (buf) {
+        if (!access_ok(buf, sizeof(struct tms))) return -EFAULT;
+        struct tms kt;
         uint64_t ms = timer_get_ms();
-        t->tms_utime  = (int64_t)ms;   /* user time ≈ wall clock */
-        t->tms_stime  = 0;              /* kernel time not tracked */
-        t->tms_cutime = 0;              /* children not tracked */
-        t->tms_cstime = 0;
+        kt.tms_utime  = (int64_t)ms;   /* user time ≈ wall clock */
+        kt.tms_stime  = 0;              /* kernel time not tracked */
+        kt.tms_cutime = 0;              /* children not tracked */
+        kt.tms_cstime = 0;
+        if (copy_to_user(buf, &kt, sizeof(kt)) < 0) return -EFAULT;
     }
     return (int64_t)timer_get_ms();
 }
 
 static int64_t sys_clock_gettime(int clk_id, void* tp) {
     if (!tp) return -EFAULT;
-    struct timespec64* ts = (struct timespec64*)tp;
+    if (!access_ok(tp, sizeof(struct timespec64))) return -EFAULT;
     uint64_t ms = timer_get_ms();
+    struct timespec64 kts;
 
     switch (clk_id) {
         case CLOCK_REALTIME:
             /* Real-time clock: ms since boot (no RTC yet). */
-            ts->tv_sec  = (int64_t)(ms / 1000);
-            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
-            return 0;
+            kts.tv_sec  = (int64_t)(ms / 1000);
+            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            break;
 
         case CLOCK_MONOTONIC:
             /* Monotonic clock: same as realtime for now (no RTC). */
-            ts->tv_sec  = (int64_t)(ms / 1000);
-            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
-            return 0;
+            kts.tv_sec  = (int64_t)(ms / 1000);
+            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            break;
 
         case CLOCK_PROCESS_CPUTIME_ID:
             /* Per-process CPU time: approximate with wall clock. */
-            ts->tv_sec  = (int64_t)(ms / 1000);
-            ts->tv_nsec = (int64_t)((ms % 1000) * 1000000);
-            return 0;
+            kts.tv_sec  = (int64_t)(ms / 1000);
+            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            break;
 
         default:
             return -EINVAL;
     }
+    if (copy_to_user(tp, &kts, sizeof(kts)) < 0) return -EFAULT;
+    return 0;
 }
 
 static int64_t sys_getrlimit(int resource, void* rlim_ptr) {
     if (!rlim_ptr) return -EFAULT;
-    struct rlimit* rl = (struct rlimit*)rlim_ptr;
+    if (!access_ok(rlim_ptr, sizeof(struct rlimit))) return -EFAULT;
+    struct rlimit krl;
 
     /* Return sensible defaults for each resource limit. In our
      * minimal OS, most limits are essentially unlimited. */
     switch (resource) {
         case RLIMIT_NOFILE:
-            rl->rlim_cur = MAX_FD_PER_PROC;
-            rl->rlim_max = MAX_FD_PER_PROC;
-            return 0;
+            krl.rlim_cur = MAX_FD_PER_PROC;
+            krl.rlim_max = MAX_FD_PER_PROC;
+            break;
         case RLIMIT_STACK:
-            rl->rlim_cur = 8 * 1024 * 1024;   /* 8 MB */
-            rl->rlim_max = 8 * 1024 * 1024;
-            return 0;
+            krl.rlim_cur = 8 * 1024 * 1024;   /* 8 MB */
+            krl.rlim_max = 8 * 1024 * 1024;
+            break;
         case RLIMIT_DATA:
-            rl->rlim_cur = 16 * 1024 * 1024;  /* 16 MB (matches brk cap) */
-            rl->rlim_max = 16 * 1024 * 1024;
-            return 0;
+            krl.rlim_cur = 16 * 1024 * 1024;  /* 16 MB (matches brk cap) */
+            krl.rlim_max = 16 * 1024 * 1024;
+            break;
         case RLIMIT_AS:
-            rl->rlim_cur = 256 * 1024 * 1024; /* 256 MB */
-            rl->rlim_max = 256 * 1024 * 1024;
-            return 0;
+            krl.rlim_cur = 256 * 1024 * 1024; /* 256 MB */
+            krl.rlim_max = 256 * 1024 * 1024;
+            break;
         case RLIMIT_CPU:
-            rl->rlim_cur = 0xFFFFFFFF;         /* unlimited */
-            rl->rlim_max = 0xFFFFFFFF;
-            return 0;
+            krl.rlim_cur = 0xFFFFFFFF;         /* unlimited */
+            krl.rlim_max = 0xFFFFFFFF;
+            break;
         case RLIMIT_FSIZE:
-            rl->rlim_cur = 0xFFFFFFFF;
-            rl->rlim_max = 0xFFFFFFFF;
-            return 0;
+            krl.rlim_cur = 0xFFFFFFFF;
+            krl.rlim_max = 0xFFFFFFFF;
+            break;
         case RLIMIT_CORE:
-            rl->rlim_cur = 0;                  /* no core dumps */
-            rl->rlim_max = 0;
-            return 0;
+            krl.rlim_cur = 0;                  /* no core dumps */
+            krl.rlim_max = 0;
+            break;
         case RLIMIT_RSS:
-            rl->rlim_cur = 0xFFFFFFFF;
-            rl->rlim_max = 0xFFFFFFFF;
-            return 0;
+            krl.rlim_cur = 0xFFFFFFFF;
+            krl.rlim_max = 0xFFFFFFFF;
+            break;
         case RLIMIT_NPROC:
-            rl->rlim_cur = MAX_PROCS;
-            rl->rlim_max = MAX_PROCS;
-            return 0;
+            krl.rlim_cur = MAX_PROCS;
+            krl.rlim_max = MAX_PROCS;
+            break;
         default:
             return -EINVAL;
     }
+    if (copy_to_user(rlim_ptr, &krl, sizeof(krl)) < 0) return -EFAULT;
+    return 0;
 }
 
 static int64_t sys_setrlimit(int resource, const void* rlim_ptr) {
     if (!rlim_ptr) return -EFAULT;
+    if (!access_ok(rlim_ptr, sizeof(struct rlimit))) return -EFAULT;
+    /* Copy the user struct in (validates the pointer under SMAP),
+     * even though we don't honor it yet. */
+    struct rlimit krl;
+    if (copy_from_user(&krl, rlim_ptr, sizeof(krl)) < 0) return -EFAULT;
     (void)resource;
     /* We don't allow changing resource limits yet. Return -EPERM
      * to indicate the operation is not permitted. */
@@ -1016,6 +1124,12 @@ static int64_t sys_futex(uint32_t* uaddr, int op, uint32_t val,
                           uint64_t timeout, uint32_t* uaddr2, uint32_t val3) {
     (void)uaddr2; (void)val3; (void)timeout;
     if (!uaddr) return -EFAULT;
+    if (!access_ok(uaddr, sizeof(uint32_t))) return -EFAULT;
+    /* Snapshot the user word via get_user — under SMAP, direct *uaddr
+     * would #PF. Note: this is a non-atomic snapshot; a real futex
+     * needs an atomic cmpxchgE on the user word, which is TIER 2c. */
+    uint32_t kuval = 0;
+    if (get_user(&kuval, uaddr) < 0) return -EFAULT;
 
     switch (op) {
         case FUTEX_WAIT:
@@ -1024,7 +1138,7 @@ static int64_t sys_futex(uint32_t* uaddr, int op, uint32_t val,
              * check once and either return 0 (match) or -EAGAIN (mismatch).
              * A real implementation would sleep and schedule, but for now
              * this basic stub is sufficient for simple futex usage. */
-            if (*uaddr != val) return -EAGAIN;
+            if (kuval != val) return -EAGAIN;
             /* Value matches — nothing to wait for, return success. */
             return 0;
 
@@ -1067,8 +1181,14 @@ static int64_t sys_recv(int64_t fd, void* buf, size_t len, int flags) {
 }
 
 static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
+    /* Harden against unbounded nfds (kernel-stack exhaustion via huge
+     * pollfd array). Linux defaults to 256 open files per process;
+     * we allow up to LESTRA_POLL_MAX (1024) which is generous. */
+    if (nfds > LESTRA_POLL_MAX) return -EINVAL;
     struct pollfd* pfds = (struct pollfd*)fds_ptr;
     if (!pfds && nfds > 0) return -EFAULT;
+    if (pfds && nfds > 0 && !access_ok(pfds, nfds * sizeof(struct pollfd)))
+        return -EFAULT;
 
     /* Basic poll: check each fd for readability/writability.
      * This is a synchronous check — we don't block since we have
@@ -1168,7 +1288,14 @@ static int64_t sys_select(int nfds, void* readfds, void* writefds,
                            void* exceptfds, const void* timeout) {
     (void)timeout;
     if (nfds < 0) return -EINVAL;
+    /* Harden against unbounded nfds (same rationale as sys_poll). */
+    if (nfds > LESTRA_POLL_MAX) return -EINVAL;
     if (nfds > FD_SETSIZE_L) nfds = FD_SETSIZE_L;
+    /* Validate user pointers if non-NULL. */
+    size_t set_bytes = (nfds + 7) / 8;
+    if (readfds   && !access_ok(readfds,   set_bytes)) return -EFAULT;
+    if (writefds  && !access_ok(writefds,  set_bytes)) return -EFAULT;
+    if (exceptfds && !access_ok(exceptfds, set_bytes)) return -EFAULT;
 
     /* select() uses bit-sets (fd_set). Each fd_set is an array of
      * longs where bit N corresponds to fd N. FD_SETSIZE_BYTES is
