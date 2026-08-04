@@ -14,6 +14,11 @@
 - **TIER 5 (KE-6)**: Minimal ASLR (stack 12-bit, brk 8-bit), USER_STACK_TOP dedup
 - **KE-7**: Last SMAP violations eliminated (sys_bind/connect/accept + linux_compat)
 
+### Driver Infrastructure (KE-9)
+- **PCI bus enumeration**: Shared pci.c/pci.h, `lspci` command, 7 drivers migrated
+- Eliminated 7 duplicate PCI code copies (211 lines deleted, 180-line shared module)
+- `pci_find_device(vendor, device)` and `pci_find_class(class, subclass)` ready
+
 ### Active Protections (all boot-verified on qemu64,+smep,+smap)
 - SMEP: ENABLED (CR4 bit 20)
 - SMAP: ENABLED (CR4 bit 21)
@@ -27,7 +32,8 @@
 1. **Fix GP fault in user_map_page** during gui-mode /init ELF loading (ldso stack not mapped into user_pml4)
 2. **KASLR-lite**: Randomize kernel base address
 3. **Interrupt-mixed entropy pool** (currently TSC-only, INSECURE)
-4. **Driver pacing**: Real RTL8139, AHCI write, PCI enum, USB, framebuffer fonts
+4. **RTL8139 NIC driver** — now easy via pci_find_device(0x10EC, 0x8139)
+5. **AHCI write support**, USB, framebuffer fonts
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
@@ -46,6 +52,8 @@
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+c71cfb2 drivers: KE-9 shared PCI bus enumeration + lspci, migrate 7 drivers
+2ec024a docs: KE-8 changelog + sync MEMORY.md
 7d8df72 security: KE-8 TIER 2c execve/ldso argv/envp hardening + auxv layout fix
 27f1987 docs: sync MEMORY.md — KE-7 last SMAP violations eliminated
 035ff88 security: KE-7 eliminate last SMAP violations in syscalls + linux_compat
