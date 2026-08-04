@@ -263,6 +263,7 @@ static int64_t sys_fork(void) {
 
 static int64_t sys_read(int64_t fd_num, void* buf, size_t count) {
     if (!buf || count == 0) return -EFAULT;
+    if (!access_ok(buf, count)) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EBADF;
     if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
@@ -270,94 +271,150 @@ static int64_t sys_read(int64_t fd_num, void* buf, size_t count) {
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
 
+    /* Bounce buffer: kmalloc a kernel buffer so VFS/pipe layers
+     * never see a user pointer.  This is required for SMAP safety —
+     * under CR4.SMAP=1 the kernel cannot directly dereference user
+     * memory without stac/clac, and the deeper layers don't use them.
+     * Cap at 4 KB per call to avoid large kernel heap allocations. */
+    size_t chunk = count > 4096 ? 4096 : count;
+    void* kbuf = kmalloc(chunk);
+    if (!kbuf) return -ENOMEM;
+    int64_t total = 0;
+
     switch (entry->type) {
         case FD_SPECIAL:
-            /* stdin (fd 0) reads from keyboard */
+            /* stdin (fd 0) reads from keyboard — one char at a time.
+             * We stage into the bounce buffer then copy out. */
             if (fd_num == 0) {
-                char* cbuf = (char*)buf;
-                for (size_t i = 0; i < count; i++) {
-                    cbuf[i] = keyboard_getchar();
+                size_t done = 0;
+                while (done < count) {
+                    size_t want = count - done;
+                    if (want > chunk) want = chunk;
+                    for (size_t i = 0; i < want; i++)
+                        ((char*)kbuf)[i] = keyboard_getchar();
+                    if (copy_to_user((uint8_t*)buf + done, kbuf, want) < 0) {
+                        total = total ? total : -EFAULT;
+                        goto out;
+                    }
+                    done += want;
+                    total += (int64_t)want;
                 }
-                return (int64_t)count;
+                goto out;
             }
             /* stdout/stderr cannot be read */
-            return -EBADF;
+            total = -EBADF;
+            goto out;
 
-        case FD_VFS:
-            /* Try positional read (memfs). Falls back to sequential
-             * read for ext2/procfs/devfs that don't support offsets. */
-            ssize_t n = vfs_read_at(entry->resource, buf, count, entry->offset);
+        case FD_VFS: {
+            /* VFS read: fill kbuf, copy to user. */
+            ssize_t n = vfs_read_at(entry->resource, kbuf, chunk,
+                                   entry->offset);
             if (n >= 0) {
                 entry->offset += n;
-                return (int64_t)n;
+                if (copy_to_user(buf, kbuf, (size_t)n) < 0)
+                    { total = -EFAULT; goto out; }
+                total = (int64_t)n;
+                goto out;
             }
-            /* vfs_read_at returned -1 (unsupported fd type or EOF on
-             * empty file). Try vfs_read which handles ext2/procfs/devfs. */
-            n = vfs_read(entry->resource, buf, count);
-            return (n < 0) ? -EIO : (int64_t)n;
+            n = vfs_read(entry->resource, kbuf, chunk);
+            if (n < 0) { total = -EIO; goto out; }
+            if (copy_to_user(buf, kbuf, (size_t)n) < 0)
+                { total = -EFAULT; goto out; }
+            total = (int64_t)n;
+            goto out;
+        }
 
-        case FD_PIPE:
-            /* pipe: read from pipe endpoint (blocking I/O) */
-            return (int64_t)pipe_read(entry->resource, buf, count);
+        case FD_PIPE: {
+            ssize_t n = pipe_read(entry->resource, kbuf, chunk);
+            if (n < 0) { total = -EIO; goto out; }
+            if (n > 0 && copy_to_user(buf, kbuf, (size_t)n) < 0)
+                { total = -EFAULT; goto out; }
+            total = (int64_t)n;
+            goto out;
+        }
 
         default:
-            return -EBADF;
+            total = -EBADF;
+            goto out;
     }
+out:
+    kfree(kbuf);
+    return total;
 }
 
 static int64_t sys_write(int64_t fd_num, const void* buf, size_t count) {
     if (!buf || count == 0) return -EFAULT;
+    if (!access_ok(buf, count)) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EBADF;
     if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
 
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
+
+    /* Bounce buffer: copy user data into kernel heap first.
+     * Cap at 4 KB per call. */
+    size_t chunk = count > 4096 ? 4096 : count;
+    void* kbuf = kmalloc(chunk);
+    if (!kbuf) return -ENOMEM;
+    int64_t total = 0;
+
+    /* Copy first chunk from user. */
+    if (copy_from_user(kbuf, buf, chunk) < 0) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
 
     switch (entry->type) {
         case FD_SPECIAL:
             /* stdout/stderr go to VGA+serial */
             if (fd_num == 1 || fd_num == 2) {
-                const char* cbuf = (const char*)buf;
-                for (size_t i = 0; i < count; i++) {
-                    if (cbuf[i] == '\n') {
-                        vga_putchar('\r');
-                    }
-                    vga_putchar(cbuf[i]);
-                    serial_default_putchar(cbuf[i]);
+                const char* kbc = (const char*)kbuf;
+                for (size_t i = 0; i < chunk; i++) {
+                    if (kbc[i] == '\n') vga_putchar('\r');
+                    vga_putchar(kbc[i]);
+                    serial_default_putchar(kbc[i]);
                 }
-                return (int64_t)count;
+                total = (int64_t)chunk;
+                goto out;
             }
             /* stdin cannot be written */
-            return -EBADF;
+            total = -EBADF;
+            goto out;
 
         case FD_VFS:
-            /* O_APPEND: if the fd was opened with O_APPEND, seek to
-             * end before writing (POSIX semantics). For memfs files we
-             * can use vfs_lseek to get the file size. */
             if (entry->flags & O_APPEND) {
-                off_t end = vfs_lseek(entry->resource, 0, 2);  /* SEEK_END */
+                off_t end = vfs_lseek(entry->resource, 0, 2);
                 if (end >= 0) entry->offset = end;
             }
-            /* Try positional write (memfs). Falls back to sequential
-             * write for ext2/procfs/devfs that don't support offsets. */
-            ssize_t n = vfs_write_at(entry->resource, buf, count, entry->offset);
-            if (n >= 0) {
-                entry->offset += n;
-                return (int64_t)n;
+            {
+                ssize_t n = vfs_write_at(entry->resource, kbuf, chunk,
+                                         entry->offset);
+                if (n >= 0) {
+                    entry->offset += n;
+                    total = (int64_t)n;
+                    goto out;
+                }
+                n = vfs_write(entry->resource, kbuf, chunk);
+                if (n < 0) { total = -EIO; goto out; }
+                total = (int64_t)n;
+                goto out;
             }
-            /* vfs_write_at returned -1 (unsupported fd type). Try
-             * vfs_write which handles ext2/procfs/devfs. */
-            n = vfs_write(entry->resource, buf, count);
-            return (n < 0) ? -EIO : (int64_t)n;
 
-        case FD_PIPE:
-            /* pipe: write to pipe endpoint (blocking I/O) */
-            return (int64_t)pipe_write(entry->resource, buf, count);
+        case FD_PIPE: {
+            ssize_t n = pipe_write(entry->resource, kbuf, chunk);
+            if (n < 0) { total = -EIO; goto out; }
+            total = (int64_t)n;
+            goto out;
+        }
 
         default:
-            return -EBADF;
+            total = -EBADF;
+            goto out;
     }
+out:
+    kfree(kbuf);
+    return total;
 }
 
 /* Per-process CWD. Single static buffer for now. */
@@ -694,30 +751,33 @@ static int64_t sys_unlink(const char* path) {
 }
 
 static int64_t sys_getdents(int64_t fd_num, void* dirp, size_t count) {
-    /* VFS exposes vfs_readdir one entry at a time. We pack as many
-     * struct dirent entries as fit in the user buffer.
-     *
-     * With the per-process fd table, the local fd must be mapped to
-     * the VFS resource via cur->fds[fd_num].resource. */
+    /* SMAP-safe getdents: pack dirent entries into a kernel buffer,
+     * then copy the result to user space in one shot. */
     if (!dirp || count == 0) return -EINVAL;
+    if (!access_ok(dirp, count)) return -EFAULT;
     struct process* cur = task_current();
     if (!cur) return -EBADF;
     if (fd_num < 0 || fd_num >= MAX_FD_PER_PROC) return -EBADF;
 
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
-    if (entry->type != FD_VFS) return -EINVAL;  /* only VFS fds support getdents */
+    if (entry->type != FD_VFS) return -EINVAL;
 
     int vfs_fd = entry->resource;
-    struct dirent* out = (struct dirent*)dirp;
     size_t bytes = 0;
     int idx = 0;
+
+    /* Work with a kernel-local dirent, copy out one at a time.
+     * Each dirent is ~72 bytes (64 name + 8 overhead), so the stack
+     * footprint is fine. */
     while (bytes + sizeof(struct dirent) <= count) {
-        int rc = vfs_readdir(vfs_fd, &out[idx]);
-        /* vfs_readdir returns 0 on success, -1 on end-of-directory.
-         * The old code used "rc <= 0" which treated success (0) as
-         * end-of-directory — that was a bug. Fixed to "rc < 0". */
+        struct dirent de;
+        memset(&de, 0, sizeof(de));
+        int rc = vfs_readdir(vfs_fd, &de);
         if (rc < 0) break;
+        if (copy_to_user((uint8_t*)dirp + bytes, &de,
+                         sizeof(struct dirent)) < 0)
+            return -EFAULT;
         idx++;
         bytes += sizeof(struct dirent);
     }
@@ -957,24 +1017,32 @@ static int64_t sys_ioctl(int64_t fd_num, uint64_t request, uint64_t arg) {
 
         case FIONREAD:
             /* Number of bytes readable. For stdin (fd 0), check the
-             * keyboard buffer. For other fds, return 0. */
+             * keyboard buffer. For other fds, return 0.
+             * SMAP-safe: use put_user instead of direct deref. */
             if (entry->type == FD_SPECIAL && fd_num == 0) {
                 int count = keyboard_has_key() ? 1 : 0;
-                if (arg) *(int*)(uintptr_t)arg = count;
+                if (arg) {
+                    if (put_user(count, (int*)(uintptr_t)arg) != 0)
+                        return -EFAULT;
+                }
                 return 0;
             }
             if (entry->type == FD_PIPE) {
-                /* We don't have a pipe_readable_count helper yet;
-                 * return 0 as a safe default. */
-                if (arg) *(int*)(uintptr_t)arg = 0;
+                if (arg) {
+                    int zero = 0;
+                    if (put_user(zero, (int*)(uintptr_t)arg) != 0)
+                        return -EFAULT;
+                }
                 return 0;
             }
             if (entry->type == FD_VFS) {
-                /* For VFS files, readable = file_size - current_offset */
                 off_t end = vfs_lseek(entry->resource, 0, 2);
                 off_t readable = (end >= 0 && end > entry->offset)
                     ? end - entry->offset : 0;
-                if (arg) *(int*)(uintptr_t)arg = (int)readable;
+                if (arg) {
+                    if (put_user((int)readable, (int*)(uintptr_t)arg) != 0)
+                        return -EFAULT;
+                }
                 return 0;
             }
             return -ENOTTY;
@@ -1173,112 +1241,150 @@ static int64_t sys_accept(int64_t fd, void* addr, void* addrlen) {
 }
 
 static int64_t sys_send(int64_t fd, const void* buf, size_t len, int flags) {
-    return (int64_t)socket_sendto((int)fd, buf, len, flags, NULL, 0);
+    if (!buf && len > 0) return -EFAULT;
+    if (buf && len > 0 && !access_ok(buf, len)) return -EFAULT;
+    /* Bounce buffer for SMAP safety — socket layer uses the buf
+     * pointer synchronously (verified: tcp_send/pipe_write don't
+     * retain it beyond the call). */
+    size_t chunk = len > 4096 ? 4096 : len;
+    void* kbuf = NULL;
+    if (len > 0) {
+        kbuf = kmalloc(chunk);
+        if (!kbuf) return -ENOMEM;
+        if (copy_from_user(kbuf, buf, chunk) < 0) {
+            kfree(kbuf);
+            return -EFAULT;
+        }
+    }
+    ssize_t ret = socket_sendto((int)fd, kbuf, chunk, flags, NULL, 0);
+    if (kbuf) kfree(kbuf);
+    return (int64_t)ret;
 }
 
 static int64_t sys_recv(int64_t fd, void* buf, size_t len, int flags) {
-    return (int64_t)socket_recvfrom((int)fd, buf, len, flags, NULL, NULL);
+    if (!buf && len > 0) return -EFAULT;
+    if (buf && len > 0 && !access_ok(buf, len)) return -EFAULT;
+    /* Bounce buffer for SMAP safety. */
+    size_t chunk = len > 4096 ? 4096 : len;
+    void* kbuf = NULL;
+    if (len > 0) {
+        kbuf = kmalloc(chunk);
+        if (!kbuf) return -ENOMEM;
+    }
+    ssize_t ret = socket_recvfrom((int)fd, kbuf, chunk, flags, NULL, NULL);
+    if (kbuf && ret > 0) {
+        if (copy_to_user(buf, kbuf, (size_t)ret) < 0) {
+            kfree(kbuf);
+            return -EFAULT;
+        }
+    }
+    if (kbuf) kfree(kbuf);
+    return (int64_t)ret;
 }
 
 static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
-    /* Harden against unbounded nfds (kernel-stack exhaustion via huge
-     * pollfd array). Linux defaults to 256 open files per process;
-     * we allow up to LESTRA_POLL_MAX (1024) which is generous. */
+    /* SMAP-safe poll: copy pollfd array into kernel memory, process,
+     * then copy revents results back to user space. */
     if (nfds > LESTRA_POLL_MAX) return -EINVAL;
     struct pollfd* pfds = (struct pollfd*)fds_ptr;
     if (!pfds && nfds > 0) return -EFAULT;
     if (pfds && nfds > 0 && !access_ok(pfds, nfds * sizeof(struct pollfd)))
         return -EFAULT;
 
-    /* Basic poll: check each fd for readability/writability.
-     * This is a synchronous check — we don't block since we have
-     * no async I/O notification yet. If timeout > 0, we sleep
-     * briefly then re-check once. */
+    /* Allocate kernel-local pollfd array. */
+    struct pollfd* kfds = NULL;
+    if (nfds > 0) {
+        kfds = (struct pollfd*)kmalloc(nfds * sizeof(struct pollfd));
+        if (!kfds) return -ENOMEM;
+        if (copy_from_user(kfds, pfds, nfds * sizeof(struct pollfd)) < 0) {
+            kfree(kfds);
+            return -EFAULT;
+        }
+    }
+
     int ready = 0;
     struct process* cur = task_current();
 
     for (uint64_t i = 0; i < nfds; i++) {
-        pfds[i].revents = 0;
+        kfds[i].revents = 0;
+        if (kfds[i].fd < 0) continue;
 
-        if (pfds[i].fd < 0) {
-            /* Negative fd: ignore (revents stays 0) */
+        if (socket_is_socket_fd(kfds[i].fd)) {
+            if (kfds[i].events & POLLIN)  kfds[i].revents |= POLLIN;
+            if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
+            if (kfds[i].revents) ready++;
             continue;
         }
 
-        /* Check socket fds */
-        if (socket_is_socket_fd(pfds[i].fd)) {
-            /* Socket is always writable if connected, readable
-             * if data is available. We assume both for now. */
-            if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
-            if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
-            if (pfds[i].revents) ready++;
-            continue;
-        }
-
-        /* Check local process fds */
-        if (cur && pfds[i].fd >= 0 && pfds[i].fd < MAX_FD_PER_PROC) {
-            struct fd_entry* entry = &cur->fds[pfds[i].fd];
+        if (cur && kfds[i].fd >= 0 && kfds[i].fd < MAX_FD_PER_PROC) {
+            struct fd_entry* entry = &cur->fds[kfds[i].fd];
             if (entry->type == FD_UNUSED) {
-                pfds[i].revents |= POLLERR;
+                kfds[i].revents |= POLLERR;
                 ready++;
                 continue;
             }
-
             if (entry->type == FD_SPECIAL) {
-                /* stdin: check keyboard buffer */
-                if (pfds[i].fd == 0 && (pfds[i].events & POLLIN)) {
-                    if (keyboard_has_key()) {
-                        pfds[i].revents |= POLLIN;
-                    }
+                if (kfds[i].fd == 0 && (kfds[i].events & POLLIN)) {
+                    if (keyboard_has_key())
+                        kfds[i].revents |= POLLIN;
                 }
-                /* stdout/stderr: always writable */
-                if ((pfds[i].fd == 1 || pfds[i].fd == 2)
-                    && (pfds[i].events & POLLOUT)) {
-                    pfds[i].revents |= POLLOUT;
-                }
+                if ((kfds[i].fd == 1 || kfds[i].fd == 2)
+                    && (kfds[i].events & POLLOUT))
+                    kfds[i].revents |= POLLOUT;
             } else {
-                /* VFS/pipe fds: assume readable+writable for now */
-                if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
-                if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
+                if (kfds[i].events & POLLIN)  kfds[i].revents |= POLLIN;
+                if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
             }
-
-            if (pfds[i].revents) ready++;
+            if (kfds[i].revents) ready++;
         }
     }
 
-    /* If nothing is ready and timeout > 0, sleep briefly and
-     * re-check once. This gives a crude approximation of blocking
-     * poll behavior. */
+    /* Re-scan after brief sleep if nothing ready */
     if (ready == 0 && timeout_ms > 0) {
-        if (timeout_ms > 100) timeout_ms = 100; /* cap at 100ms */
+        if (timeout_ms > 100) timeout_ms = 100;
         task_sleep((uint64_t)timeout_ms);
-        /* Re-scan after waking */
         for (uint64_t i = 0; i < nfds; i++) {
-            if (pfds[i].fd < 0) continue;
-            if (socket_is_socket_fd(pfds[i].fd)) {
-                if (pfds[i].events & POLLIN)  pfds[i].revents |= POLLIN;
-                if (pfds[i].events & POLLOUT) pfds[i].revents |= POLLOUT;
-                if (pfds[i].revents) ready++;
+            if (kfds[i].fd < 0) continue;
+            if (socket_is_socket_fd(kfds[i].fd)) {
+                if (kfds[i].events & POLLIN)  kfds[i].revents |= POLLIN;
+                if (kfds[i].events & POLLOUT) kfds[i].revents |= POLLOUT;
+                if (kfds[i].revents) ready++;
                 continue;
             }
-            if (cur && pfds[i].fd >= 0 && pfds[i].fd < MAX_FD_PER_PROC) {
-                struct fd_entry* entry = &cur->fds[pfds[i].fd];
+            if (cur && kfds[i].fd >= 0 && kfds[i].fd < MAX_FD_PER_PROC) {
+                struct fd_entry* entry = &cur->fds[kfds[i].fd];
                 if (entry->type == FD_UNUSED) {
-                    if (!(pfds[i].revents & POLLERR)) {
-                        pfds[i].revents |= POLLERR;
+                    if (!(kfds[i].revents & POLLERR)) {
+                        kfds[i].revents |= POLLERR;
                         ready++;
                     }
                     continue;
                 }
-                if (entry->type == FD_SPECIAL && pfds[i].fd == 0
-                    && (pfds[i].events & POLLIN)) {
-                    if (keyboard_has_key() && !(pfds[i].revents & POLLIN)) {
-                        pfds[i].revents |= POLLIN;
+                if (entry->type == FD_SPECIAL && kfds[i].fd == 0
+                    && (kfds[i].events & POLLIN)) {
+                    if (keyboard_has_key() && !(kfds[i].revents & POLLIN)) {
+                        kfds[i].revents |= POLLIN;
                         ready++;
                     }
                 }
             }
         }
+    }
+
+    /* Copy revents back to user — only the revents field needs
+     * to go back. For simplicity we copy the whole array since
+     * revents is the only field we modified. */
+    if (kfds && nfds > 0) {
+        /* Copy only the revents fields back to avoid TOCTOU
+         * races on the events/fd fields. */
+        for (uint64_t i = 0; i < nfds; i++) {
+            short rev = kfds[i].revents;
+            if (put_user(rev, &pfds[i].revents) != 0) {
+                kfree(kfds);
+                return -EFAULT;
+            }
+        }
+        kfree(kfds);
     }
 
     return (int64_t)ready;
@@ -1288,70 +1394,88 @@ static int64_t sys_select(int nfds, void* readfds, void* writefds,
                            void* exceptfds, const void* timeout) {
     (void)timeout;
     if (nfds < 0) return -EINVAL;
-    /* Harden against unbounded nfds (same rationale as sys_poll). */
     if (nfds > LESTRA_POLL_MAX) return -EINVAL;
     if (nfds > FD_SETSIZE_L) nfds = FD_SETSIZE_L;
-    /* Validate user pointers if non-NULL. */
-    size_t set_bytes = (nfds + 7) / 8;
-    if (readfds   && !access_ok(readfds,   set_bytes)) return -EFAULT;
-    if (writefds  && !access_ok(writefds,  set_bytes)) return -EFAULT;
-    if (exceptfds && !access_ok(exceptfds, set_bytes)) return -EFAULT;
 
-    /* select() uses bit-sets (fd_set). Each fd_set is an array of
-     * longs where bit N corresponds to fd N. FD_SETSIZE_BYTES is
-     * the size in bytes. */
-    uint8_t* rset = (uint8_t*)readfds;
-    uint8_t* wset = (uint8_t*)writefds;
-    uint8_t* eset = (uint8_t*)exceptfds;
+    /* SMAP-safe select: copy fd_set arrays into kernel memory. */
+    size_t set_bytes = (nfds + 7) / 8;
+    uint8_t krset[FD_SETSIZE_L / 8];
+    uint8_t kwset[FD_SETSIZE_L / 8];
+    uint8_t keset[FD_SETSIZE_L / 8];
+    memset(krset, 0, sizeof(krset));
+    memset(kwset, 0, sizeof(kwset));
+    memset(keset, 0, sizeof(keset));
+
+    if (readfds) {
+        if (!access_ok(readfds, set_bytes)) return -EFAULT;
+        if (copy_from_user(krset, readfds, set_bytes) < 0) return -EFAULT;
+    }
+    if (writefds) {
+        if (!access_ok(writefds, set_bytes)) return -EFAULT;
+        if (copy_from_user(kwset, writefds, set_bytes) < 0) return -EFAULT;
+    }
+    if (exceptfds) {
+        if (!access_ok(exceptfds, set_bytes)) return -EFAULT;
+        if (copy_from_user(keset, exceptfds, set_bytes) < 0) return -EFAULT;
+    }
+
     struct process* cur = task_current();
     int ready = 0;
 
     for (int fd = 0; fd < nfds; fd++) {
         int fd_byte = fd / 8;
         int fd_bit  = fd % 8;
-        int watching_r = rset && (rset[fd_byte] & (1 << fd_bit));
-        int watching_w = wset && (wset[fd_byte] & (1 << fd_bit));
-        int watching_e = eset && (eset[fd_byte] & (1 << fd_bit));
+        int watching_r = readfds  && (krset[fd_byte] & (1 << fd_bit));
+        int watching_w = writefds && (kwset[fd_byte] & (1 << fd_bit));
+        int watching_e = exceptfds && (keset[fd_byte] & (1 << fd_bit));
 
         if (!watching_r && !watching_w && !watching_e) continue;
 
-        /* Clear the bits first (we'll set them if ready) */
-        if (rset) rset[fd_byte] &= ~(1 << fd_bit);
-        if (wset) wset[fd_byte] &= ~(1 << fd_bit);
-        if (eset) eset[fd_byte] &= ~(1 << fd_bit);
+        /* Clear the bits first */
+        krset[fd_byte] &= ~(1 << fd_bit);
+        kwset[fd_byte] &= ~(1 << fd_bit);
+        keset[fd_byte] &= ~(1 << fd_bit);
 
-        /* Check socket fds */
         if (socket_is_socket_fd(fd)) {
-            if (watching_r) { rset[fd_byte] |= (1 << fd_bit); ready++; }
-            if (watching_w) { wset[fd_byte] |= (1 << fd_bit); ready++; }
+            if (watching_r) { krset[fd_byte] |= (1 << fd_bit); ready++; }
+            if (watching_w) { kwset[fd_byte] |= (1 << fd_bit); ready++; }
             continue;
         }
 
-        /* Check local process fds */
         if (cur && fd >= 0 && fd < MAX_FD_PER_PROC) {
             struct fd_entry* entry = &cur->fds[fd];
             if (entry->type == FD_UNUSED) {
-                if (watching_e) { eset[fd_byte] |= (1 << fd_bit); ready++; }
+                if (watching_e) { keset[fd_byte] |= (1 << fd_bit); ready++; }
                 continue;
             }
-
             if (entry->type == FD_SPECIAL) {
                 if (fd == 0 && watching_r) {
                     if (keyboard_has_key()) {
-                        rset[fd_byte] |= (1 << fd_bit);
+                        krset[fd_byte] |= (1 << fd_bit);
                         ready++;
                     }
                 }
                 if ((fd == 1 || fd == 2) && watching_w) {
-                    wset[fd_byte] |= (1 << fd_bit);
+                    kwset[fd_byte] |= (1 << fd_bit);
                     ready++;
                 }
             } else {
-                /* VFS/pipe: assume readable+writable */
-                if (watching_r) { rset[fd_byte] |= (1 << fd_bit); ready++; }
-                if (watching_w) { wset[fd_byte] |= (1 << fd_bit); ready++; }
+                if (watching_r) { krset[fd_byte] |= (1 << fd_bit); ready++;
+ }
+                if (watching_w) { kwset[fd_byte] |= (1 << fd_bit); ready++; }
             }
         }
+    }
+
+    /* Copy results back to user */
+    if (readfds) {
+        if (copy_to_user(readfds, krset, set_bytes) < 0) return -EFAULT;
+    }
+    if (writefds) {
+        if (copy_to_user(writefds, kwset, set_bytes) < 0) return -EFAULT;
+    }
+    if (exceptfds) {
+        if (copy_to_user(exceptfds, keset, set_bytes) < 0) return -EFAULT;
     }
 
     return (int64_t)ready;

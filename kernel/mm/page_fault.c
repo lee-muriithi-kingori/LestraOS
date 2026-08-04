@@ -33,6 +33,8 @@
 #include <lestra/idt.h>
 #include <string.h>
 
+extern struct security_status g_security;
+
 /* ---- Helpers ---- */
 
 /* Walk a process's PML4 hierarchy to find the PTE for a virtual address.
@@ -88,11 +90,12 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
     int write   = (error_code & 0x02);    /* R/W bit */
     int user    = (error_code & 0x04);    /* U/S bit */
 
-    pr_info("PF: addr=0x%x err=0x%x%s%s%s proc=%s(%d)\n",
+    pr_info("PF: addr=0x%x err=0x%x%s%s%s%s proc=%s(%d)\n",
             (unsigned)fault_addr, (unsigned)error_code,
             present ? " P" : " NP",
             write   ? " W" : " R",
             user    ? " U" : " K",
+            g_security.smap ? " SMAP" : "",
             cur ? cur->name : "kernel",
             cur ? cur->pid  : 0);
 
@@ -243,6 +246,25 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
     /* ================================================================
      * Unhandled fault → kernel panic with full diagnostics
      * ================================================================ */
+    /* SMAP diagnostic: if CR4.SMAP is enabled and the faulting address
+     * is in user space (below 0x8000_0000_0000) while the fault came from
+     * supervisor mode (U/S=0), this is almost certainly a kernel code path
+     * that forgot stac() before accessing user memory.  Bit 5 (SMAP) in
+     * the error code is also set by the CPU when SMAP is the cause.
+     * This hint makes missed stac/clac sites trivial to diagnose once
+     * CR4.SMAP is flipped in TIER 3. */
+    int smap_bit = (error_code >> 5) & 1;
+    if (g_security.smap && !user && fault_addr < 0x800000000000ULL) {
+        pr_err("PF: *** POSSIBLE SMAP VIOLATION ***\n");
+        pr_err("  Kernel accessed user address 0x%x without AC flag\n",
+               (unsigned)fault_addr);
+        pr_err("  SMAP error-code bit: %s  CR4.SMAP: ON\n",
+               smap_bit ? "SET (confirmed SMAP)" : "clear (check stac)");
+        pr_err("  Add stac()/clac() or use copy_from_user/copy_to_user around\n");
+        pr_err("  the access at RIP 0x%p.\n",
+               frame ? (void*)frame->rip : (void*)0);
+    }
+
     pr_err("PF: UNHANDLED page fault at 0x%x (error 0x%x)\n",
            (unsigned)fault_addr, (unsigned)error_code);
     pr_err("  Present: %s  Access: %s  Mode: %s\n",
