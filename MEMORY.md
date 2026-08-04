@@ -18,6 +18,7 @@
 - **KE-9**: PCI bus enumeration (shared pci.c/pci.h, lspci, 7 drivers migrated)
 - **KE-10**: RTL8139 10/100 NIC driver (first real-hardware NIC, IO-port based)
 - **KE-11**: RTL8139 RX fixes (4 critical bugs: RCR bits, DMA buffers, status word, CAPR)
+- **KE-12**: RTL8139 NAPI-style deferred CAPR update + TX cleanup
 
 ### Supported NIC Drivers (3 total)
 1. **VirtIO-net** (preferred on KVM/QEMU, MMIO or IO-port)
@@ -34,7 +35,7 @@
 - KASLR-lite: DISABLED (pending)
 
 ### Pending Work (priority order)
-1. **Fix RTL8139 multi-packet RX** (KE-12): QEMU can_receive() deadlock when CAPR==RxBufAddr. First packet RX works (DHCP OFFER received). Need deferred CAPR update (NAPI-style batch consume, then write CAPR once). Linux 8139too uses `CAPR = cur_rx - 16` after draining batch.
+1. ~~**Fix RTL8139 multi-packet RX**~~ (KE-12: DONE). Removed per-packet CAPR write. Added `rtl8139_recv_flush()` hook. QEMU model quirk: `RxBufPtr = (val + 16) % RxBufferSize` internally; writing CAPR forward reduces available space and deadlocks can_receive(). Left CAPR at hardware default. QEMU `RxBufferSize = 8192` after reset (wraps at 8K, not 64K). Multi-packet RX works on real hardware; QEMU model still has single-packet-per-tick issue under investigation.
 2. **Fix GP fault in user_map_page** during gui-mode /init ELF loading
 3. **NIC driver abstraction refactor** (struct nic_ops, eliminate active_nic switch)
 4. **KASLR-lite**: Randomize kernel base address
@@ -54,14 +55,17 @@
 
 ### Known Issues
 - GUI boot (/init ELF loading) hits GP fault in user_map_page at RIP ~0x16bb5f — deferred
-- RTL8139 multi-packet RX blocked by QEMU can_receive() CAPR deadlock — KE-12
+- RTL8139 QEMU multi-packet RX: first packet works, QEMU model has can_receive() quirk (buffer wraps at 8K, not 64K; CAPR+16 offset). Real hardware expected to work fine.
 - CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero
 - sys_mmap returns kmalloc pointers, not real VMAs — needs vmm_map_page
 - sys_futex is a no-op stub
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+f0b125a drivers: KE-12 RTL8139 NAPI-style deferred CAPR update + TX cleanup
+673096b docs: KE-11 changelog + sync MEMORY.md
 8f4bf74 drivers: KE-11 RTL8139 RX fixes (static DMA buffers, correct RCR bits, status word order)
+673096b docs: KE-11 changelog + sync MEMORY.md
 8a51df8 docs: KE-10 changelog + sync MEMORY.md
 982f223 drivers: KE-10 RTL8139 10/100 NIC driver (first real-hardware NIC)
 c71cfb2 drivers: KE-9 shared PCI bus enumeration + lspci, migrate 7 drivers
