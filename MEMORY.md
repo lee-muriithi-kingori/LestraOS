@@ -2783,3 +2783,95 @@ CARRY-FORWARD FOR NEXT ENGINEER:
 - The /home/z/.local/opt/devtools/ toolchain is NOT committed to the repo.
   env.sh + smoke_cloud.sh auto-detect it. If container resets, re-run
   the apt-get download + dpkg-deb -x sequence (see KE-3 worklog).
+
+---
+Task ID: KE-6
+Agent: Kernel Engineer (with ALPHA-6 + BETA-6 deliberation)
+Task: TIER 5 — minimal ASLR (stack + brk randomization) + deduplicate USER_STACK_TOP
+Date: 5 Aug 2025
+
+Work Log:
+- Read worklog tail + git log — confirmed KE-5 (TIER 3 SMEP/SMAP + PTE mask fix)
+  at commit 2cca2f6. Clean working tree. TIER 5 was the next step per the
+  original security roadmap.
+- Identified that USER_STACK_TOP was defined in 3 places with DIFFERENT
+  stack sizes: elf.c (256 KB), ldso.c (8 MB), page_fault.c (hardcoded).
+  BETA-6 correctly flagged this as a collision risk.
+- Spawned ALPHA-6 (go 16-bit stack entropy, XOR-rotated mmap) and BETA-6
+  (block entirely — TSC CSPRNG is deterministic, /init non-PIE makes ASLR
+  "security theater", triple definition is catastrophic).
+  SYNTHESIS: consolidate definitions (BETA #1 risk), use 12-bit stack + 8-bit
+  brk (middle ground). mmap ASLR impossible with kmalloc stub.
+
+IMPLEMENTATION:
+
+1. kernel/include/lestra/mm.h (+18 LOC):
+   * Added USER_STACK_TOP_DEFAULT, USER_STACK_SIZE_DEFAULT, USER_STACK_SIZE_LDSO.
+   * Added ASLR_STACK_BITS=12, ASLR_BRK_BITS=8, ASLR_MMAP_BITS=8.
+   * Added `extern uint64_t csprng_u64(void);` so all ASLR sites can include mm.h.
+
+2. kernel/exec/elf.c:
+   * Removed 3 local #define lines (USER_STACK_TOP/SIZE/BOTTOM).
+   * elf_load(): stack_slide = (csprng_u64() & 0xFFF) << 12 → 16 MB range,
+     page-aligned, downward from USER_STACK_TOP_DEFAULT.
+   * user_stack_ptr and stack mapping use the randomized values.
+
+3. kernel/exec/ldso.c:
+   * Removed 2 local #define lines.
+   * ldso_load_and_run(): same csprng_u64() stack ASLR pattern.
+   * Removed dead loop that allocated stack pages but didn't map them into
+     user PML4 (was a known TODO — cleaned up with (void)stack_size).
+
+4. kernel/mm/page_fault.c:
+   * Replaced hardcoded 0x00007FFFFFE00000ULL with USER_STACK_TOP_DEFAULT.
+   * Note: using default as upper bound is CONSERVATIVE and correct —
+     actual randomized stack top is always <= default.
+
+5. kernel/syscall/syscall.c:
+   * sys_brk: initial brk = 0x40000000 + (csprng_u64() & 0xFF) << 12.
+     8-bit entropy, 1 MB range around the 1 GB base.
+   * sys_mmap: ASLR deliberately NOT applied. The current implementation
+     returns identity-mapped kernel heap pointers. XOR-ing them would
+     return invalid addresses (user would #PF when accessing). Real mmap
+     ASLR requires vmm_map_page integration. Added TODO comment.
+
+6. kernel/core/kernel_main.c:
+   * Set g_security.aslr = 1.
+   * SECURITY AUDIT now shows: "ASLR: ENABLED (stack+12 bits, brk+8 bits, TSC-CSPRNG)"
+
+7. kernel/fs/procfs.c:
+   * gen_security() now reads g_security.aslr and shows stack/brk entropy.
+
+BUILD: make clean && make all -> SUCCESS.
+
+BOOT VERIFICATION:
+  1. Default qemu64: PASS (ASLR: ENABLED in audit)
+  2. qemu64,+smep,+smap: PASS (SMEP+SMAP+NX+ASLR+Canaries all ENABLED, zero faults)
+  Logs: logs/boot-tier5-aslr-default.log, logs/boot-tier5-aslr-smep-smap.log
+
+Commits: 5877dc4 (implementation), a4e8e3f (README). Pushed.
+
+Stage Summary:
+- TIER 5 COMPLETE. Stack ASLR (12 bits = 4096 positions, 16 MB range) and
+  brk ASLR (8 bits = 256 positions, 1 MB range) are now active.
+- USER_STACK_TOP deduplicated from 3 files into mm.h. This eliminates
+  a real collision risk where page_fault.c could use a different stack
+  boundary than the ELF loader.
+- Security posture: 5 of 7 protections now ENABLED:
+  1. SMEP: ENABLED (on capable CPU)
+  2. SMAP: ENABLED (on capable CPU)
+  3. NX: ENABLED
+  4. ASLR: ENABLED (stack+brk)
+  5. Stack Canaries: ENABLED
+  Remaining: KASLR-lite (pending), PIE/text ASLR (TIER 7, deferred).
+- mmap ASLR requires vmm_map_page-backed sys_mmap (significant refactor).
+- CSPRNG weakness documented: TSC-based on qemu64 is deterministic.
+  Production must use RDRAND or interrupt-mixed entropy pool.
+
+CARRY-FORWARD FOR NEXT ENGINEER:
+- TIER 2c: sys_execve + ldso.c argv/envp uaccess conversion (1054-line file).
+  6 socket syscalls still SMAP-unsafe (not boot-critical).
+- TIER 6 (kptr_restrict) is cheap — just a global + prctl, could land anytime.
+- DRIVER PACING: the security pipeline is nearly complete. Next cycles
+  should focus on real driver ports (FAT32, PCI enum, USB, VBE, etc.).
+- GitHub PAT: head -1 /home/z/my-project/upload/hlee. Owner: lee-muriithi-kingori.
