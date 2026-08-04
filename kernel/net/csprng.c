@@ -94,6 +94,14 @@ static int collect_entropy(uint8_t out[48]) {
         for (int i = 0; i < 12; i++) {
             buf[i] ^= (uint32_t)(tsc >> (i*5)) ^ (uint32_t)(ms << i) ^ sp ^ (i * 0x61C88647);
         }
+        /* INSECURE: TSC-only entropy is predictable in deterministic VMs.
+         * Do NOT use cloud/SSH mode as production without real RDRAND
+         * or an interrupt-mixed entropy pool. */
+        static int warned = 0;
+        if (!warned) {
+            printk("csprng: WARNING — RDRAND unavailable, using INSECURE TSC fallback\n");
+            warned = 1;
+        }
     }
     memcpy(out, buf, 48);
     return have_hw >= 6;

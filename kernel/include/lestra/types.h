@@ -214,19 +214,45 @@ static inline uintptr_t read_cr2(void) {
     return val;
 }
 
+/* CPUID-based feature detection for RDRAND/RDSEED.
+ * Required: QEMU's default qemu64 CPU does NOT advertise RDRAND
+ * (CPUID.01h:ECX[30]=0), so emitting `rdrand` unconditionally raises #UD.
+ * Gate all rdrand/rdseed callers on these checks. */
+static inline int cpu_has_rdrand(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+    cached = (ecx & (1u << 30)) ? 1 : 0;
+    return cached;
+}
+
+static inline int cpu_has_rdseed(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    uint32_t eax, ebx, ecx, edx;
+    /* CPUID leaf 7, subleaf 0 */
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    cached = (ebx & (1u << 18)) ? 1 : 0;
+    return cached;
+}
+
 static inline int rdrand32(uint32_t* val) {
+    if (!cpu_has_rdrand()) { *val = 0; return 0; }
     unsigned char ok;
     asm volatile("rdrand %1; setc %0" : "=q"(ok), "=r"(*val));
     return ok;
 }
 
 static inline int rdrand64(uint64_t* val) {
+    if (!cpu_has_rdrand()) { *val = 0; return 0; }
     unsigned char ok;
     asm volatile("rdrand %1; setc %0" : "=q"(ok), "=r"(*val));
     return ok;
 }
 
 static inline int rdseed32(uint32_t* val) {
+    if (!cpu_has_rdseed()) { *val = 0; return 0; }
     unsigned char ok;
     asm volatile("rdseed %1; setc %0" : "=q"(ok), "=r"(*val));
     return ok;

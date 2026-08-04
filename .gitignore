@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+iso/boot/kernel.bin
+iso/boot/initrd.img
+*.o
+*.a
+*.iso
+*.img
+*.bin
+!boot/stage1.bin
+
+# Secrets — NEVER commit
+.env
+.git-credentials
+*.pem
+*.key
+secrets/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs (keep boot logs in logs/ for proof, ignore runtime debug)
+*.log
+!logs/*.log

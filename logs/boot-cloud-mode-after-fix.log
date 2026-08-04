@@ -1,0 +1,119 @@
+cSeaBIOS (version 1.16.3-debian-1.16.3-2)
+
+
+iPXE (https://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+1EFC6F60+1EF06F60 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from DVD/CD...
+Welcome to GRUB!
+
+  Booting `Lestra OS (Serial Cloud Mode)'
+
+B123456
+  ==========================================
+  |                                          |
+  |     L e s t r a   O S                    |
+  |                                          |
+  |     by Lee Muriihi Kingori               |
+  |     lestramk.org  (c) 2026               |
+  |     Version 1.0.0-alpha                  |
+  |                                          |
+  ==========================================
+
+Initializing Lestra OS kernel...
+Boot module: addr=0x1eaa000-0x1ec1050 (size=94288) string='initrd'
+Memory map: 7 entries
+Memory: Lower=639KB, Upper=523136KB
+Initializing GDT...
+Initializing IDT...
+Initializing PIC...
+Initializing memory management...
+PMM: 511 MB total, 511 MB usable
+VMM initialized
+PMM: reserved region 0x10000000 - 0x30000000 (512 MB)
+Heap initialized at 0x10000000 (size: 512 MB)
+PMM: refcount array at 0x2a3000, size 512 KB (131040 entries)
+sched: initialized (max 32 processes, real context_switch)
+Syscall interface initialized (SYSCALL/SYSRET)
+VFS: initialized (memfs, max 64 files, root dir at idx 0)
+Loading initrd from 0x0x1eaa000 (size=94288 bytes)
+initrd:   /init (28168 bytes)
+initrd:   /shell (37680 bytes)
+initrd:   /sysinfo (28232 bytes)
+initrd: loaded 3 files
+No rootfs.tar module — running with initrd only
+Memory: Total=511 MB, Used=258 MB, Free=253 MB
+Heap: Used=0 KB
+Initializing timer (1000 Hz)...
+Initializing keyboard...
+Initializing package manager...
+lestra-pkg: package manager initialized (110 packages, 5 repos)
+Initializing AI subsystem...
+AI subsystem initialized (7 tools registered)
+Initializing network stack...
+net: initializing network stack
+virtio_net: no VirtIO-net device found
+e1000: found at PCI 00:3.0, MMIO=0xfebc0000
+e1000: MAC a4:a8:0:24:68:ac
+e1000: link up (driver initialized, RX/TX rings 16/16 entries, STATUS=0x80080783)
+net: using E1000 driver
+firewall: initialized (default policy: accept in/accept out)
+DHCP: starting (xid=0x12345678)
+IPv6: link-local address configured
+IPv6: sent Router Solicitation
+Initializing disk subsystem...
+ahci: no AHCI HBA found
+Initializing audio subsystem...
+ac97: no AC97 controller found
+Initializing RTC...
+rtc: initialising CMOS RTC (ports 0x70/0x71)
+rtc: mode = BCD / 24-hour
+rtc: current time 1970-1-1 0:0:0
+rtc: unix time = 0
+Initializing power management...
+battery: scanning PCI for ACPI / battery devices...
+battery: Intel PIIX4 ACPI PM at PCI 0:1:0
+battery: ACPI PM device present, ACPI mode available
+battery: initialised (Full, 100%, charging=0)
+temp: initialising thermal sensors
+temp: CPU vendor = Unknown
+temp: unknown CPU, MSR returned 0 (no thermal sensor)
+temp: using simulated readings (CPU=45°C)
+temp: using simulated readings (CPU=45°C, GPU=42°C)
+Initializing WiFi framework...
+wifi: initialising WLAN framework (802.11 mgmt frames + WPA2)
+wifi: NIC present, probes ethertype 0x88B4, EAPOL 0x888E
+wifi: ready
+Initializing cron daemon...
+cron: initialising (max 16 tasks)
+cron: ready
+Initializing service manager...
+service: registered 'net' (Network stack (E1000 + DHCP))
+service: registered 'shell' (Kernel shell (lsh))
+service: registered 'ssh' (SSH-like remote shell (port 2222))
+service: registered 'sandbox-server' (Sandbox HTTP server)
+service: initialized (16 built-in services)
+Initializing sandbox subsystem...
+sandbox: initialising (max 2 sandboxes)
+sandbox: ready
+Enabling interrupts...
+Network: acquiring IP via DHCP (background)...
+
+Lestra OS kernel initialized successfully!
+Type 'help' for available commands.
+
+Boot cmdline: 'cloud serial'
+
+=== CLOUD/VPS SERVER MODE ===
+LestraOS Cloud/VPS Mode activated
+Serial console (COM1) is primary I/O
+Skipping GUI, framebuffer, and compositor
+Starting SSH remote shell server...
+csprng: WARNING — RDRAND unavailable, using INSECURE TSC fallback
+csprng: initialized (TSC fallback)
+DHCP: sending DISCOVER (try 1)
+DHCP: OFFER ip=10.0.2.15 from server 10.0.2.2
+DHCP: sending REQUEST for 10.0.2.15 (try 1)
+DHCP: ACK - configured ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3
+qemu-system-x86_64: terminating on signal 15 from pid 5679 (timeout)
