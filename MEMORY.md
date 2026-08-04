@@ -19,11 +19,19 @@
 - **KE-10**: RTL8139 10/100 NIC driver (first real-hardware NIC, IO-port based)
 - **KE-11**: RTL8139 RX fixes (4 critical bugs: RCR bits, DMA buffers, status word, CAPR)
 - **KE-12**: RTL8139 NAPI-style deferred CAPR update + TX cleanup
+- **KE-14**: NIC driver abstraction (struct nic_ops vtable, pci migration for e1000/virtio)
 
-### Supported NIC Drivers (3 total)
+### Supported NIC Drivers (3 total, all via nic_ops vtable)
 1. **VirtIO-net** (preferred on KVM/QEMU, MMIO or IO-port)
 2. **Intel E1000** (82540EM, MMIO)
 3. **Realtek RTL8139** (10/100 Fast Ethernet, IO-port, first real-hardware NIC)
+
+### NIC Abstraction (KE-14)
+- `include/lestra/nic.h`: `struct nic_ops` vtable (name, init, send, recv, get_mac, flush)
+- `net/nic.c`: driver priority table + `active_nic_ops` pointer
+- Each driver exports `const struct nic_ops <name>_ops`
+- All 3 drivers now use shared PCI API (pci_find_device / pci_get_device)
+- Adding a new NIC = implement nic_ops + one line in nic.c table
 
 ### Active Protections (all boot-verified on qemu64,+smep,+smap)
 - SMEP: ENABLED (CR4 bit 20)
@@ -37,7 +45,7 @@
 ### Pending Work (priority order)
 1. ~~**Fix RTL8139 multi-packet RX**~~ (KE-12: DONE). Removed per-packet CAPR write. Added `rtl8139_recv_flush()` hook. QEMU model quirk: `RxBufPtr = (val + 16) % RxBufferSize` internally; writing CAPR forward reduces available space and deadlocks can_receive(). Left CAPR at hardware default. QEMU `RxBufferSize = 8192` after reset (wraps at 8K, not 64K). Multi-packet RX works on real hardware; QEMU model still has single-packet-per-tick issue under investigation.
 2. ~~**Fix GP fault in user_map_page**~~ (KE-13: DONE). Root cause: create_user_address_space() shared boot_pml4[0..3] by pointer, so user_map_page() encountered 2MB huge pages, misinterpreted them as PT pointers, and wrote PTEs to arbitrary physical memory. Fix: deep-copy boot page tables (PDPT+PD) into private per-process copies, split 2MB huge pages on demand. Boot-verified clean.
-3. **NIC driver abstraction refactor** (struct nic_ops, eliminate active_nic switch)
+3. ~~**NIC driver abstraction refactor**~~ (KE-14: DONE)
 4. **KASLR-lite**: Randomize kernel base address
 5. **Interrupt-mixed entropy pool** (currently TSC-only, INSECURE)
 6. **More drivers**: USB, FAT32, framebuffer fonts
@@ -61,6 +69,7 @@
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+821a567 refactor: KE-14 NIC driver abstraction (struct nic_ops vtable)
 8ebd973 fix: KE-13 fix GP fault in user_map_page during ELF loading (deep copy + huge page split)
 f0b125a drivers: KE-12 RTL8139 NAPI-style deferred CAPR update + TX cleanup
 673096b docs: KE-11 changelog + sync MEMORY.md
@@ -112,3 +121,36 @@ Stage Summary:
 - GP fault eliminated, GUI boot path now works correctly
 - /init ELF loads and jumps to userspace without any fault or SMAP violation
 - Next priority: NIC driver abstraction refactor or KASLR-lite
+
+---
+Task ID: 2
+Agent: Main (super-agent)
+Task: KE-14 — NIC driver abstraction (struct nic_ops vtable)
+
+Work Log:
+- Read worklog + MEMORY.md + git log — KE-13 was already done, 2 unpushed commits
+- Pushed KE-13 commits (8ebd973, 522ddc5) to GitHub
+- Spawned Explore subagent to analyze all 3 NIC drivers, active_nic switch, PCI discovery
+- Spawned ALPHA (high-reward strategist) and BETA (caution officer) advisory subagents
+- Decision: Follow ALPHA's path but skip zero-copy sk_buff (BETA's top risk) and multi-NIC registry (premature)
+- Created `include/lestra/nic.h` with struct nic_ops (init, send, recv, get_mac, flush)
+- Created `net/nic.c` with driver priority table [virtio, e1000, rtl8139]
+- Refactored rtl8139.c: added nic_ops vtable (already used pci_find_device)
+- Refactored e1000.c: replaced raw PCI scan loop with pci_find_device() + pci_device_enable()
+- Refactored virtio_net.c: replaced raw PCI scan loop with pci_get_device() table scan
+  - Added vnet_pci_entry pointer (renamed to avoid conflict with uint8_t vnet_pci_dev)
+  - Simplified vnet_detect_modern() to use vnet_pci_entry->bar[] instead of re-reading PCI config
+- Rewrote net.c: removed 15 extern decls + active_nic switch, added nic_ops dispatch
+- Build succeeded first try
+- Boot-tested E1000: 'net: using e1000 driver', DHCP 10.0.2.15, SMEP/SMAP active
+- Boot-tested VirtIO-net: 'net: using virtio_net driver', modern transport detected
+- Updated README.md changelog
+- Committed as 821a567, pushed to GitHub
+- Synced MEMORY.md
+
+Stage Summary:
+- KE-14 complete: 15 files changed, 242 insertions, 163 deletions
+- active_nic integer switch eliminated, function pointer dispatch via nic_ops
+- All 3 drivers now use shared PCI API (e1000 and virtio_net migrated from raw PCI loops)
+- Adding a new NIC driver: implement nic_ops + one line in nic.c table
+- Next priority: KASLR-lite or interrupt-mixed entropy pool
