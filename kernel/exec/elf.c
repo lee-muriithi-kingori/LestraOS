@@ -53,9 +53,7 @@ typedef struct {
  * and the memcmp below would always fail. */
 #define ELF_MAGIC "\x7f" "ELF"
 
-#define USER_STACK_TOP   0x00007FFFFFE00000ULL
-#define USER_STACK_SIZE  (256 * 1024)
-#define USER_STACK_BOTTOM (USER_STACK_TOP - USER_STACK_SIZE)
+/* User stack constants — single source of truth in mm.h */
 
 /* Exposed for linux_compat.c so it can call elf_jump_to_user with the
  * same address space the regular loader uses. */
@@ -186,17 +184,24 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
         }
     }
 
-    user_stack_ptr = USER_STACK_TOP;
-    size_t stack_pages = USER_STACK_SIZE / PAGE_SIZE;
+    /* ASLR: randomize stack top by ASLR_STACK_BITS (12 bits = 16 MB).
+     * Slide downward from USER_STACK_TOP_DEFAULT, stay page-aligned. */
+    uint64_t stack_slide = (csprng_u64() & ((1ULL << ASLR_STACK_BITS) - 1)) << PAGE_SHIFT;
+    uint64_t stack_top = USER_STACK_TOP_DEFAULT - stack_slide;
+    uint64_t stack_size = USER_STACK_SIZE_DEFAULT;
+    uint64_t stack_bottom = stack_top - stack_size;
+
+    user_stack_ptr = stack_top;
+    size_t stack_pages = stack_size / PAGE_SIZE;
     for (size_t i = 0; i < stack_pages; i++) {
         phys_addr_t phys = pmm_alloc_page();
         if (phys) {
             memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
-            user_map_page(user_pml4, USER_STACK_BOTTOM + i * PAGE_SIZE,
+            user_map_page(user_pml4, stack_bottom + i * PAGE_SIZE,
                           phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
         }
     }
-    user_stack_ptr = USER_STACK_TOP - 16;
+    user_stack_ptr = stack_top - 16;
 
     user_entry = hdr->e_entry;
     return user_entry;

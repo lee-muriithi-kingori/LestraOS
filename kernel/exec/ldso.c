@@ -871,8 +871,7 @@ extern void elf_jump_to_user(uint64_t entry, uint64_t stack, uintptr_t pml4);
 extern uintptr_t* user_pml4;
 extern uint64_t user_stack_ptr;
 
-#define USER_STACK_TOP   0x00007FFFFFE00000ULL
-#define USER_STACK_SIZE  (8 * 1024 * 1024)   /* 8 MB stack for apps */
+/* User stack constants — single source of truth in mm.h */
 
 int ldso_load_and_run(const char* exe_path, int argc, char** argv, char** envp) {
     pr_info("ldso: starting dynamic linker for %s\n", exe_path);
@@ -983,20 +982,18 @@ int ldso_load_and_run(const char* exe_path, int argc, char** argv, char** envp) 
     /* For now we just set up argc/argv. Real Linux also passes envp and
      * auxv (AT_PHDR, AT_ENTRY, AT_PAGESZ, etc.) which glibc reads. */
     extern phys_addr_t pmm_alloc_page(void);
-    /* Allocate 8 MB of stack pages. */
-    size_t stack_pages = USER_STACK_SIZE / 4096;
-    for (size_t i = 0; i < stack_pages; i++) {
-        phys_addr_t phys = pmm_alloc_page();
-        if (!phys) break;
-        /* Map at USER_STACK_TOP - USER_STACK_SIZE + i*4096. We need
-         * the kernel's VMM. For now, we trust that elf_jump_to_user
-         * sets up a fresh address space — but that means our loaded
-         * libs are NOT in the new address space. This is the next
-         * piece of work: we need to load libs INTO the user PML4. */
-    }
+    /* ASLR: randomize stack top, same pattern as elf.c. */
+    uint64_t stack_slide = (csprng_u64() & ((1ULL << ASLR_STACK_BITS) - 1)) << 12;
+    uint64_t stack_top = USER_STACK_TOP_DEFAULT - stack_slide;
+    uint64_t stack_size = USER_STACK_SIZE_LDSO;
+
+    /* Allocate stack pages (note: ldso doesn't map them into user
+     * PML4 here — that's a known TODO. The stack pointer is just
+     * computed and passed to elf_jump_to_user.) */
+    (void)stack_size;
 
     /* Place argc + argv on the top of the stack. */
-    uint64_t* sp = (uint64_t*)(USER_STACK_TOP - 256);
+    uint64_t* sp = (uint64_t*)(stack_top - 256);
     sp[0] = (uint64_t)argc;
     for (int i = 0; i < argc; i++) {
         sp[1 + i] = (uint64_t)argv[i];

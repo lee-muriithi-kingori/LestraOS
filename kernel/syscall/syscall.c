@@ -581,7 +581,12 @@ static void* current_brk = NULL;
 static int64_t sys_brk(void* addr) {
     /* Linux semantics: brk(0) returns current break; brk(addr) sets it
      * and returns the new break (or current on failure). */
-    if (!current_brk) current_brk = (void*)0x40000000ULL;  /* 1 GB */
+    if (!current_brk) {
+        /* ASLR: randomize initial brk by ASLR_BRK_BITS (8 bits = 1 MB range).
+         * Base is 0x40000000 (1 GB), slide within [base, base+1MB). */
+        uint64_t brk_slide = (csprng_u64() & ((1ULL << ASLR_BRK_BITS) - 1)) << 12;
+        current_brk = (void*)(0x40000000ULL + brk_slide);
+    }
     if (!addr) return (int64_t)current_brk;
     /* Only allow growing the break, within a 16 MB cap. */
     uintptr_t new_brk = (uintptr_t)addr;
@@ -608,6 +613,10 @@ static int64_t sys_mmap(void* addr, size_t length, int prot, int flags, int fd, 
     void* p = kmalloc(rounded);
     if (!p) return -ENOMEM;
     memset(p, 0, rounded);
+    /* NOTE: real mmap ASLR requires VMM-backed per-process address space
+     * management (allocate pages at a random virtual address in the user PML4).
+     * Current implementation returns identity-mapped kernel heap pointers.
+     * Deferred until sys_mmap is backed by vmm_map_page. */
     return (int64_t)p;
 }
 

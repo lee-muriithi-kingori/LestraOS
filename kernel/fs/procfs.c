@@ -307,7 +307,9 @@ static size_t gen_security(struct procfs_open* o) {
     off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
                      "NX                   on    EFER.NXE\n");
     off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
-                     "ASLR                 off   pending PIE conversion\n");
+                     "ASLR                 %s  stack+%d brk+%d (TSC-CSPRNG)\n",
+                     g_security.aslr ? "on " : "off",
+                     ASLR_STACK_BITS, ASLR_BRK_BITS);
     off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
                      "StackCanaries        %s  -fstack-protector-strong\n",
                      g_security.canaries ? "on " : "off");

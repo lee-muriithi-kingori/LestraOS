@@ -193,7 +193,7 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
      * stack downward. Update process->stack_bottom.
      * ================================================================ */
     if (user && cur && fault_addr >= USER_SPACE_START && fault_addr <= USER_SPACE_END) {
-        uint64_t stack_top    = 0x00007FFFFFE00000ULL;   /* canonical stack top */
+        uint64_t stack_top    = USER_STACK_TOP_DEFAULT;  /* may be ASLR-shifted */
         uint64_t stack_bottom = cur->stack_bottom;
 
         /* Growth allowed: fault is below current bottom but above

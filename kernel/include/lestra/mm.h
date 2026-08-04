@@ -56,6 +56,26 @@
 #define USER_SPACE_START    0x0000000000400000ULL
 #define USER_SPACE_END      0x00007FFFFFFFFFFFULL
 
+/* User stack layout — SINGLE SOURCE OF TRUTH.
+ * Used by elf.c, ldso.c, page_fault.c, and the ASLR subsystem.
+ * The stack grows downward from USER_STACK_TOP_DEFAULT. */
+#define USER_STACK_TOP_DEFAULT   0x00007FFFFFE00000ULL
+#define USER_STACK_SIZE_DEFAULT  (256 * 1024)  /* 256 KB (elf.c) */
+#define USER_STACK_SIZE_LDSO     (8 * 1024 * 1024)  /* 8 MB (ldso.c) */
+
+/* ASLR entropy (in bits). Applied to stack top, brk base, mmap base.
+ * 12 bits = 4096 possible positions (16 MB range, page-aligned).
+ * TSC-based CSPRNG is weak; 12 bits is honest but non-zero. */
+#define ASLR_STACK_BITS   12
+#define ASLR_BRK_BITS     8
+#define ASLR_MMAP_BITS    8
+
+/* ASLR-slide helpers — called once at boot (stack) or per-syscall (brk/mmap).
+ * They call csprng_u64() (defined in kernel/net/csprng.c, initialized
+ * after timer_init). The prototypes are here so all ASLR users can
+ * include mm.h instead of redeclaring extern. */
+extern uint64_t csprng_u64(void);
+
 /* Physical memory map entry types */
 #define MMAP_USABLE       1
 #define MMAP_RESERVED     2

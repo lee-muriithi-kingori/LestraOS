@@ -278,6 +278,7 @@ void kernel_main(void* mb2_info) {
     extern struct security_status g_security;
     g_security.nx = 1;  /* EFER.NXE already set in boot.asm */
     g_security.kptr_restrict = 1;
+    g_security.aslr = 1;  /* stack/brk ASLR active (TIER 5) */
     pr_info("security: SMEP=%s SMAP=%s %s\n",
             g_security.smep ? "ENABLED" : "unavailable",
             g_security.smap ? "ENABLED" : "unavailable",
@@ -428,7 +429,8 @@ void kernel_main(void* mb2_info) {
     pr_info("  SMEP:           %s\n", g_security.smep ? "ENABLED (CR4.SMEP)" : "unavailable");
     pr_info("  SMAP:           %s\n", g_security.smap ? "ENABLED (CR4.SMAP)" : "unavailable");
     pr_info("  NX:             ENABLED (EFER.NXE)\n");
-    pr_info("  ASLR:           DISABLED (pending PIE conversion)\n");
+    pr_info("  ASLR:           %s (stack+%d bits, brk+%d bits, TSC-CSPRNG)\n",
+            "ENABLED", ASLR_STACK_BITS, ASLR_BRK_BITS);
     pr_info("  Stack canaries: %s (-fstack-protector-strong)\n",
             g_security.canaries ? "ENABLED" : "DISABLED");
     pr_info("  kptr_restrict:  %d\n", g_security.kptr_restrict);
