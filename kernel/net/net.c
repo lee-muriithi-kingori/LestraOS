@@ -39,17 +39,29 @@ extern mac_addr_t virtio_net_get_mac(void);
 extern int        virtio_net_send(const void* data, uint16_t len);
 extern int        virtio_net_recv(void* buf, uint16_t bufsz);
 
-/* Active NIC driver selector: VirtIO-net is preferred on KVM/QEMU,
- * e1000 is the fallback for bare-metal Intel NICs. */
-static int        use_virtio_net = 0;
+/* RTL8139 driver entry points (defined in drivers/net/rtl8139.c) */
+extern int        rtl8139_init(void);
+extern int        rtl8139_is_present(void);
+extern mac_addr_t rtl8139_get_mac(void);
+extern int        rtl8139_send(const void* data, uint16_t len);
+extern int        rtl8139_recv(void* buf, uint16_t bufsz);
+
+/* Active NIC driver selector.
+ * 0 = e1000 (default Intel NIC)
+ * 1 = virtio-net
+ * 2 = rtl8139 (Realtek 10/100)
+ */
+static int        active_nic = 0;
 
 /* Unified driver wrappers — route through the active NIC driver */
 static int net_driver_send(const void* data, uint16_t len) {
-    if (use_virtio_net) return virtio_net_send(data, len);
+    if (active_nic == 1) return virtio_net_send(data, len);
+    if (active_nic == 2) return rtl8139_send(data, len);
     return e1000_send(data, len);
 }
 static int net_driver_recv(void* buf, uint16_t bufsz) {
-    if (use_virtio_net) return virtio_net_recv(buf, bufsz);
+    if (active_nic == 1) return virtio_net_recv(buf, bufsz);
+    if (active_nic == 2) return rtl8139_recv(buf, bufsz);
     return e1000_recv(buf, bufsz);
 }
 
@@ -1505,17 +1517,23 @@ static void handle_ethernet(uint8_t* data, uint16_t len) {
 /* ----- public API ----- */
 void net_init(void) {
     pr_info("net: initializing network stack\n");
-    /* Try VirtIO-net first (preferred on KVM/QEMU VPS), then e1000 */
+    /* Try VirtIO-net first (preferred on KVM/QEMU VPS),
+     * then E1000, then RTL8139 (real hardware 10/100 NIC). */
     if (virtio_net_init()) {
-        use_virtio_net = 1;
+        active_nic = 1;
         net_iface_name = "virtio_net";
         my_mac = virtio_net_get_mac();
         pr_info("net: using VirtIO-net driver\n");
     } else if (e1000_init()) {
-        use_virtio_net = 0;
+        active_nic = 0;
         net_iface_name = "e1000";
         my_mac = e1000_get_mac();
         pr_info("net: using E1000 driver\n");
+    } else if (rtl8139_init()) {
+        active_nic = 2;
+        net_iface_name = "rtl8139";
+        my_mac = rtl8139_get_mac();
+        pr_info("net: using RTL8139 driver\n");
     } else {
         pr_warn("net: no NIC - networking disabled\n");
         return;
