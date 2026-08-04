@@ -14,10 +14,14 @@
 - **TIER 5 (KE-6)**: Minimal ASLR (stack 12-bit, brk 8-bit), USER_STACK_TOP dedup
 - **KE-7**: Last SMAP violations eliminated (sys_bind/connect/accept + linux_compat)
 
-### Driver Infrastructure (KE-9)
-- **PCI bus enumeration**: Shared pci.c/pci.h, `lspci` command, 7 drivers migrated
-- Eliminated 7 duplicate PCI code copies (211 lines deleted, 180-line shared module)
-- `pci_find_device(vendor, device)` and `pci_find_class(class, subclass)` ready
+### Driver Infrastructure
+- **KE-9**: PCI bus enumeration (shared pci.c/pci.h, lspci, 7 drivers migrated)
+- **KE-10**: RTL8139 10/100 NIC driver (first real-hardware NIC, IO-port based)
+
+### Supported NIC Drivers (3 total)
+1. **VirtIO-net** (preferred on KVM/QEMU, MMIO or IO-port)
+2. **Intel E1000** (82540EM, MMIO)
+3. **Realtek RTL8139** (10/100 Fast Ethernet, IO-port, first real-hardware NIC)
 
 ### Active Protections (all boot-verified on qemu64,+smep,+smap)
 - SMEP: ENABLED (CR4 bit 20)
@@ -29,32 +33,38 @@
 - KASLR-lite: DISABLED (pending)
 
 ### Pending Work (priority order)
-1. **Fix GP fault in user_map_page** during gui-mode /init ELF loading (ldso stack not mapped into user_pml4)
-2. **KASLR-lite**: Randomize kernel base address
-3. **Interrupt-mixed entropy pool** (currently TSC-only, INSECURE)
-4. **RTL8139 NIC driver** — now easy via pci_find_device(0x10EC, 0x8139)
-5. **AHCI write support**, USB, framebuffer fonts
+1. **Debug RTL8139 RX** (TX works, DHCP sends but no replies received yet)
+2. **Fix GP fault in user_map_page** during gui-mode /init ELF loading
+3. **NIC driver abstraction refactor** (struct nic_ops, eliminate active_nic switch)
+4. **KASLR-lite**: Randomize kernel base address
+5. **Interrupt-mixed entropy pool** (currently TSC-only, INSECURE)
+6. **More drivers**: USB, FAT32, framebuffer fonts
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
 - Source env: `source /home/z/.local/opt/devtools/env.sh`
 - Build: `source /home/z/.local/opt/devtools/env.sh && make clean && make all && make iso`
 - QEMU firmware: symlink qemu-data -> /home/z/.local/opt/devtools/qemu-data
-- Boot test (SMEP+SMAP): `source env.sh && qemu-system-x86_64 -cdrom build/lestraos.iso -m 256M -cpu qemu64,+smep,+smap -serial stdio -display none -boot d -net none -L qemu-data`
+- Boot test: `cd /lestraOS && ( timeout 15 bash -c 'source env.sh && timeout 15 qemu-system-x86_64 ...' )`
+- QEMU with RTL8139: add `-device rtl8139,netdev=net0`
+- QEMU with E1000: add `-device e1000,netdev=net0`
 - GitHub PAT: /home/z/my-project/upload/hlee (read via od -c to bypass redaction)
 - GitHub repo: lee-muriithi-kingori/LestraOS (branch: main, admin bypasses protection)
 
 ### Known Issues
-- GUI boot (/init ELF loading) hits GP fault in user_map_page at RIP ~0x16bb5f — deferred (ldso stack mapping TODO)
+- GUI boot (/init ELF loading) hits GP fault in user_map_page at RIP ~0x16bb5f — deferred
+- RTL8139 RX path not yet receiving (TX/DHCP sends work, wrap logic may need debug)
 - CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero
 - sys_mmap returns kmalloc pointers, not real VMAs — needs vmm_map_page
 - sys_futex is a no-op stub
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+982f223 drivers: KE-10 RTL8139 10/100 NIC driver (first real-hardware NIC)
 c71cfb2 drivers: KE-9 shared PCI bus enumeration + lspci, migrate 7 drivers
-2ec024a docs: KE-8 changelog + sync MEMORY.md
+00ed0d6 docs: KE-9 changelog + sync MEMORY.md
 7d8df72 security: KE-8 TIER 2c execve/ldso argv/envp hardening + auxv layout fix
+2ec024a docs: KE-8 changelog + sync MEMORY.md
 27f1987 docs: sync MEMORY.md — KE-7 last SMAP violations eliminated
 035ff88 security: KE-7 eliminate last SMAP violations in syscalls + linux_compat
 8db0e8d docs: sync MEMORY.md — KE-6 TIER 5 ASLR + deduplicated USER_STACK_TOP
