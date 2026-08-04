@@ -39,6 +39,7 @@
 #include <lestra/printk.h>
 #include <lestra/mm.h>
 #include <lestra/vfs.h>
+#include <lestra/uaccess.h>
 #include <string.h>
 
 /* ============================================================
@@ -978,9 +979,28 @@ int ldso_load_and_run(const char* exe_path, int argc, char** argv, char** envp) 
         }
     }
 
-    /* Build the initial stack: argc, argv[], NULL, envp[], NULL, auxv[]. */
-    /* For now we just set up argc/argv. Real Linux also passes envp and
-     * auxv (AT_PHDR, AT_ENTRY, AT_PAGESZ, etc.) which glibc reads. */
+    /* Build the initial user stack: argc, argv[], NULL, envp[], NULL, auxv[].
+     * TIER 2c: argv/envp are now kernel-side pointers (already copied
+     * from user space by sys_execve via copy_argvec_from_user). We write
+     * them directly since we're still in kernel mode.
+     *
+     * Layout (Linux ABI):
+     *   sp[0]         = argc
+     *   sp[1..argc]   = argv[0..argc-1]  (user-space pointers)
+     *   sp[argc+1]   = NULL
+     *   sp[argc+2..]  = envp[0..envc-1]  (user-space pointers)
+     *   sp[argc+2+envc] = NULL
+     *   sp[...]      = auxv pairs (AT_TYPE, value)
+     *   sp[...]      = AT_NULL, 0  (auxv terminator)
+     */
+
+    /* Count envp (kernel-side NULL-terminated array). */
+    int envc = 0;
+    if (envp) {
+        while (envp[envc]) envc++;
+        if (envc > LESTRA_ARG_MAX) envc = LESTRA_ARG_MAX;
+    }
+
     extern phys_addr_t pmm_alloc_page(void);
     /* ASLR: randomize stack top, same pattern as elf.c. */
     uint64_t stack_slide = (csprng_u64() & ((1ULL << ASLR_STACK_BITS) - 1)) << 12;
@@ -992,30 +1012,26 @@ int ldso_load_and_run(const char* exe_path, int argc, char** argv, char** envp) 
      * computed and passed to elf_jump_to_user.) */
     (void)stack_size;
 
-    /* Place argc + argv on the top of the stack. */
-    uint64_t* sp = (uint64_t*)(stack_top - 256);
-    sp[0] = (uint64_t)argc;
-    for (int i = 0; i < argc; i++) {
-        sp[1 + i] = (uint64_t)argv[i];
-    }
-    sp[1 + argc] = 0;     /* argv NULL terminator */
-    /* envp */
-    if (envp) {
-        int e = 0;
-        while (envp[e]) {
-            sp[2 + argc + e] = (uint64_t)envp[e];
-            e++;
-        }
-        sp[2 + argc + e] = 0;
-    } else {
-        sp[2 + argc] = 0;
-    }
-    /* auxv — just AT_NULL. */
-    sp[3 + argc] = 0;   /* AT_NULL type */
-    sp[4 + argc] = 0;   /* value */
+    /* Calculate total slots needed: 1 (argc) + argc + 1 (NULL) +
+     * envc + 1 (NULL) + 2 (AT_NULL pair) = argc + envc + 5 */
+    int total_slots = argc + envc + 5;
+    if (total_slots > 64) total_slots = 64; /* safety clamp */
+    uint64_t* sp = (uint64_t*)(stack_top - (unsigned)total_slots * 8);
+    int idx = 0;
 
-    pr_info("ldso: jumping to user entry 0x%x (sp=0x%x)\n",
-            (unsigned)exe->entry, (unsigned)(uintptr_t)sp);
+    sp[idx++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++)
+        sp[idx++] = (uint64_t)argv[i];
+    sp[idx++] = 0;  /* argv NULL terminator */
+    for (int i = 0; i < envc; i++)
+        sp[idx++] = (uint64_t)envp[i];
+    sp[idx++] = 0;  /* envp NULL terminator */
+    /* auxv — just AT_NULL. */
+    sp[idx++] = 0;  /* AT_NULL type */
+    sp[idx++] = 0;  /* value */
+
+    pr_info("ldso: argc=%d envc=%d entry=0x%x sp=0x%x",
+            argc, envc, (unsigned)exe->entry, (unsigned)(uintptr_t)sp);
 
     /* Jump to ring 3. */
     elf_jump_to_user(exe->entry, (uint64_t)sp, (uintptr_t)user_pml4);

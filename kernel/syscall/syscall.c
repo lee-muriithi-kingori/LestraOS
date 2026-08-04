@@ -548,20 +548,48 @@ static int64_t sys_execve(const char* path, char* const argv[], char* const envp
     if (rc < 0) return -EFAULT;
     if (rc == 0 || kpath[0] == '\0') return -EINVAL;
 
-    /* If the binary is dynamically linked, hand off to the in-kernel
-     * dynamic linker (ldso.c). Otherwise, run the static ELF loader.
-     * ldso_is_dynamic does a cheap peek at PT_INTERP/PT_DYNAMIC.
-     * NOTE: argv/envp are still passed as raw user pointers — the
-     * ldso/elf layer is responsible for copying them in. Converting
-     * that layer is TIER 2c (deferred). */
-    if (ldso_is_dynamic(kpath)) {
-        pr_info("syscall: execve(%s) -> ldso_load_and_run\n", kpath);
-        return (int64_t)ldso_load_and_run(kpath,
-                                          argv ? (int)0 : 0,
-                                          (char**)argv,
-                                          (char**)envp);
+    /* TIER 2c: Copy argv/envp from user space into kernel buffers.
+     * This is required for SMAP correctness (we must not dereference
+     * user pointers in the ldso/elf layer) and for proper validation
+     * (LESTRA_ARG_MAX / LESTRA_ARG_BYTES_MAX caps).
+     * We use static buffers because (a) only one execve can be
+     * in-flight at a time (it never returns on success), and (b)
+     * the kernel stack is tight. */
+    static char k_strings[LESTRA_ARG_BYTES_MAX];
+    char *k_argv[LESTRA_ARG_MAX + 1];
+    char *k_envp[LESTRA_ARG_MAX + 1];
+    int k_argc = 0, k_envc = 0;
+    memset(k_argv, 0, sizeof(k_argv));
+    memset(k_envp, 0, sizeof(k_envp));
+
+    if (argv) {
+        rc = copy_argvec_from_user((const char* const*)argv,
+                                      k_argv, k_strings,
+                                      sizeof(k_strings), &k_argc);
+        if (rc < 0) return rc;
     }
-    pr_info("syscall: execve(%s) -> elf_exec\n", kpath);
+
+    /* For envp, append into the same k_strings buffer after argv strings. */
+    if (envp) {
+        unsigned long env_off = 0;
+        for (int i = 0; i < k_argc; i++) {
+            if (k_argv[i]) env_off += strlen(k_argv[i]) + 1;
+        }
+        rc = copy_argvec_from_user((const char* const*)envp,
+                                      k_envp, k_strings + env_off,
+                                      sizeof(k_strings) - env_off, &k_envc);
+        if (rc < 0) return rc;
+    }
+
+    pr_info("syscall: execve(%s) argc=%d envc=%d", kpath, k_argc, k_envc);
+
+    /* If the binary is dynamically linked, hand off to the in-kernel
+     * dynamic linker. TIER 2c: argv/envp are now kernel-side pointers. */
+    if (ldso_is_dynamic(kpath)) {
+        pr_info(" -> ldso_load_and_run\n");
+        return (int64_t)ldso_load_and_run(kpath, k_argc, k_argv, k_envp);
+    }
+    pr_info(" -> elf_exec\n");
     return (int64_t)elf_exec(kpath);
 }
 
