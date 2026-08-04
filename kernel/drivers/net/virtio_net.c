@@ -19,46 +19,8 @@
 #include <lestra/types.h>
 #include <lestra/net.h>
 #include <lestra/printk.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-/* ========================================================================
- * PCI config space access (same mechanism as e1000.c / ahci.c)
- * ======================================================================== */
-
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-
-static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, v);
-}
-
-/* Read a 16-bit word from PCI config space (split across 32-bit regs) */
-static inline uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t word = pci_read32(bus, dev, func, off & 0xFC);
-    return (uint16_t)((word >> ((off & 2) * 8)) & 0xFFFF);
-}
-
-/* Read a 8-bit byte from PCI config space */
-static inline uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t word = pci_read32(bus, dev, func, off & 0xFC);
-    return (uint8_t)((word >> ((off & 3) * 8)) & 0xFF);
-}
 
 /* ========================================================================
  * VirtIO PCI Legacy Register Offsets (byte offsets within BAR0 IO region)
@@ -493,7 +455,7 @@ static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
                                 uintptr_t* bar0_out) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = (id >> 16) & 0xFFFF;
@@ -504,13 +466,13 @@ static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
             /* Modern-only VirtIO-net: device 0x1041 */
             int is_net = 0;
             if (device == 0x1000) {
-                uint16_t subsystem_id = pci_read16(0, d, f, 0x2E);
+                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
                 if (subsystem_id == 1) is_net = 1;
             } else if (device == 0x1041) {
                 is_net = 1;
             } else if (device >= 0x1040 && device <= 0x107F) {
                 /* Modern device ID range; check subsystem */
-                uint16_t subsystem_id = pci_read16(0, d, f, 0x2E);
+                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
                 if (subsystem_id == 1) is_net = 1;
             }
 
@@ -519,13 +481,13 @@ static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
             *bus = 0; *dev = d; *func = f;
 
             /* Read BAR0 (legacy IO port base) */
-            uint32_t b0 = pci_read32(0, d, f, 0x10);
+            uint32_t b0 = pci_config_read32(0, d, f, 0x10);
             *bar0_out = b0;
 
             /* Enable the device: IOSE | MSE | BME */
-            uint32_t cmd = pci_read32(0, d, f, 0x04);
+            uint32_t cmd = pci_config_read32(0, d, f, 0x04);
             cmd |= 0x7;
-            pci_write32(0, d, f, 0x04, cmd);
+            pci_config_write32(0, d, f, 0x04, cmd);
 
             pr_info("virtio_net: found at PCI 00:%u.%u, device=0x%x, BAR0=0x%x\n",
                     (unsigned)d, (unsigned)f, (unsigned)device, (unsigned)b0);
@@ -545,7 +507,7 @@ static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
 static int vnet_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
     /* Cache all BAR base addresses */
     for (int i = 0; i < 6; i++) {
-        uint32_t bar_val = pci_read32(bus, dev, func, 0x10 + i * 4);
+        uint32_t bar_val = pci_config_read32(bus, dev, func, 0x10 + i * 4);
         if (bar_val == 0 || bar_val == 0xFFFFFFFFu) {
             vnet_bars[i] = 0;
             continue;
@@ -562,7 +524,7 @@ static int vnet_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
             } else if (bar_type == 2) {
                 /* 64-bit MMIO - need upper half */
                 if (i + 1 < 6) {
-                    uint32_t bar_hi = pci_read32(bus, dev, func, 0x10 + (i + 1) * 4);
+                    uint32_t bar_hi = pci_config_read32(bus, dev, func, 0x10 + (i + 1) * 4);
                     vnet_bars[i] = (bar_val & ~0xFu) | ((uint64_t)bar_hi << 32);
                     vnet_bars[i + 1] = 0; /* upper half consumed */
                 } else {
@@ -575,24 +537,24 @@ static int vnet_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
     }
 
     /* Walk PCI capability list starting at offset 0x34 */
-    uint8_t cap_off = pci_read8(bus, dev, func, 0x34);
+    uint8_t cap_off = pci_config_read8(bus, dev, func, 0x34);
     int found_caps = 0;
 
     while (cap_off != 0 && cap_off != 0xFF) {
-        uint8_t cap_id = pci_read8(bus, dev, func, cap_off);
+        uint8_t cap_id = pci_config_read8(bus, dev, func, cap_off);
         if (cap_id != VIRTIO_PCI_CAP_ID) {
             /* Not a VirtIO capability, skip */
-            uint8_t next = pci_read8(bus, dev, func, cap_off + 1);
+            uint8_t next = pci_config_read8(bus, dev, func, cap_off + 1);
             cap_off = next;
             continue;
         }
 
         /* Read the VirtIO PCI capability structure */
         struct virtio_pci_cap cap;
-        uint32_t cap_word0 = pci_read32(bus, dev, func, cap_off);
-        uint32_t cap_word1 = pci_read32(bus, dev, func, cap_off + 4);
-        uint32_t cap_word2 = pci_read32(bus, dev, func, cap_off + 8);
-        uint32_t cap_word3 = pci_read32(bus, dev, func, cap_off + 12);
+        uint32_t cap_word0 = pci_config_read32(bus, dev, func, cap_off);
+        uint32_t cap_word1 = pci_config_read32(bus, dev, func, cap_off + 4);
+        uint32_t cap_word2 = pci_config_read32(bus, dev, func, cap_off + 8);
+        uint32_t cap_word3 = pci_config_read32(bus, dev, func, cap_off + 12);
 
         /* Parse the capability (little-endian layout) */
         cap.cap_vndr  = (uint8_t)(cap_word0 & 0xFF);
@@ -627,7 +589,7 @@ static int vnet_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
             vnet_notify_cfg_addr = struct_addr;
             vnet_notify_cfg_bar  = cap.bar;
             /* Read notify_off_multiplier (additional 32-bit field) */
-            vnet_notify_off_mult = pci_read32(bus, dev, func, cap_off + 16);
+            vnet_notify_off_mult = pci_config_read32(bus, dev, func, cap_off + 16);
             found_caps++;
             break;
         case VIRTIO_PCI_CAP_ISR_CFG:

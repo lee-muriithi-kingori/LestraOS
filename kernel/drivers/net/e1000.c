@@ -16,30 +16,8 @@
 #include <lestra/net.h>
 #include <lestra/printk.h>
 #include <lestra/panic.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-/* PCI config space access via ports 0xCF8 / 0xCFC */
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, v);
-}
 
 /* E1000 register offsets (relative to BAR0 MMIO base) */
 #define E1000_CTRL      0x0000
@@ -172,18 +150,18 @@ static uint16_t eeprom_read(uint8_t addr) {
 static int pci_find_e1000(uint8_t* bus, uint8_t* dev, uint8_t* func, uintptr_t* bar0) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = (id >> 16) & 0xFFFF;
             if (vendor == 0x8086 && (device == 0x100E || device == 0x100F
                                    || device == 0x10D3 /* 82574L */)) {
                 *bus = 0; *dev = d; *func = f;
-                uint32_t b0 = pci_read32(0, d, f, 0x10);
+                uint32_t b0 = pci_config_read32(0, d, f, 0x10);
                 *bar0 = b0 & ~0xFu;
-                uint32_t cmd = pci_read32(0, d, f, 0x04);
+                uint32_t cmd = pci_config_read32(0, d, f, 0x04);
                 cmd |= 0x7;  /* IOSE | MSE | BME */
-                pci_write32(0, d, f, 0x04, cmd);
+                pci_config_write32(0, d, f, 0x04, cmd);
                 return 1;
             }
         }

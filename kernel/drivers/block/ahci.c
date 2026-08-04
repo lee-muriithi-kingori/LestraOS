@@ -11,25 +11,8 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-/* PCI config space */
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8) | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-
-static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8) | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, v);
-}
 
 /* AHCI register offsets */
 #define AHCI_GHC        0x04
@@ -101,9 +84,9 @@ static inline void port_write(int port, uint32_t off, uint32_t val) {
 static int ahci_find_hba(uint8_t* bus, uint8_t* dev, uint8_t* func) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
-            uint32_t class_code = pci_read32(0, d, f, 0x08);
+            uint32_t class_code = pci_config_read32(0, d, f, 0x08);
             uint8_t base_class = (class_code >> 24) & 0xFF;
             uint8_t subclass = (class_code >> 16) & 0xFF;
             if (base_class == 0x01 && subclass == 0x06) {
@@ -127,12 +110,12 @@ int ahci_init(void) {
         return 0;
     }
 
-    uint32_t bar5 = pci_read32(bus, dev, func, 0x24);
+    uint32_t bar5 = pci_config_read32(bus, dev, func, 0x24);
     ahci_abar = bar5 & ~0xFu;
     pr_info("ahci: ABAR = 0x%x\n", (unsigned)ahci_abar);
 
-    uint32_t cmd_reg = pci_read32(bus, dev, func, 0x04);
-    pci_write32(bus, dev, func, 0x04, cmd_reg | 0x7);
+    uint32_t cmd_reg = pci_config_read32(bus, dev, func, 0x04);
+    pci_config_write32(bus, dev, func, 0x04, cmd_reg | 0x7);
 
     uint32_t ghc = ahci_read(AHCI_GHC);
     ahci_write(AHCI_GHC, ghc | GHC_AE);

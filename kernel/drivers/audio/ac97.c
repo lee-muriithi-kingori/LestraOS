@@ -9,24 +9,8 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8) | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-
-static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8) | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, v);
-}
 
 #define NABM_PCM_OUT_BD_LIST  0x10
 #define NABM_PCM_OUT_CIV      0x14
@@ -74,9 +58,9 @@ static inline void nam_write16(uint8_t offset, uint16_t val) {
 static int ac97_find(uint8_t* bus, uint8_t* dev, uint8_t* func) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
-            uint32_t class_code = pci_read32(0, d, f, 0x08);
+            uint32_t class_code = pci_config_read32(0, d, f, 0x08);
             uint8_t base_class = (class_code >> 24) & 0xFF;
             uint8_t subclass = (class_code >> 16) & 0xFF;
             if (base_class == 0x04 && subclass == 0x01) {
@@ -99,13 +83,13 @@ int ac97_init(void) {
         return 0;
     }
 
-    uint32_t bar0 = pci_read32(bus, dev, func, 0x10);
-    uint32_t bar1 = pci_read32(bus, dev, func, 0x14);
+    uint32_t bar0 = pci_config_read32(bus, dev, func, 0x10);
+    uint32_t bar1 = pci_config_read32(bus, dev, func, 0x14);
     nabm_base = bar0 & ~0xFu;
     nam_base = bar1 & ~0xFu;
 
-    uint32_t cmd = pci_read32(bus, dev, func, 0x04);
-    pci_write32(bus, dev, func, 0x04, cmd | 0x5);
+    uint32_t cmd = pci_config_read32(bus, dev, func, 0x04);
+    pci_config_write32(bus, dev, func, 0x04, cmd | 0x5);
 
     pr_info("ac97: found at PCI 00:%u.%u, NABM=0x%x, NAM=0x%x\n",
             (unsigned)dev, (unsigned)func,

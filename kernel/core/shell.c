@@ -34,6 +34,7 @@
 #include <lestra/ssh_server.h>
 #include <lestra/firewall.h>
 #include <lestra/serial.h>
+#include <lestra/pci.h>
 #include <string.h>
 
 #define CMD_MAX_LEN  512
@@ -169,6 +170,10 @@ static void cmd_help(void) {
     printk("    file mkdir <path>       Create a directory\n");
     printk("    file rm <path>          Remove a file\n");
     printk("    file stat <path>        Show file info\n");
+    printk("\n");
+    printk("  Hardware:\n");
+    printk("    lspci        List PCI devices\n");
+    printk("    sysinfo      Show full system information\n");
     printk("\n");
     printk("  Other:\n");
     printk("    lee          Sandbox and service manager\n");
@@ -2246,6 +2251,27 @@ static void execute_command(void) {
         /* Cron */
         printk("Cron:      %d tasks\n", cron_count());
         printk("==========================\n\n");
+    }
+    else if (strcmp(cmd, "lspci") == 0) {
+        printk("\n=== PCI Device List ===\n");
+        int count = pci_get_device_count();
+        if (count == 0) {
+            printk("No PCI devices found.\n");
+        } else {
+            for (int i = 0; i < count; i++) {
+                struct pci_device *d = pci_get_device(i);
+                printk("%02x:%02x.%x %04x:%04x  %s [%02x:%02x.%x]  irq=%d",
+                       d->bus, d->dev, d->func,
+                       d->vendor_id, d->device_id,
+                       pci_class_name(d->class_code),
+                       d->class_code, d->subclass, d->prog_if,
+                       d->irq_line);
+                if (d->bar[0])
+                    printk("  bar0=0x%x", d->bar[0]);
+                printk("\n");
+            }
+        }
+        printk("========================\n\n");
     }
     else if (strcmp(cmd, "exit") == 0) {
         printk("Shell exiting... (system will halt)\n");

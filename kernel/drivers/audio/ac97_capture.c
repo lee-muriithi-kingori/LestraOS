@@ -39,17 +39,8 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8) | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
 
 /* NABM PCM-in register offsets */
 #define NABM_PCM_IN_BD_LIST  0x00
@@ -124,9 +115,9 @@ static inline void cap_nam_write16(uint8_t offset, uint16_t val) {
 static int cap_find_ac97(uint8_t* bus, uint8_t* dev, uint8_t* func) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
-            uint32_t class_code = pci_read32(0, d, f, 0x08);
+            uint32_t class_code = pci_config_read32(0, d, f, 0x08);
             uint8_t base_class = (class_code >> 24) & 0xFF;
             uint8_t subclass   = (class_code >> 16) & 0xFF;
             if (base_class == 0x04 && subclass == 0x01) {
@@ -148,8 +139,8 @@ int ac97_capture_init(void) {
         return 0;
     }
 
-    uint32_t bar0 = pci_read32(bus, dev, func, 0x10);
-    uint32_t bar1 = pci_read32(bus, dev, func, 0x14);
+    uint32_t bar0 = pci_config_read32(bus, dev, func, 0x10);
+    uint32_t bar1 = pci_config_read32(bus, dev, func, 0x14);
     cap_nabm_base = bar0 & ~0xFu;
     cap_nam_base  = bar1 & ~0xFu;
 

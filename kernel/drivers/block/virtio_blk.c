@@ -19,44 +19,8 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
+#include <lestra/pci.h>
 #include <string.h>
-
-/* ========================================================================
- * PCI config space access (same mechanism as ahci.c / e1000.c)
- * ======================================================================== */
-
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
-
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-
-static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t v) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    outl(PCI_DATA, v);
-}
-
-static inline uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t word = pci_read32(bus, dev, func, off & 0xFC);
-    return (uint16_t)((word >> ((off & 2) * 8)) & 0xFFFF);
-}
-
-static inline uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t word = pci_read32(bus, dev, func, off & 0xFC);
-    return (uint8_t)((word >> ((off & 3) * 8)) & 0xFF);
-}
 
 /* ========================================================================
  * VirtIO PCI Legacy Register Offsets (within BAR0 IO region)
@@ -410,7 +374,7 @@ static uint64_t vblk_read_config64(uint8_t off) {
 static int pci_find_virtio_blk(uint8_t* bus, uint8_t* dev, uint8_t* func) {
     for (uint8_t d = 0; d < 32; d++) {
         for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_read32(0, d, f, 0);
+            uint32_t id = pci_config_read32(0, d, f, 0);
             if (id == 0xFFFFFFFFu) continue;
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = (id >> 16) & 0xFFFF;
@@ -419,12 +383,12 @@ static int pci_find_virtio_blk(uint8_t* bus, uint8_t* dev, uint8_t* func) {
 
             int is_blk = 0;
             if (device == 0x1001) {
-                uint16_t subsystem_id = pci_read16(0, d, f, 0x2E);
+                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
                 if (subsystem_id == 2) is_blk = 1;
             } else if (device == 0x1042) {
                 is_blk = 1;
             } else if (device >= 0x1040 && device <= 0x107F) {
-                uint16_t subsystem_id = pci_read16(0, d, f, 0x2E);
+                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
                 if (subsystem_id == 2) is_blk = 1;
             }
 
@@ -433,9 +397,9 @@ static int pci_find_virtio_blk(uint8_t* bus, uint8_t* dev, uint8_t* func) {
             *bus = 0; *dev = d; *func = f;
 
             /* Enable device */
-            uint32_t cmd = pci_read32(0, d, f, 0x04);
+            uint32_t cmd = pci_config_read32(0, d, f, 0x04);
             cmd |= 0x7;
-            pci_write32(0, d, f, 0x04, cmd);
+            pci_config_write32(0, d, f, 0x04, cmd);
 
             pr_info("virtio_blk: found at PCI 00:%u.%u, device=0x%x\n",
                     (unsigned)d, (unsigned)f, (unsigned)device);
@@ -452,7 +416,7 @@ static int pci_find_virtio_blk(uint8_t* bus, uint8_t* dev, uint8_t* func) {
 static int vblk_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
     /* Cache BAR base addresses */
     for (int i = 0; i < 6; i++) {
-        uint32_t bar_val = pci_read32(bus, dev, func, 0x10 + i * 4);
+        uint32_t bar_val = pci_config_read32(bus, dev, func, 0x10 + i * 4);
         if (bar_val == 0 || bar_val == 0xFFFFFFFFu) {
             vblk_bars[i] = 0;
             continue;
@@ -464,7 +428,7 @@ static int vblk_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
             if (bar_type == 0) {
                 vblk_bars[i] = bar_val & ~0xFu;
             } else if (bar_type == 2 && i + 1 < 6) {
-                uint32_t bar_hi = pci_read32(bus, dev, func, 0x10 + (i + 1) * 4);
+                uint32_t bar_hi = pci_config_read32(bus, dev, func, 0x10 + (i + 1) * 4);
                 vblk_bars[i] = (bar_val & ~0xFu) | ((uint64_t)bar_hi << 32);
                 vblk_bars[i + 1] = 0;
             } else {
@@ -474,21 +438,21 @@ static int vblk_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
     }
 
     /* Walk PCI capability list */
-    uint8_t cap_off = pci_read8(bus, dev, func, 0x34);
+    uint8_t cap_off = pci_config_read8(bus, dev, func, 0x34);
     int found = 0;
 
     while (cap_off != 0 && cap_off != 0xFF) {
-        uint8_t cap_id = pci_read8(bus, dev, func, cap_off);
+        uint8_t cap_id = pci_config_read8(bus, dev, func, cap_off);
         if (cap_id != VIRTIO_PCI_CAP_ID) {
-            cap_off = pci_read8(bus, dev, func, cap_off + 1);
+            cap_off = pci_config_read8(bus, dev, func, cap_off + 1);
             continue;
         }
 
         struct virtio_pci_cap cap;
-        uint32_t w0 = pci_read32(bus, dev, func, cap_off);
-        uint32_t w1 = pci_read32(bus, dev, func, cap_off + 4);
-        uint32_t w2 = pci_read32(bus, dev, func, cap_off + 8);
-        uint32_t w3 = pci_read32(bus, dev, func, cap_off + 12);
+        uint32_t w0 = pci_config_read32(bus, dev, func, cap_off);
+        uint32_t w1 = pci_config_read32(bus, dev, func, cap_off + 4);
+        uint32_t w2 = pci_config_read32(bus, dev, func, cap_off + 8);
+        uint32_t w3 = pci_config_read32(bus, dev, func, cap_off + 12);
 
         cap.cap_vndr  = (uint8_t)(w0 & 0xFF);
         cap.cap_next  = (uint8_t)((w0 >> 8) & 0xFF);
@@ -512,7 +476,7 @@ static int vblk_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
             break;
         case VIRTIO_PCI_CAP_NOTIFY_CFG:
             vblk_notify_cfg_addr = struct_addr;
-            vblk_notify_off_mult = pci_read32(bus, dev, func, cap_off + 16);
+            vblk_notify_off_mult = pci_config_read32(bus, dev, func, cap_off + 16);
             found++;
             break;
         case VIRTIO_PCI_CAP_ISR_CFG:
@@ -634,7 +598,7 @@ int virtio_blk_init(void) {
     } else {
         vblk_is_modern = 0;
         /* Read BAR0 for legacy IO base */
-        uint32_t bar0 = pci_read32(bus, dev, func, 0x10);
+        uint32_t bar0 = pci_config_read32(bus, dev, func, 0x10);
         vblk_io_base = (uint16_t)(bar0 & ~0x3u);
         pr_info("virtio_blk: legacy transport, IO base=0x%x\n", (unsigned)vblk_io_base);
     }

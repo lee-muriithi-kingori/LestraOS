@@ -371,6 +371,11 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing AI subsystem...\n");
     ai_init();
 
+    /* Scan PCI bus — populates device table used by NIC, AHCI, audio, etc. */
+    pr_info("Scanning PCI bus...\n");
+    extern void pci_init(void);
+    pci_init();
+
     /* Initialize networking (E1000 driver + DHCP + TCP/IP + HTTP client).
      * Non-fatal if no NIC present - kernel still runs without network. */
     pr_info("Initializing network stack...\n");

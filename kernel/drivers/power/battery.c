@@ -16,10 +16,7 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/power.h>
-
-/* PCI config space access via ports 0xCF8 / 0xCFC. */
-#define PCI_ADDR  0xCF8
-#define PCI_DATA  0xCFC
+#include <lestra/pci.h>
 
 /* Intel PIIX4 ACPI PM device (QEMU's default southbridge). */
 #define PIIX4_ACPI_VENDOR  0x8086
@@ -36,16 +33,6 @@
 #define SIM_CHARGING  0
 #define SIM_STATUS    "Full"
 
-static inline uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    uint32_t addr = (uint32_t)0x80000000u
-                  | ((uint32_t)bus << 16)
-                  | ((uint32_t)dev << 11)
-                  | ((uint32_t)func << 8)
-                  | (off & 0xFC);
-    outl(PCI_ADDR, addr);
-    return inl(PCI_DATA);
-}
-
 /* Internal state. */
 static int battery_present = 0;   /* Real battery detected            */
 static int acpi_present    = 0;   /* ACPI PM device detected          */
@@ -59,14 +46,14 @@ static int initialized     = 0;
 static int scan_for_acpi(void) {
     for (uint16_t dev = 0; dev < 32; dev++) {
         for (uint8_t func = 0; func < 8; func++) {
-            uint32_t vd = pci_read32(0, (uint8_t)dev, func, 0x00);
+            uint32_t vd = pci_config_read32(0, (uint8_t)dev, func, 0x00);
             uint16_t vendor = (uint16_t)(vd & 0xFFFF);
             uint16_t device = (uint16_t)(vd >> 16);
             if (vendor == 0xFFFF || vendor == 0x0000) {
                 continue;
             }
 
-            uint32_t class_code = pci_read32(0, (uint8_t)dev, func, 0x08);
+            uint32_t class_code = pci_config_read32(0, (uint8_t)dev, func, 0x08);
             uint8_t baseclass = (uint8_t)((class_code >> 24) & 0xFF);
             uint8_t subclass  = (uint8_t)((class_code >> 16) & 0xFF);
 
