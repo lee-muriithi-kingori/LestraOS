@@ -8,6 +8,8 @@
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 
+extern struct security_status g_security;
+
 /* GDT entries:
  * 0: Null descriptor
  * 1: Kernel code segment (64-bit)
@@ -137,5 +139,24 @@ void gdt_init(void) {
     tss_set_entry(5, &tss);
     ltr_load(TSS_SEG);
 
+    /* TIER 3: Enable SMEP (CR4 bit 20) and SMAP (CR4 bit 21).
+     * All boot-critical syscall paths now use uaccess.h wrappers
+     * (TIER 2) and bounce buffers (TIER 2b), so kernel access to
+     * user memory goes through stac/clac or copy_from_user/copy_to_user.
+     * Only flip if CPU actually supports the feature. */
+    uint64_t cr4 = read_cr4();
+    if (cpu_has_smep()) {
+        cr4 |= (1UL << 20);
+        g_security.smep = 1;
+    }
+    if (cpu_has_smap()) {
+        cr4 |= (1UL << 21);
+        g_security.smap = 1;
+    }
+    write_cr4(cr4);
+
     pr_debug("GDT initialized with 6 entries (5 code/data + TSS, IST1 #DF stack)\n");
+    pr_debug("SMEP: %s  SMAP: %s\n",
+              g_security.smep ? "ENABLED" : "not available",
+              g_security.smap ? "ENABLED" : "not available");
 }

@@ -98,15 +98,15 @@ void sched_set_clear_child_tid(int pid, void* addr) {
 static void clear_kernel_user_bits(uint64_t* pml4) {
     for (int p4 = 0; p4 < 4; p4++) {
         if (!(pml4[p4] & PAGE_PRESENT)) continue;
-        uint64_t* pdpt = (uint64_t*)(pml4[p4] & ~0xFFFULL);
+        uint64_t* pdpt = (uint64_t*)(pml4[p4] & PTE_PHYS_MASK);
         for (int p3 = 0; p3 < 512; p3++) {
             if (!(pdpt[p3] & PAGE_PRESENT)) continue;
             if (pdpt[p3] & PAGE_HUGE) { pdpt[p3] &= ~PAGE_USER; continue; }
-            uint64_t* pd = (uint64_t*)(pdpt[p3] & ~0xFFFULL);
+            uint64_t* pd = (uint64_t*)(pdpt[p3] & PTE_PHYS_MASK);
             for (int p2 = 0; p2 < 512; p2++) {
                 if (!(pd[p2] & PAGE_PRESENT)) continue;
                 if (pd[p2] & PAGE_HUGE) { pd[p2] &= ~PAGE_USER; continue; }
-                uint64_t* pt = (uint64_t*)(pd[p2] & ~0xFFFULL);
+                uint64_t* pt = (uint64_t*)(pd[p2] & PTE_PHYS_MASK);
                 for (int p1 = 0; p1 < 512; p1++) {
                     if (!(pt[p1] & PAGE_PRESENT)) continue;
                     pt[p1] &= ~PAGE_USER;
@@ -162,15 +162,15 @@ static void proc_map_page(struct process* p, uint64_t vaddr, uint64_t phys, uint
 static void cow_share_pages(struct process* parent, struct process* child) {
     for (int p4 = 4; p4 < 512; p4++) { /* PML4 indices 0-3 are kernel */
         if (!(parent->pml4[p4] & PAGE_PRESENT)) continue;
-        uint64_t* pdpt = (uint64_t*)(parent->pml4[p4] & ~0xFFFULL);
+        uint64_t* pdpt = (uint64_t*)(parent->pml4[p4] & PTE_PHYS_MASK);
         for (int p3 = 0; p3 < 512; p3++) {
             if (!(pdpt[p3] & PAGE_PRESENT)) continue;
             if (pdpt[p3] & PAGE_HUGE) continue;
-            uint64_t* pd = (uint64_t*)(pdpt[p3] & ~0xFFFULL);
+            uint64_t* pd = (uint64_t*)(pdpt[p3] & PTE_PHYS_MASK);
             for (int p2 = 0; p2 < 512; p2++) {
                 if (!(pd[p2] & PAGE_PRESENT)) continue;
                 if (pd[p2] & PAGE_HUGE) continue;
-                uint64_t* pt = (uint64_t*)(pd[p2] & ~0xFFFULL);
+                uint64_t* pt = (uint64_t*)(pd[p2] & PTE_PHYS_MASK);
                 for (int p1 = 0; p1 < 512; p1++) {
                     if (!(pt[p1] & PAGE_PRESENT)) continue;
                     if (!(pt[p1] & PAGE_USER)) continue;

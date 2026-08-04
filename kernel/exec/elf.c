@@ -84,30 +84,35 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
     uint64_t pd_idx   = (vaddr >> 21) & 0x1FF;
     uint64_t pt_idx   = (vaddr >> 12) & 0x1FF;
 
+    /* NX (bit 63) is only valid on leaf PTEs.  Intermediate page table
+     * entries (PML4/PDPT/PD) must NOT have it set — otherwise
+     * PTE_PHYS_MASK extraction produces a non-canonical address (#GP). */
+    uint64_t table_flags = flags & ~PAGE_NX;
+
     uintptr_t* pml4_virt = pml4;
     if (!(pml4_virt[pml4_idx] & PAGE_PRESENT)) {
         phys_addr_t pdpt_phys = pmm_alloc_page();
         if (!pdpt_phys) return;
         memset((void*)pdpt_phys, 0, PAGE_SIZE);
-        pml4_virt[pml4_idx] = pdpt_phys | flags | PAGE_PRESENT;
+        pml4_virt[pml4_idx] = pdpt_phys | table_flags | PAGE_PRESENT;
     }
-    uintptr_t* pdpt = (uintptr_t*)(pml4_virt[pml4_idx] & ~0xFFFULL);
+    uintptr_t* pdpt = (uintptr_t*)(pml4_virt[pml4_idx] & PTE_PHYS_MASK);
 
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
         phys_addr_t pd_phys = pmm_alloc_page();
         if (!pd_phys) return;
         memset((void*)pd_phys, 0, PAGE_SIZE);
-        pdpt[pdpt_idx] = pd_phys | flags | PAGE_PRESENT;
+        pdpt[pdpt_idx] = pd_phys | table_flags | PAGE_PRESENT;
     }
-    uintptr_t* pd = (uintptr_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
+    uintptr_t* pd = (uintptr_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
 
     if (!(pd[pd_idx] & PAGE_PRESENT)) {
         phys_addr_t pt_phys = pmm_alloc_page();
         if (!pt_phys) return;
         memset((void*)pt_phys, 0, PAGE_SIZE);
-        pd[pd_idx] = pt_phys | flags | PAGE_PRESENT;
+        pd[pd_idx] = pt_phys | table_flags | PAGE_PRESENT;
     }
-    uintptr_t* pt = (uintptr_t*)(pd[pd_idx] & ~0xFFFULL);
+    uintptr_t* pt = (uintptr_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
     pt[pt_idx] = phys | flags | PAGE_PRESENT;
 }

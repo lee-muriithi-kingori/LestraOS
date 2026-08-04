@@ -46,7 +46,7 @@ static pte_t* get_pte_level(uintptr_t* pml4, uintptr_t virt, pt_level_t* out_lev
 
     if (!(pml4[pml4_idx] & PAGE_PRESENT)) return NULL;
 
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & PTE_PHYS_MASK);
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) return NULL;
 
     /* PDPT entry itself could be a 1GB huge page */
@@ -55,7 +55,7 @@ static pte_t* get_pte_level(uintptr_t* pml4, uintptr_t virt, pt_level_t* out_lev
         return &pdpt[pdpt_idx];  /* 1GB huge page */
     }
 
-    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFF);
+    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
     if (!(pd[pd_idx] & PAGE_PRESENT)) return NULL;
 
     /* PD entry can be a 2MB huge page (this is what boot.asm uses) */
@@ -65,7 +65,7 @@ static pte_t* get_pte_level(uintptr_t* pml4, uintptr_t virt, pt_level_t* out_lev
     }
 
     if (out_level) *out_level = LEVEL_PT;
-    uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
+    uint64_t* pt = (uint64_t*)(pd[pd_idx] & PTE_PHYS_MASK);
     return &pt[pt_idx];
 }
 
@@ -95,7 +95,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
         pml4[pml4_idx] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
     }
 
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFF);
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & PTE_PHYS_MASK);
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
         phys_addr_t pd_phys = pmm_alloc_page();
         if (!pd_phys) return;
@@ -109,7 +109,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
         return;
     }
 
-    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFF);
+    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
     if (!(pd[pd_idx] & PAGE_PRESENT)) {
         phys_addr_t pt_phys = pmm_alloc_page();
         if (!pt_phys) return;
@@ -124,7 +124,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
         return;
     }
 
-    uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFF);
+    uint64_t* pt = (uint64_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
     /* Check if page is already mapped — use refcount-aware freeing.
      * With COW, the old physical page may be shared by other processes.
@@ -132,7 +132,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
      * drops to 0 after decrement). Otherwise, other processes still
      * reference it and we must not free it. */
     if (pt[pt_idx] & PAGE_PRESENT) {
-        phys_addr_t old_phys = pt[pt_idx] & ~0xFFF;
+        phys_addr_t old_phys = pt[pt_idx] & PTE_PHYS_MASK;
         /* Decrement refcount of the old physical page. Only free if
          * no other PTEs reference it (refcount drops to 0). */
         if (pmm_refcount_dec(old_phys) == 0) {
@@ -174,7 +174,7 @@ phys_addr_t vmm_get_phys(uintptr_t* pml4, virt_addr_t virt) {
                 return (entry & ~0x1FFFFFULL) | (virt & 0x1FFFFF);
             }
         }
-        return (*pte & ~0xFFFULL) | (virt & 0xFFF);
+        return (*pte & PTE_PHYS_MASK) | (virt & 0xFFF);
     }
     return 0;
 }
@@ -204,17 +204,17 @@ static void free_pdpt_subtree(phys_addr_t pdpt_phys) {
         if (!(pdpt[p3] & PAGE_PRESENT)) continue;
         if (pdpt[p3] & PAGE_HUGE) continue; /* 1GB huge page: nothing to recurse into */
 
-        phys_addr_t pd_phys = pdpt[p3] & ~0xFFFULL;
+        phys_addr_t pd_phys = pdpt[p3] & PTE_PHYS_MASK;
         uint64_t* pd = (uint64_t*)pd_phys;
         for (int p2 = 0; p2 < PD_ENTRIES; p2++) {
             if (!(pd[p2] & PAGE_PRESENT)) continue;
             if (pd[p2] & PAGE_HUGE) continue; /* 2MB huge page: nothing to recurse into */
 
-            phys_addr_t pt_phys = pd[p2] & ~0xFFFULL;
+            phys_addr_t pt_phys = pd[p2] & PTE_PHYS_MASK;
             uint64_t* pt = (uint64_t*)pt_phys;
             for (int p1 = 0; p1 < PT_ENTRIES; p1++) {
                 if (!(pt[p1] & PAGE_PRESENT)) continue;
-                phys_addr_t page_phys = pt[p1] & ~0xFFFULL;
+                phys_addr_t page_phys = pt[p1] & PTE_PHYS_MASK;
                 /* COW-aware: decrement refcount. Only free the physical
                  * page if no other PTE still references it. Private
                  * pages (refcount=1) will be freed; COW-shared pages
@@ -241,7 +241,7 @@ void vmm_destroy_address_space(uintptr_t* pml4) {
      * PML4[255], and any ELF segments mapped outside the low range). */
     for (int p4 = 4; p4 < PML4_ENTRIES; p4++) {
         if (!(pml4[p4] & PAGE_PRESENT)) continue;
-        free_pdpt_subtree(pml4[p4] & ~0xFFFULL);
+        free_pdpt_subtree(pml4[p4] & PTE_PHYS_MASK);
     }
 
     pmm_free_page((phys_addr_t)(uintptr_t)pml4);

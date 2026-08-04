@@ -21,6 +21,12 @@
 #define PAGE_COW        0x200  /* Bit 9: software-use COW marker (x86_64 bits 9-11 are available to OS) */
 #define PAGE_NX         (1ULL << 63)
 
+/* Physical address mask for PTEs (bits 51:12).
+ * MUST exclude bit 63 (PAGE_NX) and bits 52-62 (reserved/available).
+ * Using ~0xFFFULL is WRONG because it preserves bit 63 (NX), producing
+ * non-canonical addresses when the PTE has NX set. */
+#define PTE_PHYS_MASK   0x000FFFFFFFFFF000ULL
+
 #define PAGE_KERNEL     (PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL)
 #define PAGE_USER_RW    (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
 #define PAGE_USER_RO    (PAGE_PRESENT | PAGE_USER)

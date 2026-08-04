@@ -52,15 +52,15 @@ static uint64_t* get_pte_in_pml4(uint64_t* pml4, uint64_t virt) {
 
     if (!(pml4[pml4_idx] & PAGE_PRESENT)) return NULL;
 
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & PTE_PHYS_MASK);
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) return NULL;
     if (pdpt[pdpt_idx] & PAGE_HUGE) return NULL;   /* 1 GB huge page */
 
-    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
     if (!(pd[pd_idx] & PAGE_PRESENT)) return NULL;
     if (pd[pd_idx] & PAGE_HUGE) return NULL;       /* 2 MB huge page */
 
-    uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = (uint64_t*)(pd[pd_idx] & PTE_PHYS_MASK);
     return &pt[pt_idx];
 }
 
@@ -169,9 +169,9 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
 
             /* Walk to PT (all intermediate tables exist since the old
              * mapping was present) */
-            uint64_t* pdpt = (uint64_t*)(cur->pml4[pml4_idx] & ~0xFFFULL);
-            uint64_t* pd   = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
-            uint64_t* pt   = (uint64_t*)(pd[pd_idx] & ~0xFFFULL);
+            uint64_t* pdpt = (uint64_t*)(cur->pml4[pml4_idx] & PTE_PHYS_MASK);
+            uint64_t* pd   = (uint64_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
+            uint64_t* pt   = (uint64_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
             /* Directly write the new PTE (avoids vmm_map_page's
              * double-decrement of old_phys refcount) */

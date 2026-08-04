@@ -272,16 +272,16 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing GDT...\n");
     gdt_init();
 
-    /* Security feature detection (SMEP/SMAP) — detection only.
-     * CR4 bits are NOT flipped here; that waits for syscall wrappers. */
+    /* Security feature detection.
+     * CR4.SMEP and CR4.SMAP are now flipped in gdt_init() (TIER 3).
+     * g_security.smep/smap are already set there. */
     extern struct security_status g_security;
-    g_security.smep = cpu_has_smep();
-    g_security.smap = cpu_has_smap();
     g_security.nx = 1;  /* EFER.NXE already set in boot.asm */
     g_security.kptr_restrict = 1;
-    pr_info("security: CPU supports SMEP=%s SMAP=%s (not yet enabled — pending syscall wrappers)\n",
-            g_security.smep ? "yes" : "no",
-            g_security.smap ? "yes" : "no");
+    pr_info("security: SMEP=%s SMAP=%s %s\n",
+            g_security.smep ? "ENABLED" : "unavailable",
+            g_security.smap ? "ENABLED" : "unavailable",
+            (g_security.smep || g_security.smap) ? "(CR4 bits flipped)" : "(CPU lacks feature)");
 
     /* Initialize IDT and interrupts */
     pr_info("Initializing IDT...\n");
@@ -425,12 +425,8 @@ void kernel_main(void* mb2_info) {
     pr_info("Enabling interrupts...\n");
 
     pr_info("\n=== SECURITY AUDIT ===\n");
-    pr_info("  SMEP:           %s (CPU %s, CR4 bit %s)\n",
-            "DISABLED", g_security.smep ? "supports" : "lacks",
-            "not flipped");
-    pr_info("  SMAP:           %s (CPU %s, CR4 bit %s)\n",
-            "DISABLED", g_security.smap ? "supports" : "lacks",
-            "not flipped");
+    pr_info("  SMEP:           %s\n", g_security.smep ? "ENABLED (CR4.SMEP)" : "unavailable");
+    pr_info("  SMAP:           %s\n", g_security.smap ? "ENABLED (CR4.SMAP)" : "unavailable");
     pr_info("  NX:             ENABLED (EFER.NXE)\n");
     pr_info("  ASLR:           DISABLED (pending PIE conversion)\n");
     pr_info("  Stack canaries: %s (-fstack-protector-strong)\n",
