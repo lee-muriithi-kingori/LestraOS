@@ -17,6 +17,7 @@
 ### Driver Infrastructure
 - **KE-9**: PCI bus enumeration (shared pci.c/pci.h, lspci, 7 drivers migrated)
 - **KE-10**: RTL8139 10/100 NIC driver (first real-hardware NIC, IO-port based)
+- **KE-11**: RTL8139 RX fixes (4 critical bugs: RCR bits, DMA buffers, status word, CAPR)
 
 ### Supported NIC Drivers (3 total)
 1. **VirtIO-net** (preferred on KVM/QEMU, MMIO or IO-port)
@@ -33,7 +34,7 @@
 - KASLR-lite: DISABLED (pending)
 
 ### Pending Work (priority order)
-1. **Debug RTL8139 RX** (TX works, DHCP sends but no replies received yet)
+1. **Fix RTL8139 multi-packet RX** (KE-12): QEMU can_receive() deadlock when CAPR==RxBufAddr. First packet RX works (DHCP OFFER received). Need deferred CAPR update (NAPI-style batch consume, then write CAPR once). Linux 8139too uses `CAPR = cur_rx - 16` after draining batch.
 2. **Fix GP fault in user_map_page** during gui-mode /init ELF loading
 3. **NIC driver abstraction refactor** (struct nic_ops, eliminate active_nic switch)
 4. **KASLR-lite**: Randomize kernel base address
@@ -53,13 +54,15 @@
 
 ### Known Issues
 - GUI boot (/init ELF loading) hits GP fault in user_map_page at RIP ~0x16bb5f — deferred
-- RTL8139 RX path not yet receiving (TX/DHCP sends work, wrap logic may need debug)
+- RTL8139 multi-packet RX blocked by QEMU can_receive() CAPR deadlock — KE-12
 - CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero
 - sys_mmap returns kmalloc pointers, not real VMAs — needs vmm_map_page
 - sys_futex is a no-op stub
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+8f4bf74 drivers: KE-11 RTL8139 RX fixes (static DMA buffers, correct RCR bits, status word order)
+8a51df8 docs: KE-10 changelog + sync MEMORY.md
 982f223 drivers: KE-10 RTL8139 10/100 NIC driver (first real-hardware NIC)
 c71cfb2 drivers: KE-9 shared PCI bus enumeration + lspci, migrate 7 drivers
 00ed0d6 docs: KE-9 changelog + sync MEMORY.md
