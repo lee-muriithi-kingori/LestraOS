@@ -61,19 +61,112 @@ uintptr_t* user_pml4 = NULL;
 static uint64_t user_entry = 0;
 uint64_t user_stack_ptr = 0;
 
+/* KE-13: Deep-copy a boot PD into a private PD for the user address space.
+ * This allows user_map_page() to split 2MB huge pages without corrupting
+ * the kernel's own page tables. The new PD entries inherit the boot flags
+ * (Present+Writable for identity-mapped kernel memory) but with PAGE_USER
+ * cleared so the user process cannot access kernel memory through them. */
+static uint64_t* deep_copy_pd(uint64_t* boot_pd) {
+    phys_addr_t pd_phys = pmm_alloc_page();
+    if (!pd_phys) return NULL;
+    uint64_t* pd = (uint64_t*)(uintptr_t)pd_phys;
+    for (int i = 0; i < 512; i++) {
+        pd[i] = boot_pd[i] & ~PAGE_USER;  /* kernel-only entries */
+    }
+    return pd;
+}
+
+/* KE-13: Deep-copy a boot PDPT into a private PDPT, and deep-copy every
+ * PD it references. This gives the user address space its own private
+ * page table structures that can be modified (e.g. to split huge pages)
+ * without affecting the kernel's own mappings. */
+static uint64_t* deep_copy_pdpt(uint64_t* boot_pdpt) {
+    phys_addr_t pdpt_phys = pmm_alloc_page();
+    if (!pdpt_phys) return NULL;
+    uint64_t* pdpt = (uint64_t*)(uintptr_t)pdpt_phys;
+    for (int i = 0; i < 512; i++) {
+        if (!(boot_pdpt[i] & PAGE_PRESENT)) {
+            pdpt[i] = 0;
+            continue;
+        }
+        /* 1GB huge page: copy as-is (no splitting needed yet) */
+        if (boot_pdpt[i] & PAGE_HUGE) {
+            pdpt[i] = boot_pdpt[i] & ~PAGE_USER;
+            continue;
+        }
+        /* Regular PDPT entry pointing to a PD: deep-copy the PD */
+        uint64_t* boot_pd = (uint64_t*)(uintptr_t)(boot_pdpt[i] & PTE_PHYS_MASK);
+        uint64_t* new_pd = deep_copy_pd(boot_pd);
+        if (!new_pd) { pdpt[i] = 0; continue; }
+        pdpt[i] = ((uint64_t)(uintptr_t)new_pd) | (boot_pdpt[i] & ~PAGE_USER & ~PTE_PHYS_MASK) | PAGE_PRESENT;
+    }
+    return pdpt;
+}
+
 static uintptr_t* create_user_address_space(void) {
     phys_addr_t pml4_phys = pmm_alloc_page();
     if (!pml4_phys) return NULL;
     uintptr_t* pml4 = (uintptr_t*)pml4_phys;
     memset(pml4, 0, PAGE_SIZE);
 
+    /* KE-13 FIX: Deep-copy the kernel's boot page tables instead of
+     * sharing PML4[0..3] by pointer. The old code did:
+     *   pml4[0] = boot_pml4[0];  // shares boot PDPT+PD
+     * which meant user_map_page() encountered 2MB huge pages in the
+     * shared boot PD. It would then write PTEs to the huge page's
+     * physical address (misinterpreted as a PT pointer), corrupting
+     * kernel BSS/data and causing a delayed #GP.
+     *
+     * The deep copy gives us private PDPTs and PDs. user_map_page()
+     * can now safely split 2MB huge pages in the private PD copy
+     * without affecting the kernel's own mappings.
+     *
+     * PAGE_USER is cleared on all copied entries so the user process
+     * cannot access kernel memory through the identity mapping.
+     * Only ELF segments and the user stack get PAGE_USER set by
+     * user_map_page(). */
     extern uint64_t boot_pml4[];
-    pml4[0] = boot_pml4[0];
-    pml4[1] = boot_pml4[1];
-    pml4[2] = boot_pml4[2];
-    pml4[3] = boot_pml4[3];
+    for (int i = 0; i < 4; i++) {
+        if (!(boot_pml4[i] & PAGE_PRESENT)) continue;
+        uint64_t* boot_pdpt = (uint64_t*)(uintptr_t)(boot_pml4[i] & PTE_PHYS_MASK);
+        uint64_t* new_pdpt = deep_copy_pdpt(boot_pdpt);
+        if (!new_pdpt) continue;
+        pml4[i] = ((uint64_t)(uintptr_t)new_pdpt) | (boot_pml4[i] & ~PAGE_USER & ~PTE_PHYS_MASK) | PAGE_PRESENT;
+    }
 
     return pml4;
+}
+
+/* Split a 2MB huge page into 512 individual 4KB page table entries.
+ * This operates on the USER's private PD (created by deep_copy_pd), so
+ * the kernel's own page tables are never modified.
+ *
+ * The new 4KB entries are mapped WITHOUT PAGE_USER so the user process
+ * cannot access the kernel memory they cover. Only the specific PTE that
+ * user_map_page() installs will have PAGE_USER set.
+ *
+ * Returns the pointer to the new page table, or NULL on failure. */
+static uint64_t* split_2mb_huge_page(uint64_t* pd, int pd_idx, uint64_t old_pd_entry) {
+    phys_addr_t pt_phys = pmm_alloc_page();
+    if (!pt_phys) return NULL;
+    uint64_t* pt = (uint64_t*)(uintptr_t)pt_phys;
+    memset(pt, 0, PAGE_SIZE);
+
+    /* Extract the 2MB huge page base and flags */
+    uint64_t huge_base = old_pd_entry & PTE_PHYS_MASK;
+    uint64_t huge_flags = old_pd_entry & ~PTE_PHYS_MASK & ~PAGE_HUGE;
+    /* Ensure PAGE_USER is clear — kernel memory, not user-accessible */
+    huge_flags &= ~PAGE_USER;
+
+    /* Fill 512 PTEs covering the 2MB region */
+    for (int i = 0; i < 512; i++) {
+        pt[i] = huge_base + (uint64_t)i * PAGE_SIZE | huge_flags;
+    }
+
+    /* Replace the PD entry: point to our new PT instead of the huge page */
+    pd[pd_idx] = pt_phys | (old_pd_entry & ~PAGE_HUGE & ~PTE_PHYS_MASK) | PAGE_PRESENT;
+
+    return pt;
 }
 
 static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64_t flags) {
@@ -102,7 +195,25 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
         memset((void*)pd_phys, 0, PAGE_SIZE);
         pdpt[pdpt_idx] = pd_phys | table_flags | PAGE_PRESENT;
     }
+
+    /* Check for 1GB huge page at PDPT level — cannot split, bail */
+    if (pdpt[pdpt_idx] & PAGE_HUGE) {
+        pr_warn("elf: cannot map 0x%x — 1GB huge page in the way\n", (unsigned)vaddr);
+        return;
+    }
+
     uintptr_t* pd = (uintptr_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
+
+    /* KE-13 FIX: If the PD entry is a 2MB huge page (copied from boot
+     * page tables by deep_copy_pd), split it into 4KB pages before
+     * installing the user PTE. This is safe because we're modifying
+     * the user's PRIVATE PD copy, not the kernel's boot PD. */
+    if (pd[pd_idx] & PAGE_HUGE) {
+        uint64_t* pt = split_2mb_huge_page(pd, pd_idx, pd[pd_idx]);
+        if (!pt) return;
+        pt[pt_idx] = phys | flags | PAGE_PRESENT;
+        return;
+    }
 
     if (!(pd[pd_idx] & PAGE_PRESENT)) {
         phys_addr_t pt_phys = pmm_alloc_page();

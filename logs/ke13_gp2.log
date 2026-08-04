@@ -1,0 +1,1 @@
+qemu-system-x86_64: -append only allowed with -kernel option
