@@ -1234,11 +1234,27 @@ static int64_t sys_socket(int domain, int type, int protocol) {
 }
 
 static int64_t sys_bind(int64_t fd, const void* addr, int addrlen) {
-    return (int64_t)socket_bind((int)fd, (const struct sockaddr*)addr, addrlen);
+    /* SMAP-safe: copy sockaddr from user into kernel bounce buffer. */
+    if (!addr) return -EFAULT;
+    if (addrlen <= 0 || addrlen > 128) return -EINVAL;
+    if (!access_ok(addr, (unsigned long)addrlen)) return -EFAULT;
+    struct sockaddr_in kaddr;
+    unsigned long cpysize = (unsigned long)addrlen;
+    if (cpysize > sizeof(kaddr)) cpysize = sizeof(kaddr);
+    if (copy_from_user(&kaddr, addr, cpysize) < 0) return -EFAULT;
+    return (int64_t)socket_bind((int)fd, (const struct sockaddr*)&kaddr, (int)cpysize);
 }
 
 static int64_t sys_connect(int64_t fd, const void* addr, int addrlen) {
-    return (int64_t)socket_connect((int)fd, (const struct sockaddr*)addr, addrlen);
+    /* SMAP-safe: copy sockaddr from user into kernel bounce buffer. */
+    if (!addr) return -EFAULT;
+    if (addrlen <= 0 || addrlen > 128) return -EINVAL;
+    if (!access_ok(addr, (unsigned long)addrlen)) return -EFAULT;
+    struct sockaddr_in kaddr;
+    unsigned long cpysize = (unsigned long)addrlen;
+    if (cpysize > sizeof(kaddr)) cpysize = sizeof(kaddr);
+    if (copy_from_user(&kaddr, addr, cpysize) < 0) return -EFAULT;
+    return (int64_t)socket_connect((int)fd, (const struct sockaddr*)&kaddr, (int)cpysize);
 }
 
 static int64_t sys_listen(int64_t fd, int backlog) {
@@ -1246,7 +1262,30 @@ static int64_t sys_listen(int64_t fd, int backlog) {
 }
 
 static int64_t sys_accept(int64_t fd, void* addr, void* addrlen) {
-    return (int64_t)socket_accept((int)fd, (struct sockaddr*)addr, (int*)addrlen);
+    /* SMAP-safe: ask socket layer to fill kernel-local sockaddr,
+     * then copy results back to user. */
+    struct sockaddr_in kaddr;
+    int kaddrlen = sizeof(kaddr);
+    int ret = socket_accept((int)fd, (struct sockaddr*)&kaddr, &kaddrlen);
+    if (ret < 0) return (int64_t)ret;
+
+    /* Copy sockaddr out to user if requested. */
+    if (addr) {
+        int user_addrlen = 0;
+        if (addrlen) {
+            if (get_user(&user_addrlen, (int*)addrlen) != 0) return -EFAULT;
+        }
+        if (user_addrlen > 0 && access_ok(addr, (unsigned long)user_addrlen)) {
+            unsigned long outsize = (unsigned long)kaddrlen;
+            if (outsize > (unsigned long)user_addrlen) outsize = (unsigned long)user_addrlen;
+            if (copy_to_user(addr, &kaddr, outsize) < 0) return -EFAULT;
+        }
+        /* Update user's addrlen to actual size. */
+        if (addrlen) {
+            if (put_user(kaddrlen, (int*)addrlen) != 0) return -EFAULT;
+        }
+    }
+    return (int64_t)ret;
 }
 
 static int64_t sys_send(int64_t fd, const void* buf, size_t len, int flags) {
