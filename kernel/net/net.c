@@ -19,51 +19,26 @@
 
 #include <lestra/types.h>
 #include <lestra/net.h>
+#include <lestra/nic.h>
 #include <lestra/firewall.h>
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 #include <lestra/timer.h>
 #include <string.h>
 
-/* E1000 driver entry points (defined in drivers/net/e1000.c) */
-extern int        e1000_init(void);
-extern int        e1000_is_present(void);
-extern mac_addr_t e1000_get_mac(void);
-extern int        e1000_send(const void* data, uint16_t len);
-extern int        e1000_recv(void* buf, uint16_t bufsz);
+/* NIC driver table and active pointer (defined in net/nic.c) */
+extern const struct nic_ops *const nic_driver_table[];
+extern const int              nic_driver_count;
+extern const struct nic_ops *active_nic_ops;
 
-/* VirtIO-net driver entry points (defined in drivers/net/virtio_net.c) */
-extern int        virtio_net_init(void);
-extern int        virtio_net_is_present(void);
-extern mac_addr_t virtio_net_get_mac(void);
-extern int        virtio_net_send(const void* data, uint16_t len);
-extern int        virtio_net_recv(void* buf, uint16_t bufsz);
-
-/* RTL8139 driver entry points (defined in drivers/net/rtl8139.c) */
-extern int        rtl8139_init(void);
-extern int        rtl8139_is_present(void);
-extern mac_addr_t rtl8139_get_mac(void);
-extern int        rtl8139_send(const void* data, uint16_t len);
-extern int        rtl8139_recv(void* buf, uint16_t bufsz);
-extern void       rtl8139_recv_flush(void);
-
-/* Active NIC driver selector.
- * 0 = e1000 (default Intel NIC)
- * 1 = virtio-net
- * 2 = rtl8139 (Realtek 10/100)
- */
-static int        active_nic = 0;
-
-/* Unified driver wrappers — route through the active NIC driver */
+/* Unified driver wrappers — dispatch through active NIC vtable */
 static int net_driver_send(const void* data, uint16_t len) {
-    if (active_nic == 1) return virtio_net_send(data, len);
-    if (active_nic == 2) return rtl8139_send(data, len);
-    return e1000_send(data, len);
+    if (!active_nic_ops) return -1;
+    return active_nic_ops->send(data, len);
 }
 static int net_driver_recv(void* buf, uint16_t bufsz) {
-    if (active_nic == 1) return virtio_net_recv(buf, bufsz);
-    if (active_nic == 2) return rtl8139_recv(buf, bufsz);
-    return e1000_recv(buf, bufsz);
+    if (!active_nic_ops) return 0;
+    return active_nic_ops->recv(buf, bufsz);
 }
 
 /* WiFi frame handler (defined in net/wifi.c) */
@@ -1518,27 +1493,21 @@ static void handle_ethernet(uint8_t* data, uint16_t len) {
 /* ----- public API ----- */
 void net_init(void) {
     pr_info("net: initializing network stack\n");
-    /* Try VirtIO-net first (preferred on KVM/QEMU VPS),
-     * then E1000, then RTL8139 (real hardware 10/100 NIC). */
-    if (virtio_net_init()) {
-        active_nic = 1;
-        net_iface_name = "virtio_net";
-        my_mac = virtio_net_get_mac();
-        pr_info("net: using VirtIO-net driver\n");
-    } else if (e1000_init()) {
-        active_nic = 0;
-        net_iface_name = "e1000";
-        my_mac = e1000_get_mac();
-        pr_info("net: using E1000 driver\n");
-    } else if (rtl8139_init()) {
-        active_nic = 2;
-        net_iface_name = "rtl8139";
-        my_mac = rtl8139_get_mac();
-        pr_info("net: using RTL8139 driver\n");
-    } else {
-        pr_warn("net: no NIC - networking disabled\n");
-        return;
+    /* Probe each NIC driver in priority order via the vtable.
+     * First one that initializes successfully becomes active. */
+    for (int i = 0; i < nic_driver_count && nic_driver_table[i]; i++) {
+        const struct nic_ops *ops = nic_driver_table[i];
+        if (ops->init && ops->init()) {
+            active_nic_ops = ops;
+            net_iface_name = (char*)ops->name;
+            my_mac = ops->get_mac();
+            pr_info("net: using %s driver\n", ops->name);
+            goto nic_found;
+        }
     }
+    pr_warn("net: no NIC - networking disabled\n");
+    return;
+nic_found:
     net_initialized = 1;
     net_link_up = 1;   /* link is up from driver perspective; IP not yet */
     fw_init();
@@ -1609,10 +1578,9 @@ void net_tick(void) {
         /* Otherwise dispatch to the right protocol handler. */
         handle_ethernet(buf, (uint16_t)n);
     }
-    /* NAPI-style flush: write CAPR once after draining the batch.
-     * Only the RTL8139 needs this (deferred CAPR to avoid QEMU deadlock).
-     * E1000 and VirtIO don't use CAPR, so this is a no-op for them. */
-    if (active_nic == 2) rtl8139_recv_flush();
+    /* Post-batch flush for drivers that need it (e.g. RTL8139 CAPR) */
+    if (active_nic_ops && active_nic_ops->flush)
+        active_nic_ops->flush();
 
     /* Advance DHCP and TCP state machines. */
     dhcp_tick();

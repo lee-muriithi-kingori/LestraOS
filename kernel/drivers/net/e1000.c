@@ -14,6 +14,7 @@
 
 #include <lestra/types.h>
 #include <lestra/net.h>
+#include <lestra/nic.h>
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 #include <lestra/pci.h>
@@ -145,28 +146,17 @@ static uint16_t eeprom_read(uint8_t addr) {
     return out;
 }
 
-/* ----- PCI scan -----
- * Walk bus 0 looking for vendor 0x8086 (Intel), device 0x100E (82540EM). */
-static int pci_find_e1000(uint8_t* bus, uint8_t* dev, uint8_t* func, uintptr_t* bar0) {
-    for (uint8_t d = 0; d < 32; d++) {
-        for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_config_read32(0, d, f, 0);
-            if (id == 0xFFFFFFFFu) continue;
-            uint16_t vendor = id & 0xFFFF;
-            uint16_t device = (id >> 16) & 0xFFFF;
-            if (vendor == 0x8086 && (device == 0x100E || device == 0x100F
-                                   || device == 0x10D3 /* 82574L */)) {
-                *bus = 0; *dev = d; *func = f;
-                uint32_t b0 = pci_config_read32(0, d, f, 0x10);
-                *bar0 = b0 & ~0xFu;
-                uint32_t cmd = pci_config_read32(0, d, f, 0x04);
-                cmd |= 0x7;  /* IOSE | MSE | BME */
-                pci_config_write32(0, d, f, 0x04, cmd);
-                return 1;
-            }
-        }
+/* ----- PCI discovery via shared API (KE-14) -----
+ * Try known Intel E1000 device IDs using pci_find_device().
+ * Falls through each variant until one is found. */
+static const uint16_t e1000_device_ids[] = { 0x100E, 0x100F, 0x10D3, 0 };
+
+static struct pci_device *e1000_find_pci(void) {
+    for (int i = 0; e1000_device_ids[i]; i++) {
+        struct pci_device *dev = pci_find_device(0x8086, e1000_device_ids[i]);
+        if (dev) return dev;
     }
-    return 0;
+    return NULL;
 }
 
 /* ----- public driver API (called by net.c) ----- */
@@ -178,15 +168,15 @@ int e1000_send(const void* data, uint16_t len);
 int e1000_recv(void* buf, uint16_t bufsz);
 
 int e1000_init(void) {
-    uint8_t bus, dev, func;
-    uintptr_t bar0;
-    if (!pci_find_e1000(&bus, &dev, &func, &bar0)) {
-        pr_warn("e1000: no Intel NIC found in PCI bus 0\n");
+    struct pci_device *pdev = e1000_find_pci();
+    if (!pdev) {
+        pr_info("e1000: no Intel NIC found via PCI\n");
         return 0;
     }
-    e1000_mmio = bar0;
-    pr_info("e1000: found at PCI 00:%u.%u, MMIO=0x%x\n",
-            (unsigned)dev, (unsigned)func, (unsigned)bar0);
+    e1000_mmio = pdev->bar[0] & ~0xFu;
+    pci_device_enable(pdev);
+    pr_info("e1000: found at PCI %02x:%02x.%x, MMIO=0x%x\n",
+            pdev->bus, pdev->dev, pdev->func, (unsigned)e1000_mmio);
 
     /* Read MAC from EEPROM */
     uint16_t w0 = eeprom_read(0);
@@ -323,3 +313,21 @@ int e1000_recv(void* buf, uint16_t bufsz) {
 
     return len;
 }
+
+/* ========================================================================
+ * KE-14: NIC driver vtable
+ * ======================================================================== */
+
+static int e1000_nic_init(void)       { return e1000_init(); }
+static int e1000_nic_send(const void *data, uint16_t len) { return e1000_send(data, len); }
+static int e1000_nic_recv(void *buf, uint16_t bufsz)     { return e1000_recv(buf, bufsz); }
+static mac_addr_t e1000_nic_get_mac(void) { return e1000_get_mac(); }
+
+const struct nic_ops e1000_ops = {
+    .name    = "e1000",
+    .init    = e1000_nic_init,
+    .send    = e1000_nic_send,
+    .recv    = e1000_nic_recv,
+    .get_mac = e1000_nic_get_mac,
+    .flush   = NULL,  /* E1000 doesn't need post-batch flush */
+};

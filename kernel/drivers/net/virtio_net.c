@@ -18,6 +18,7 @@
 
 #include <lestra/types.h>
 #include <lestra/net.h>
+#include <lestra/nic.h>
 #include <lestra/printk.h>
 #include <lestra/pci.h>
 #include <string.h>
@@ -446,55 +447,40 @@ static uint32_t vnet_read_config32(uint8_t off) {
 }
 
 /* ========================================================================
- * PCI Device Scanning
- * Scan bus 0 for VirtIO-net: vendor 0x1AF4, device 0x1000 (transitional)
- * or 0x1041 (modern-only). Also check subsystem device ID for net type.
+ * PCI Device Discovery via shared PCI table (KE-14)
+ *
+ * Scan the shared pci_table[] for VirtIO-net devices.
+ * VirtIO vendor = 0x1AF4. Net device: 0x1000 (transitional, subsystem=1),
+ * 0x1041 (modern-only), or 0x1040-0x107F with subsystem=1.
  * ======================================================================== */
 
-static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
-                                uintptr_t* bar0_out) {
-    for (uint8_t d = 0; d < 32; d++) {
-        for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_config_read32(0, d, f, 0);
-            if (id == 0xFFFFFFFFu) continue;
-            uint16_t vendor = id & 0xFFFF;
-            uint16_t device = (id >> 16) & 0xFFFF;
+static struct pci_device *vnet_pci_entry = NULL;  /* saved for capability walk */
 
-            if (vendor != 0x1AF4) continue;
+static struct pci_device *pci_find_virtio_net(void) {
+    int count = pci_get_device_count();
+    for (int i = 0; i < count; i++) {
+        struct pci_device *d = pci_get_device(i);
+        if (d->vendor_id != 0x1AF4) continue;
 
-            /* Transitional VirtIO-net: device 0x1000, subsystem ID 1 */
-            /* Modern-only VirtIO-net: device 0x1041 */
-            int is_net = 0;
-            if (device == 0x1000) {
-                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
-                if (subsystem_id == 1) is_net = 1;
-            } else if (device == 0x1041) {
-                is_net = 1;
-            } else if (device >= 0x1040 && device <= 0x107F) {
-                /* Modern device ID range; check subsystem */
-                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
-                if (subsystem_id == 1) is_net = 1;
-            }
+        int is_net = 0;
+        if (d->device_id == 0x1041) {
+            is_net = 1;  /* modern-only network device */
+        } else if (d->device_id == 0x1000) {
+            /* Transitional: check subsystem device ID */
+            uint16_t ssid = pci_config_read16(d->bus, d->dev, d->func, 0x2E);
+            if (ssid == 1) is_net = 1;
+        } else if (d->device_id >= 0x1040 && d->device_id <= 0x107F) {
+            uint16_t ssid = pci_config_read16(d->bus, d->dev, d->func, 0x2E);
+            if (ssid == 1) is_net = 1;
+        }
 
-            if (!is_net) continue;
-
-            *bus = 0; *dev = d; *func = f;
-
-            /* Read BAR0 (legacy IO port base) */
-            uint32_t b0 = pci_config_read32(0, d, f, 0x10);
-            *bar0_out = b0;
-
-            /* Enable the device: IOSE | MSE | BME */
-            uint32_t cmd = pci_config_read32(0, d, f, 0x04);
-            cmd |= 0x7;
-            pci_config_write32(0, d, f, 0x04, cmd);
-
-            pr_info("virtio_net: found at PCI 00:%u.%u, device=0x%x, BAR0=0x%x\n",
-                    (unsigned)d, (unsigned)f, (unsigned)device, (unsigned)b0);
-            return 1;
+        if (is_net) {
+            pr_info("virtio_net: found at PCI %02x:%02x.%x, device=0x%x, BAR0=0x%x\n",
+                    d->bus, d->dev, d->func, d->device_id, d->bar[0]);
+            return d;
         }
     }
-    return 0;
+    return NULL;
 }
 
 /* ========================================================================
@@ -504,35 +490,22 @@ static int pci_find_virtio_net(uint8_t* bus, uint8_t* dev, uint8_t* func,
  * device_cfg capability structures.
  * ======================================================================== */
 
-static int vnet_detect_modern(uint8_t bus, uint8_t dev, uint8_t func) {
-    /* Cache all BAR base addresses */
+static int vnet_detect_modern(void) {
+    uint8_t bus = vnet_pci_entry->bus;
+    uint8_t dev = vnet_pci_entry->dev;
+    uint8_t func = vnet_pci_entry->func;
+
+    /* Cache all BAR base addresses from the pci_device (already decoded by pci.c) */
     for (int i = 0; i < 6; i++) {
-        uint32_t bar_val = pci_config_read32(bus, dev, func, 0x10 + i * 4);
+        uint32_t bar_val = vnet_pci_entry->bar[i];
         if (bar_val == 0 || bar_val == 0xFFFFFFFFu) {
             vnet_bars[i] = 0;
             continue;
         }
         if (bar_val & 1) {
-            /* IO BAR */
             vnet_bars[i] = bar_val & ~0x3u;
         } else {
-            /* MMIO BAR */
-            uint8_t bar_type = (bar_val >> 1) & 3;
-            if (bar_type == 0) {
-                /* 32-bit MMIO */
-                vnet_bars[i] = bar_val & ~0xFu;
-            } else if (bar_type == 2) {
-                /* 64-bit MMIO - need upper half */
-                if (i + 1 < 6) {
-                    uint32_t bar_hi = pci_config_read32(bus, dev, func, 0x10 + (i + 1) * 4);
-                    vnet_bars[i] = (bar_val & ~0xFu) | ((uint64_t)bar_hi << 32);
-                    vnet_bars[i + 1] = 0; /* upper half consumed */
-                } else {
-                    vnet_bars[i] = bar_val & ~0xFu;
-                }
-            } else {
-                vnet_bars[i] = bar_val & ~0xFu;
-            }
+            vnet_bars[i] = bar_val & ~0xFu;
         }
     }
 
@@ -727,27 +700,26 @@ int virtio_net_recv(void* buf, uint16_t bufsz);
  * ======================================================================== */
 
 int virtio_net_init(void) {
-    uint8_t bus, dev, func;
-    uintptr_t bar0_raw;
-
-    /* Step 1: Find VirtIO-net PCI device */
-    if (!pci_find_virtio_net(&bus, &dev, &func, &bar0_raw)) {
+    /* Step 1: Find VirtIO-net PCI device via shared table */
+    vnet_pci_entry = pci_find_virtio_net();
+    if (!vnet_pci_entry) {
         pr_info("virtio_net: no VirtIO-net device found\n");
         return 0;
     }
 
-    vnet_pci_bus  = bus;
-    vnet_pci_dev  = dev;
-    vnet_pci_func = func;
+    pci_device_enable(vnet_pci_entry);
+    vnet_pci_bus  = vnet_pci_entry->bus;
+    vnet_pci_dev  = vnet_pci_entry->dev;
+    vnet_pci_func = vnet_pci_entry->func;
 
     /* Step 2: Detect transport mode (modern vs legacy) */
-    if (vnet_detect_modern(bus, dev, func)) {
+    if (vnet_detect_modern()) {
         vnet_is_modern = 1;
     } else {
         vnet_is_modern = 0;
         /* Legacy: extract IO port base from BAR0 */
         /* BAR0 bottom bit is 1 for IO space */
-        vnet_io_base = (uint16_t)(bar0_raw & ~0x3u);
+        vnet_io_base = (uint16_t)(vnet_pci_entry->bar[0] & ~0x3u);
         pr_info("virtio_net: legacy transport, IO base=0x%x\n", (unsigned)vnet_io_base);
     }
 
@@ -1069,3 +1041,21 @@ int virtio_net_recv(void* buf, uint16_t bufsz) {
 
     return (int)pkt_len;
 }
+
+/* ========================================================================
+ * KE-14: NIC driver vtable
+ * ======================================================================== */
+
+static int vnet_nic_init(void)       { return virtio_net_init(); }
+static int vnet_nic_send(const void *data, uint16_t len) { return virtio_net_send(data, len); }
+static int vnet_nic_recv(void *buf, uint16_t bufsz)     { return virtio_net_recv(buf, bufsz); }
+static mac_addr_t vnet_nic_get_mac(void) { return virtio_net_get_mac(); }
+
+const struct nic_ops virtio_net_ops = {
+    .name    = "virtio_net",
+    .init    = vnet_nic_init,
+    .send    = vnet_nic_send,
+    .recv    = vnet_nic_recv,
+    .get_mac = vnet_nic_get_mac,
+    .flush   = NULL,  /* VirtIO doesn't need post-batch flush */
+};

@@ -18,6 +18,7 @@
 
 #include <lestra/types.h>
 #include <lestra/net.h>
+#include <lestra/nic.h>
 #include <lestra/printk.h>
 #include <lestra/pci.h>
 #include <string.h>
@@ -284,3 +285,22 @@ void rtl8139_recv_flush(void) {
      * space, potentially deadlocking RX. The software rx_capr tracks
      * the actual read position independently. */
 }
+
+/* ========================================================================
+ * KE-14: NIC driver vtable
+ * ======================================================================== */
+
+static int rtl8139_nic_init(void)       { return rtl8139_init(); }
+static int rtl8139_nic_send(const void *data, uint16_t len) { return rtl8139_send(data, len); }
+static int rtl8139_nic_recv(void *buf, uint16_t bufsz)     { return rtl8139_recv(buf, bufsz); }
+static mac_addr_t rtl8139_nic_get_mac(void) { return rtl8139_get_mac(); }
+static void rtl8139_nic_flush(void)      { rtl8139_recv_flush(); }
+
+const struct nic_ops rtl8139_ops = {
+    .name    = "rtl8139",
+    .init    = rtl8139_nic_init,
+    .send    = rtl8139_nic_send,
+    .recv    = rtl8139_nic_recv,
+    .get_mac = rtl8139_nic_get_mac,
+    .flush   = rtl8139_nic_flush,
+};
