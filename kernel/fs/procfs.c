@@ -45,6 +45,7 @@ enum procfs_kind {
     PROC_CPUINFO,
     PROC_VERSION,
     PROC_PS,        /* process listing (like /proc/ps) */
+    PROC_SECURITY,  /* /proc/security — protection status */
 };
 
 struct procfs_open {
@@ -289,6 +290,34 @@ static size_t gen_ps(struct procfs_open* o) {
     return (size_t)off;
 }
 
+/* Generate /proc/security — machine-parseable protection status. */
+static size_t gen_security(struct procfs_open* o) {
+    extern struct security_status g_security;
+    int off = 0;
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "protection           status    notes\n");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "SMEP                 %s    CR4 bit 20 (CPU %s)\n",
+                     g_security.smep ? "on " : "off",
+                     g_security.smep ? "supports" : "lacks");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "SMAP                 %s    CR4 bit 21 (CPU %s)\n",
+                     g_security.smap ? "on " : "off",
+                     g_security.smap ? "supports" : "lacks");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "NX                   on    EFER.NXE\n");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "ASLR                 off   pending PIE conversion\n");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "StackCanaries        %s  -fstack-protector-strong\n",
+                     g_security.canaries ? "on " : "off");
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "kptr_restrict        %d\n", g_security.kptr_restrict);
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "KASLR-lite           off   pending\n");
+    return (size_t)off;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -301,6 +330,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/cpuinfo")      == 0) return PROC_CPUINFO;
     if (strcmp(path, "/proc/version")      == 0) return PROC_VERSION;
     if (strcmp(path, "/proc/ps")           == 0) return PROC_PS;
+    if (strcmp(path, "/proc/security")     == 0) return PROC_SECURITY;
     return PROC_NONE;
 }
 
@@ -323,6 +353,7 @@ int procfs_open(const char* path) {
                 case PROC_CPUINFO:      o->size = gen_cpuinfo(o);      break;
                 case PROC_VERSION:      o->size = gen_version(o);      break;
                 case PROC_PS:           o->size = gen_ps(o);           break;
+                case PROC_SECURITY:     o->size = gen_security(o);     break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

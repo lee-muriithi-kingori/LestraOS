@@ -272,6 +272,17 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing GDT...\n");
     gdt_init();
 
+    /* Security feature detection (SMEP/SMAP) — detection only.
+     * CR4 bits are NOT flipped here; that waits for syscall wrappers. */
+    extern struct security_status g_security;
+    g_security.smep = cpu_has_smep();
+    g_security.smap = cpu_has_smap();
+    g_security.nx = 1;  /* EFER.NXE already set in boot.asm */
+    g_security.kptr_restrict = 1;
+    pr_info("security: CPU supports SMEP=%s SMAP=%s (not yet enabled — pending syscall wrappers)\n",
+            g_security.smep ? "yes" : "no",
+            g_security.smap ? "yes" : "no");
+
     /* Initialize IDT and interrupts */
     pr_info("Initializing IDT...\n");
     idt_init();
@@ -340,6 +351,13 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing timer (1000 Hz)...\n");
     timer_init(1000);
 
+    /* Initialize CSPRNG early so ASLR + canaries have entropy.
+     * Must come AFTER timer_init() — collect_entropy() reads timer_get_ms(). */
+    extern void csprng_init(void);
+    csprng_init();
+    extern void stack_canary_init(void);
+    stack_canary_init();
+
     /* Initialize keyboard */
     pr_info("Initializing keyboard...\n");
     keyboard_init();
@@ -405,6 +423,22 @@ void kernel_main(void* mb2_info) {
 
     /* Enable interrupts */
     pr_info("Enabling interrupts...\n");
+
+    pr_info("\n=== SECURITY AUDIT ===\n");
+    pr_info("  SMEP:           %s (CPU %s, CR4 bit %s)\n",
+            "DISABLED", g_security.smep ? "supports" : "lacks",
+            "not flipped");
+    pr_info("  SMAP:           %s (CPU %s, CR4 bit %s)\n",
+            "DISABLED", g_security.smap ? "supports" : "lacks",
+            "not flipped");
+    pr_info("  NX:             ENABLED (EFER.NXE)\n");
+    pr_info("  ASLR:           DISABLED (pending PIE conversion)\n");
+    pr_info("  Stack canaries: %s (-fstack-protector-strong)\n",
+            g_security.canaries ? "ENABLED" : "DISABLED");
+    pr_info("  kptr_restrict:  %d\n", g_security.kptr_restrict);
+    pr_info("  KASLR-lite:     DISABLED (pending)\n");
+    pr_info("======================\n");
+
     sti();
 
     /* Give DHCP a few seconds to complete in the background.

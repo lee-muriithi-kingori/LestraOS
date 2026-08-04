@@ -90,3 +90,24 @@ __noreturn void panicf(const char* fmt, ...) {
     va_end(args);
     panic(buf);
 }
+
+/* Global security status — populated at boot from kernel_main.c,
+ * read by /proc/security and the boot-time SECURITY AUDIT print. */
+struct security_status g_security = {0};
+
+/* Stack canary support — compiled in via -fstack-protector-strong in Makefile.
+ * The guard is initialized once at boot from the CSPRNG. */
+uintptr_t __stack_chk_guard = 0x0BADF00DDEADBEEFull;  /* safe default before csprng */
+
+__noreturn void __stack_chk_fail(void) {
+    /* Called by GCC-generated epilogue code when the canary word has been smashed.
+     * Unrecoverable — the kernel cannot trust its own stack. */
+    panic("Stack smashing detected (__stack_chk_fail)");
+}
+
+void stack_canary_init(void) {
+    extern uint64_t csprng_u64(void);
+    __stack_chk_guard = csprng_u64();
+    if ((__stack_chk_guard & 0xFF) == 0) __stack_chk_guard |= 0x5A;
+    g_security.canaries = 1;
+}

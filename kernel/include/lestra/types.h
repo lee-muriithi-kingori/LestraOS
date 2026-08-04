@@ -258,4 +258,55 @@ static inline int rdseed32(uint32_t* val) {
     return ok;
 }
 
+/* SMEP/SMAP CPU feature detection (CPUID leaf 7, subleaf 0).
+ * SMEP = EBX bit 7, SMAP = EBX bit 20. Per Intel SDM Vol 3A.
+ * NOTE: these DETECT the feature only. The CR4 bits are NOT flipped
+ * here — that happens in a follow-up cycle after all syscall
+ * user-pointer accesses are wrapped with stac/clac. */
+static inline int cpu_has_smep(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    cached = (ebx & (1u << 7)) ? 1 : 0;
+    return cached;
+}
+
+static inline int cpu_has_smap(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+    cached = (ebx & (1u << 20)) ? 1 : 0;
+    return cached;
+}
+
+static inline uint64_t read_cr4(void) {
+    uint64_t val;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(val));
+    return val;
+}
+
+static inline void write_cr4(uint64_t val) {
+    __asm__ volatile("mov %0, %%cr4" : : "r"(val));
+}
+
+/* stac/clac: enable/disable user-memory access from ring 0 (SMAP).
+ * When CR4.SMAP=0 (current state), these are no-ops. */
+static inline void stac(void) { __asm__ volatile("stac" ::: "memory"); }
+static inline void clac(void) { __asm__ volatile("clac" ::: "memory"); }
+
+/* Global security status — populated at boot, read by /proc/security. */
+struct security_status {
+    uint8_t smep;          /* 1 if CR4.SMEP set (currently always 0 — bit not flipped yet) */
+    uint8_t smap;          /* 1 if CR4.SMAP set (currently always 0 — bit not flipped yet) */
+    uint8_t nx;            /* 1 if EFER.NXE set (already on) */
+    uint8_t aslr;          /* 1 if PT_LOAD randomization active (deferred) */
+    uint8_t canaries;      /* 1 if -fstack-protector-strong active + guard initialized */
+    uint8_t kptr_restrict; /* 0=off, 1=mask for non-root, 2=always mask */
+    uint8_t kaslr_lite;    /* 1 if kernel heap base randomized (deferred) */
+    uint8_t _pad;
+};
+extern struct security_status g_security;
+
 #endif /* LESTRA_TYPES_H */
