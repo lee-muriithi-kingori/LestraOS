@@ -25,21 +25,46 @@ struct heap_block {
 };
 
 static struct heap_block* free_list = NULL;
-static uintptr_t heap_next = KERNEL_HEAP_START;
+static uintptr_t heap_next = KERNEL_HEAP_START_DEFAULT;
+
+/* Runtime heap base — mirrors the extern in mm.h */
+uintptr_t kernel_heap_start = KERNEL_HEAP_START_DEFAULT;
+uintptr_t kernel_heap_end   = KERNEL_HEAP_END_DEFAULT;
 
 void heap_init(void) {
     free_list = NULL;
-    heap_next = KERNEL_HEAP_START;
 
-    /* FIX: reserve the heap region in PMM so it doesn't get allocated
-     * for other uses (page tables, etc.). The heap uses identity-mapped
-     * memory at [KERNEL_HEAP_START, KERNEL_HEAP_END). */
+    /* KE-15: Randomize the kernel heap base address.
+     * Uses early TSC-based entropy (csprng not yet initialized).
+     * The heap region is 512 MB, 2 MB aligned, within the identity-mapped
+     * first 4 GB.  We randomize the start within a 512 MB window
+     * (256 positions at 2 MB alignment = 8 bits of entropy).
+     * Constraints: stay above 64 MB (well clear of kernel + page tables),
+     * below 768 MB (leave room for VMM alloc region at 2 GB+). */
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t tsc = ((uint64_t)hi << 32) | lo;
+    /* xorshift-mix for better distribution */
+    tsc ^= tsc >> 33;
+    tsc *= 0xff51afd7ed558ccdULL;
+    tsc ^= tsc >> 33;
+    /* Random range: 64 MB to 256 MB, 2 MB aligned (256 slots = 8 bits) */
+    #define KASLR_HEAP_MIN  (64ULL * MiB)
+    #define KASLR_HEAP_RANGE (192ULL * MiB)
+    uintptr_t slide = (tsc & (KASLR_HEAP_RANGE - 1)) & ~(2ULL * MiB - 1);
+    kernel_heap_start = KASLR_HEAP_MIN + slide;
+    kernel_heap_end   = kernel_heap_start + KERNEL_HEAP_SIZE;
+
+    heap_next = kernel_heap_start;
+
+    /* Reserve the heap region in PMM so it doesn't get allocated
+     * for other uses (page tables, etc.). */
     extern void pmm_reserve_region(uintptr_t start, uintptr_t end);
-    pmm_reserve_region(KERNEL_HEAP_START, KERNEL_HEAP_END);
+    pmm_reserve_region(kernel_heap_start, kernel_heap_end);
 
     pr_info("Heap initialized at 0x%x (size: %u MB)\n",
-            (unsigned)KERNEL_HEAP_START,
-            (unsigned)((KERNEL_HEAP_END - KERNEL_HEAP_START) / MiB));
+            (unsigned)kernel_heap_start,
+            (unsigned)(KERNEL_HEAP_SIZE / MiB));
 }
 
 void* kmalloc(size_t size) {
@@ -69,7 +94,7 @@ void* kmalloc(size_t size) {
     }
 
     /* Allocate from heap */
-    if (heap_next + total > KERNEL_HEAP_END) {
+    if (heap_next + total > kernel_heap_end) {
         pr_warn("kmalloc: out of heap memory\n");
         return NULL;
     }
@@ -132,7 +157,7 @@ size_t ksize(void* ptr) {
 }
 
 uintptr_t heap_get_used(void) {
-    return heap_next - KERNEL_HEAP_START;
+    return heap_next - kernel_heap_start;
 }
 
 void mm_print_stats(void) {

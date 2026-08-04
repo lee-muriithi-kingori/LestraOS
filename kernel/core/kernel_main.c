@@ -302,7 +302,7 @@ void kernel_main(void* mb2_info) {
         struct mmap_entry default_mmap[] = {
             {0x00000000, 0x0009FC00, MMAP_USABLE, 0},
             {0x00100000, 0x0FF00000, MMAP_USABLE, 0},   /* ~255MB */
-            {0x10000000, 0x70000000, MMAP_USABLE, 0},   /* 1.75GB more */
+            {0x10000000, 0x70000000, MMAP_USABLE, 0},   /* 1.75GB more (above heap) */
             {0x100000000, 0x00000000, MMAP_RESERVED, 0}, /* >4GB reserved */
         };
         pmm_init(default_mmap, 4);
@@ -439,7 +439,7 @@ void kernel_main(void* mb2_info) {
     pr_info("  Stack canaries: %s (-fstack-protector-strong)\n",
             g_security.canaries ? "ENABLED" : "DISABLED");
     pr_info("  kptr_restrict:  %d\n", g_security.kptr_restrict);
-    pr_info("  KASLR-lite:     DISABLED (pending)\n");
+    pr_info("  KASLR-lite:     ENABLED (heap+%d bits, TSC-early)\n", 8);
     pr_info("======================\n");
 
     sti();

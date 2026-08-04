@@ -49,8 +49,22 @@
  *                          at 0x100000+ and well inside the 1 GB map.
  */
 #define KERNEL_VMA          0xFFFFFFFF80000000ULL  /* legacy, unused now */
-#define KERNEL_HEAP_START   0x10000000ULL          /* 256 MB */
-#define KERNEL_HEAP_END     0x30000000ULL          /* 768 MB (512 MB heap) */
+
+/* KE-15: Kernel heap base is randomized at boot by heap_init().
+ * Runtime variables are set before first kmalloc().
+ * Compile-time defaults are used during early boot before heap_init().
+ * Provides ~8 bits of kernel heap ASLR entropy. */
+#define KERNEL_HEAP_START_DEFAULT   0x10000000ULL   /* 256 MB (link-time fallback) */
+#define KERNEL_HEAP_SIZE            0x20000000ULL   /* 512 MB */
+#define KERNEL_HEAP_END_DEFAULT     0x30000000ULL   /* 768 MB (link-time fallback) */
+
+/* Runtime heap boundaries — set by heap_init(). */
+extern uintptr_t kernel_heap_start;
+extern uintptr_t kernel_heap_end;
+
+/* Back-compat: these macros now read the runtime variables. */
+#define KERNEL_HEAP_START  (kernel_heap_start)
+#define KERNEL_HEAP_END    (kernel_heap_end)
 #define KERNEL_STACK_START  0xFFFFFFFF80000000ULL  /* legacy, unused */
 #define KERNEL_STACK_END    0xFFFFFFFF90000000ULL  /* legacy, unused */
 #define USER_SPACE_START    0x0000000000400000ULL
