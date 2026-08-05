@@ -90,6 +90,11 @@ uint64_t timer_get_ticks(void) {
     return ticks;
 }
 
+/* KE-26: Expose the timer frequency for /proc/uptime. */
+uint32_t timer_get_frequency(void) {
+    return frequency;
+}
+
 uint64_t timer_get_ms(void) {
     return (ticks * 1000) / frequency;
 }

@@ -46,6 +46,8 @@ enum procfs_kind {
     PROC_VERSION,
     PROC_PS,        /* process listing (like /proc/ps) */
     PROC_SECURITY,  /* /proc/security — protection status */
+    PROC_UPTIME,    /* /proc/uptime — kernel uptime in seconds */
+    PROC_LOADAVG,   /* /proc/loadavg — process load average */
 };
 
 struct procfs_open {
@@ -316,7 +318,48 @@ static size_t gen_security(struct procfs_open* o) {
     off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
                      "kptr_restrict        %d\n", g_security.kptr_restrict);
     off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
-                     "KASLR-lite           off   pending\n");
+                     "KASLR-lite           %s  heap+%d bits (TSC-early)\n",
+                     g_security.kaslr_lite ? "on " : "off",
+                     8);
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "SyscallReturn        iretq  KE-26 (explicit CS/SS frame)\n");
+    return (size_t)off;
+}
+
+/* KE-26: Generate /proc/uptime — kernel uptime in seconds (Linux format). */
+static size_t gen_uptime(struct procfs_open* o) {
+    extern uint64_t timer_get_ticks(void);
+    extern uint32_t timer_get_frequency(void);
+    uint64_t ticks = timer_get_ticks();
+    uint32_t freq = timer_get_frequency();
+    uint64_t uptime_secs = freq ? ticks / freq : 0;
+    uint64_t idle_secs = 0;  /* idle not tracked yet */
+    int off = ksnprintf(o->buf, sizeof(o->buf),
+                        "%llu.%02llu %llu.%02llu\n",
+                        (unsigned long long)uptime_secs,
+                        (unsigned long long)((ticks % freq) * 100 / freq),
+                        (unsigned long long)idle_secs,
+                        (unsigned long long)0);
+    return (size_t)off;
+}
+
+/* KE-26: Generate /proc/loadavg — process load average (simplified).
+ * Linux format: "0.00 0.00 0.00 1/32 1234" (1min/5min/15min avg,
+ * runnable/total processes, last PID). We don't track real load averages
+ * yet, but we report the current process count and last PID. */
+static size_t gen_loadavg(struct procfs_open* o) {
+    extern struct process procs[];
+    int runnable = 0, total = 0, last_pid = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (procs[i].state == PROC_FREE) continue;
+        total++;
+        if (procs[i].state == PROC_RUNNING || procs[i].state == PROC_RUNNABLE)
+            runnable++;
+        if (procs[i].pid > last_pid) last_pid = procs[i].pid;
+    }
+    int off = ksnprintf(o->buf, sizeof(o->buf),
+                        "0.00 0.00 0.00 %d/%d %d\n",
+                        runnable, total, last_pid);
     return (size_t)off;
 }
 
@@ -333,6 +376,8 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/version")      == 0) return PROC_VERSION;
     if (strcmp(path, "/proc/ps")           == 0) return PROC_PS;
     if (strcmp(path, "/proc/security")     == 0) return PROC_SECURITY;
+    if (strcmp(path, "/proc/uptime")       == 0) return PROC_UPTIME;
+    if (strcmp(path, "/proc/loadavg")      == 0) return PROC_LOADAVG;
     return PROC_NONE;
 }
 
@@ -356,6 +401,8 @@ int procfs_open(const char* path) {
                 case PROC_VERSION:      o->size = gen_version(o);      break;
                 case PROC_PS:           o->size = gen_ps(o);           break;
                 case PROC_SECURITY:     o->size = gen_security(o);     break;
+                case PROC_UPTIME:       o->size = gen_uptime(o);       break;
+                case PROC_LOADAVG:      o->size = gen_loadavg(o);      break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

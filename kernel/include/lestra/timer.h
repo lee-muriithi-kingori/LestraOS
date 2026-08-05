@@ -13,6 +13,7 @@
 
 void timer_init(uint32_t frequency);
 uint64_t timer_get_ticks(void);
+uint32_t timer_get_frequency(void);  /* KE-26: for /proc/uptime */
 uint64_t timer_get_ms(void);
 void timer_set_handler(void (*handler)(void));
 void timer_wait_ms(uint32_t ms);
