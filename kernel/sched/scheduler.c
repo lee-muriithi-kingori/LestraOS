@@ -688,27 +688,33 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
 
     pr_info("sched: starting first process '%s' (pid %d) [cooperative]\n", name, pid);
 
-    uint64_t old_cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
-    __asm__ volatile("mov %0, %%cr3" : : "r"((uint64_t)current->pml4));
-    save_kernel_cr3 = old_cr3;
+    /* KE-25: Do NOT pre-switch CR3 here. elf_jump_to_user() saves the
+     * CURRENT cr3 into save_kernel_cr3 and then switches to the user
+     * PML4. If we switch CR3 first, save_kernel_cr3 ends up = the user
+     * PML4 (wrong) instead of the boot kernel CR3. Let elf_jump_to_user
+     * do the save+switch, exactly like elf_exec. */
 
     /* KE-25: arm TSS.RSP0 with PID 1's kernel stack BEFORE jumping to
      * ring 3. The first timer IRQ in userspace loads RSP from tss.rsp0;
      * if it's 0/stale the CPU can't push the interrupt frame and
      * triple-faults. elf_exec did this; sched_start_first must too.
      *
-     * We use a static 16 KB BSS stack (like elf_exec) for PID 1 instead
-     * of the kmalloc'd current->kernel_stack: the kmalloc'd heap address
-     * caused the first timer IRQ to triple-fault (the heap block header
-     * misalignment / non-16-aligned RSP0 corrupts the interrupt frame
-     * push). The static buffer is 16-byte aligned and in the identity-
-     * mapped BSS, so the CPU can reliably push the IRQ frame. */
+     * We use a static 16 KB BSS stack (like elf_exec) for PID 1: it is
+     * 16-byte aligned and in the identity-mapped BSS, so both interrupt
+     * delivery (TSS.RSP0) and syscall entry (g_syscall_kstack) can
+     * reliably push frames here. */
     static uint8_t pid1_kstack[16384] __aligned(16);
     current->kernel_stack = pid1_kstack;
     current->kernel_stack_top = (uint64_t)pid1_kstack + sizeof(pid1_kstack);
     extern void tss_set_rsp0(uint64_t);
     tss_set_rsp0(current->kernel_stack_top);
+
+    /* KE-25: publish the kernel stack top for syscall_entry.asm, which
+     * switches RSP to this value on every syscall (syscall does NOT
+     * load RSP from TSS, so without this the kernel would push onto the
+     * user stack → SMAP triple-fault). */
+    extern uint64_t g_syscall_kstack;
+    g_syscall_kstack = current->kernel_stack_top;
 
     elf_jump_to_user(current->entry_point, current->user_stack_ptr,
                      (uintptr_t)current->pml4);

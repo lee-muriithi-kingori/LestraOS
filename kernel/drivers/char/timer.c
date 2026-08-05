@@ -35,9 +35,14 @@ static void timer_irq_handler(struct interrupt_frame* frame) {
     }
 
     extern void sched_tick(void);
-    extern void schedule(struct interrupt_frame* frame);
+    /* KE-25: sched_tick() already calls schedule() when the scheduler is
+     * enabled. The previous UNCONDITIONAL schedule(frame) call here fired
+     * a context switch on every timer IRQ even with preemption disabled,
+     * which — once PID 1 became `current` — drove the broken
+     * context_switch path every tick and triple-faulted. Removing the
+     * duplicate call means context switches only happen when the
+     * scheduler is explicitly enabled. */
     sched_tick();
-    schedule(frame);
 
     /* Pump the network stack. net_tick() is a no-op if net_init() hasn't
      * been called yet or if there's no NIC. Called from IRQ0 context so

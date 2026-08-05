@@ -16,8 +16,33 @@ bits 64
 global syscall_entry
 extern syscall_dispatch
 
+; KE-25: Kernel stack for syscall entry.
+; The `syscall` instruction does NOT load a new RSP (unlike interrupt
+; delivery, which loads RSP from TSS.RSP0 on a privilege change). Without
+; an explicit stack switch here, the kernel would push registers onto the
+; USER stack. Under SMAP (CR4.SMAP=1) that is a supervisor write to a
+; user page with AC clear → #PF; the #PF handler runs at CPL=0 with the
+; SAME user RSP, tries to push its frame to the user stack → another SMAP
+; #PF → recursive fault → #DF → triple fault. This was the SMAP-on
+; triple-fault root cause.
+;
+; g_syscall_kstack is set by sched_start_first() (and context_switch) to
+; the current process's kernel_stack_top. We save the user RSP and switch
+; to it before any push, then restore the user RSP before sysretq (which
+; does not touch RSP).
+global g_syscall_kstack
+global g_saved_user_rsp
+section .data
+g_syscall_kstack:    dq 0
+g_saved_user_rsp:    dq 0
+
+section .text
 syscall_entry:
     swapgs                          ; kernel GS base now active
+
+    ; KE-25: switch to the kernel stack BEFORE pushing anything.
+    mov [g_saved_user_rsp], rsp     ; save user RSP
+    mov rsp, [g_syscall_kstack]     ; load kernel stack top
 
     ; Save user RIP (RCX) and RFLAGS (R11)
     push rcx
@@ -64,6 +89,10 @@ syscall_entry:
     pop rbx
     pop r11
     pop rcx
+
+    ; KE-25: restore the user RSP before sysretq (sysretq loads RIP from
+    ; RCX and RFLAGS from R11 but does NOT change RSP).
+    mov rsp, [g_saved_user_rsp]
 
     swapgs                      ; restore user GS base
 
