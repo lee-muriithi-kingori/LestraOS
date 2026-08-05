@@ -176,10 +176,10 @@ struct virtq_used {
  * Queue Configuration
  * ======================================================================== */
 
-#define VBLK_QUEUE_SIZE       16    /* entries per virtqueue */
+#define VBLK_QUEUE_SIZE       16    /* entries per virtqueue (modern mode max) */
+#define VBLK_VQ_PAGES         4     /* 4 pages: enough for QueueNum up to ~250 */
 #define VBLK_SECTOR_SIZE      512
 #define VBLK_VQ_ALIGN         4096
-#define VBLK_VQ_PAGES         3     /* 3 pages per virtqueue */
 
 /* Each request uses 3 chained descriptors:
  *   desc 0: request header (16 bytes, device reads)
@@ -669,10 +669,15 @@ int virtio_blk_init(void) {
     /* Step 9: Set up the request virtqueue (queue 0) */
     vblk_select_queue(0);
     vblk_qsz = vblk_read_queue_size();
-    if (vblk_qsz == 0 || vblk_qsz > VBLK_QUEUE_SIZE) {
+    if (vblk_qsz == 0) vblk_qsz = VBLK_QUEUE_SIZE;
+    /* CRITICAL: In legacy mode, do NOT clamp queue size.
+     * The device computes virtqueue layout from its own QueueNum.
+     * If our layout uses a different (smaller) QueueNum, the
+     * avail/used rings end up at different offsets and the
+     * device never sees our descriptors. Clamp only for modern
+     * transport where we write the size back to the device. */
+    if (vblk_is_modern && vblk_qsz > VBLK_QUEUE_SIZE) {
         vblk_qsz = VBLK_QUEUE_SIZE;
-    }
-    if (vblk_is_modern) {
         vblk_write_queue_size(vblk_qsz);
     }
 
@@ -797,24 +802,36 @@ static int vblk_do_request(uint32_t type, uint64_t sector, uint32_t count,
     barrier();
     vblk_notify_queue(0);
 
-    /* Wait for the device to process the request (poll used ring) */
+    /* Wait for the device to process the request (poll used ring).
+     * CRITICAL: The used ring is written by the device via DMA.
+     * GCC -O2 hoists non-volatile reads out of tight loops, so we
+     * MUST read through a volatile-qualified pointer to force a
+     * real load from memory on every iteration. */
+    volatile struct virtq_used* vblk_used_v = (volatile struct virtq_used*)vblk_used;
     int timed_out = 1;
-    for (int i = 0; i < 20000000; i++) {
-        if (vblk_used->idx != vblk_last_used) {
+    for (int i = 0; i < 2000000; i++) {
+        uint16_t used_idx = vblk_used_v->idx;
+        if (used_idx != vblk_last_used) {
             timed_out = 0;
             break;
         }
     }
 
     if (timed_out) {
-        pr_warn("virtio_blk: request timeout (type=%u, sector=%u, count=%u)\n",
-                (unsigned)type, (unsigned)sector, (unsigned)count);
+        /* Diagnostic: re-read once with volatile to check if device
+         * completed after our loop exited (confirms hoisting bug). */
+        uint16_t final_idx = vblk_used_v->idx;
+        pr_warn("virtio_blk: request timeout (type=%u, sector=%u, count=%u) "
+                "used_idx=%u last_used=%u\n",
+                (unsigned)type, (unsigned)sector, (unsigned)count,
+                (unsigned)final_idx, (unsigned)vblk_last_used);
         return 0;
     }
 
-    /* Process the used ring entry */
+    /* Process the used ring entry (read through volatile to get
+     * device-written len, then use non-volatile for status check). */
     uint16_t used_slot = vblk_last_used % vblk_qsz;
-    struct virtq_used_elem* ue = &vblk_used->ring[used_slot];
+    struct virtq_used_elem* ue = &((volatile struct virtq_used*)vblk_used)->ring[used_slot];
     vblk_last_used++;
 
     /* Check status byte */
