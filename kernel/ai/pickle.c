@@ -448,10 +448,10 @@ size_t pickle_type_size(uint32_t type, uint64_t n) {
         case GGML_Q4_1: return (size_t)((n / 32) * 20);
         case GGML_Q5_0: return (size_t)((n / 32) * 22);
         case GGML_Q5_1: return (size_t)((n / 32) * 24);
-        case GGML_Q6_K: return (size_t)((n / 256) * 211);
+        case GGML_Q6_K: return (size_t)((n / 256) * 210);
         case GGML_Q5_K: return (size_t)((n / 256) * 176);
         case GGML_Q4_K: return (size_t)((n / 256) * 144);
-        case GGML_Q3_K: return (size_t)((n / 256) * 128);
+        case GGML_Q3_K: return (size_t)((n / 256) * 110);
         case GGML_Q2_K: return (size_t)((n / 256) * 84);
         case GGML_Q8_K: return (size_t)((n / 256) * 292);
         default: return 0;
@@ -571,139 +571,184 @@ int pickle_dequant_stream(pickle_io_t* io, uint32_t type, uint64_t n, float* out
             }
             return PICKLE_OK;
         }
-        /* K-quants: simplified layouts (see note in original docs).
-         * These match llama.cpp's block structure for the most common case
-         * and are exercised only when loading real models via the host CLI.
-         * For the kernel self-test we always use F32. */
+        /* K-quants: correct GGML block layouts matching ggml/ggjt spec.
+ * Block sizes: Q2_K=84, Q3_K=110, Q4_K=144, Q5_K=176, Q6_K=210, Q8_K=292.
+ * For the kernel self-test we always use F32. */
         case GGML_Q6_K: {
+            /* 210 bytes: ql[128] + qh[64] + scales[16] + d(f16,2) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
-                sfp_t d = read_f16_bits(io);
-                signed char scales[16], q[128];
+                unsigned char ql[128], qh[64];
+                signed char scales[16];
+                if (read_block(io, ql, 128))                    return PICKLE_ERR_IO;
+                if (read_block(io, qh, 64))                     return PICKLE_ERR_IO;
                 if (read_block(io, (unsigned char*)scales, 16)) return PICKLE_ERR_IO;
-                if (read_block(io, (unsigned char*)q, 128))     return PICKLE_ERR_IO;
-                sfp_t inv128 = sfp_div(SFP_ONE, sfp_from_int(128));
-                for (int sub = 0; sub < 16; sub++) {
-                    sfp_t sd = sfp_mul(d, sfp_mul(sfp_from_int((int32_t)scales[sub]), inv128));
-                    for (int i = 0; i < 8; i++) {
-                        int idx = sub*8 + i;
-                        out[b*256 + idx] = sfp_mul(sd, sfp_from_int((int32_t)q[idx]));
+                sfp_t d = read_f16_bits(io);
+                for (int i = 0; i < 256; i++) {
+                    int q = (ql[i/2] >> (4*(i & 1))) & 0x0F;
+                    int h;
+                    if (i < 128) {
+                        h = (qh[i/4] >> (2*(i & 3))) & 3;
+                    } else {
+                        int j = i - 128;
+                        h = (qh[32 + j/4] >> (2*(j & 3))) & 3;
                     }
+                    q |= (h << 4);
+                    if (q & 0x20) q -= 64;
+                    out[b*256 + i] = sfp_mul(d, sfp_mul(
+                        sfp_from_int((int32_t)q),
+                        sfp_from_int((int32_t)scales[i / 16])));
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q5_K: {
+            /* 176 bytes: d(f16,2) + dmin(f16,2) + sc(12) + qh(32) + qs(128) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
-                sfp_t d = read_f16_bits(io);
-                signed char scales[16];
-                unsigned char qh[16], ql[64];
-                if (read_block(io, (unsigned char*)scales, 16)) return PICKLE_ERR_IO;
-                if (read_block(io, qh, 16)) return PICKLE_ERR_IO;
-                if (read_block(io, ql, 64)) return PICKLE_ERR_IO;
-                sfp_t inv16 = sfp_div(SFP_ONE, sfp_from_int(16));
-                for (int sub = 0; sub < 16; sub++) {
-                    sfp_t sd = sfp_mul(d, sfp_mul(sfp_from_int((int32_t)scales[sub]), inv16));
-                    for (int i = 0; i < 16; i++) {
-                        int idx = sub*16 + i;
-                        int lo = ql[idx] & 0x0F;
-                        int hi = (qh[sub] >> (i % 8)) & 1;
-                        out[b*256 + idx] = sfp_mul(sd, sfp_from_int(lo | (hi << 4)));
-                    }
+                sfp_t d    = read_f16_bits(io);
+                sfp_t dmin = read_f16_bits(io);
+                unsigned char sc[12], qh[32], qs[128];
+                if (read_block(io, sc, 12))     return PICKLE_ERR_IO;
+                if (read_block(io, qh, 32))     return PICKLE_ERR_IO;
+                if (read_block(io, qs, 128))    return PICKLE_ERR_IO;
+                int ks[8];
+                for (int i = 0; i < 8; i++) {
+                    int v = sc[i] & 0x3F;
+                    if (v & 0x20) v -= 64;
+                    ks[i] = v;
+                }
+                int mns[4];
+                for (int i = 0; i < 4; i++) {
+                    int v = sc[8 + i] & 0x3F;
+                    if (v & 0x20) v -= 64;
+                    mns[i] = v;
+                }
+                for (int i = 0; i < 256; i++) {
+                    int sub = i / 32;
+                    int lo = (qs[i/2] >> (4*(i & 1))) & 0x0F;
+                    int hi = (qh[i/8] >> (i % 8)) & 1;
+                    int qv = lo | (hi << 4);
+                    sfp_t sv = sfp_mul(d, sfp_from_int(ks[sub]));
+                    sfp_t mv = sfp_mul(dmin, sfp_from_int(mns[sub / 2]));
+                    out[b*256 + i] = sfp_sub(sfp_mul(sv, sfp_from_int(qv)), mv);
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q4_K: {
+            /* 144 bytes: d(f16,2) + dmin(f16,2) + sc(12) + qs(128) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
                 sfp_t d    = read_f16_bits(io);
                 sfp_t dmin = read_f16_bits(io);
-                unsigned char sm[12], q[128];
-                if (read_block(io, sm, 12)) return PICKLE_ERR_IO;
-                if (read_block(io, q, 128)) return PICKLE_ERR_IO;
-                signed char scales[8], mins[8];
+                unsigned char sc[12], qs[128];
+                if (read_block(io, sc, 12))     return PICKLE_ERR_IO;
+                if (read_block(io, qs, 128))    return PICKLE_ERR_IO;
+                int ks[8];
                 for (int i = 0; i < 8; i++) {
-                    int v = sm[i] & 0x3F;
-                    if (v & 0x20) v |= 0xC0;
-                    scales[i] = (signed char)v;
+                    int v = sc[i] & 0x3F;
+                    if (v & 0x20) v -= 64;
+                    ks[i] = v;
                 }
+                int mns[4];
                 for (int i = 0; i < 4; i++) {
-                    mins[i*2]   = (signed char)(sm[8+i] & 0x3F);
-                    mins[i*2+1] = (signed char)((sm[8+i] >> 4) & 0x3F);
+                    mns[i] = sc[8 + i] & 0x0F;
                 }
-                for (int sub = 0; sub < 8; sub++) {
-                    sfp_t sd = sfp_mul(d, sfp_from_int((int32_t)scales[sub]));
-                    sfp_t sm_v = sfp_mul(dmin, sfp_from_int((int32_t)mins[sub]));
-                    for (int i = 0; i < 32; i++) {
-                        int idx = sub*32 + i;       /* 0..255 */
-                        /* 4-bit packing: 2 elements per byte, 128 bytes for 256 elements */
-                        unsigned char byte = q[idx / 2];
-                        int v = (idx & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
-                        out[b*256 + idx] = sfp_sub(sfp_mul(sd, sfp_from_int(v)), sm_v);
-                    }
+                for (int i = 0; i < 256; i++) {
+                    int sub = i / 32;
+                    int qv = (qs[i/2] >> (4*(i & 1))) & 0x0F;
+                    sfp_t sv = sfp_mul(d, sfp_from_int(ks[sub]));
+                    sfp_t mv = sfp_mul(dmin, sfp_from_int(mns[sub / 2]));
+                    out[b*256 + i] = sfp_sub(sfp_mul(sv, sfp_from_int(qv)), mv);
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q3_K: {
+            /* 110 bytes: hmask(32) + qs(64) + sc(12) + pad(2) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
-                sfp_t d = read_f16_bits(io);
-                signed char scales[12];
-                unsigned char q[128];
-                if (read_block(io, (unsigned char*)scales, 12)) return PICKLE_ERR_IO;
-                if (read_block(io, q, 128)) return PICKLE_ERR_IO;
-                sfp_t inv32 = sfp_div(SFP_ONE, sfp_from_int(32));
-                for (int sub = 0; sub < 8; sub++) {
-                    sfp_t sd = sfp_mul(d, sfp_mul(sfp_from_int((int32_t)scales[sub]), inv32));
-                    for (int i = 0; i < 32; i++) {
-                        int idx = sub*32 + i;
-                        int v = q[idx] & 0x0F;
-                        if (v & 0x08) v -= 16;
-                        out[b*256 + idx] = sfp_mul(sd, sfp_from_int(v));
-                    }
+                unsigned char hmask[32], qs[64], sc[12], pad[2];
+                if (read_block(io, hmask, 32))   return PICKLE_ERR_IO;
+                if (read_block(io, qs, 64))      return PICKLE_ERR_IO;
+                if (read_block(io, sc, 12))      return PICKLE_ERR_IO;
+                if (read_block(io, pad, 2))      return PICKLE_ERR_IO;
+                uint16_t du = (uint16_t)sc[0] | ((uint16_t)sc[1] << 8);
+                sfp_t d = f16_to_f32_bits(du);
+                uint16_t dmin_u = (uint16_t)sc[2] | ((uint16_t)sc[3] << 8);
+                sfp_t dmin = f16_to_f32_bits(dmin_u);
+                int ks[8];
+                for (int i = 0; i < 8; i++) {
+                    int v = sc[4 + i] & 0x3F;
+                    if (v & 0x20) v -= 64;
+                    ks[i] = v;
+                }
+                for (int i = 0; i < 256; i++) {
+                    int byte_idx = i / 4;
+                    int bit_off  = 2 * (i & 3);
+                    int q = (qs[byte_idx] >> bit_off) & 0x03;
+                    if (q & 0x02) q -= 4;
+                    if ((hmask[i / 8] >> (i % 8)) & 1) q += 4;
+                    int sub = i / 32;
+                    sfp_t sv = sfp_mul(d, sfp_mul(sfp_from_int(ks[sub]), sfp_from_int(q)));
+                    out[b*256 + i] = sfp_sub(sv, dmin);
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q2_K: {
+            /* 84 bytes: d(f16,2) + dmin(f16,2) + scales(16) + qs(64) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
-                sfp_t d = read_f16_bits(io);
+                sfp_t d    = read_f16_bits(io);
                 sfp_t dmin = read_f16_bits(io);
-                signed char scales[12];
-                unsigned char q[64];
-                if (read_block(io, (unsigned char*)scales, 12)) return PICKLE_ERR_IO;
-                if (read_block(io, q, 64)) return PICKLE_ERR_IO;
-                for (int sub = 0; sub < 16; sub++) {
-                    sfp_t sd = sfp_mul(d, sfp_from_int((int32_t)scales[sub]));
-                    sfp_t sm_v = sfp_mul(dmin, sfp_from_int((int32_t)scales[sub]));
-                    for (int i = 0; i < 16; i++) {
-                        int idx = sub*16 + i;
-                        int v;
-                        if (i % 4 == 0)      v = q[idx/4] & 0x03;
-                        else if (i % 4 == 1) v = (q[idx/4] >> 2) & 0x03;
-                        else if (i % 4 == 2) v = (q[idx/4] >> 4) & 0x03;
-                        else                 v = (q[idx/4] >> 6) & 0x03;
-                        out[b*256 + idx] = sfp_sub(sfp_mul(sd, sfp_from_int(v)), sm_v);
+                unsigned char sc_raw[16], qs[64];
+                if (read_block(io, sc_raw, 16))  return PICKLE_ERR_IO;
+                if (read_block(io, qs, 64))      return PICKLE_ERR_IO;
+                int scales[32];
+                for (int g = 0; g < 4; g++) {
+                    uint32_t sw = (uint32_t)sc_raw[g*4]       |
+                                  ((uint32_t)sc_raw[g*4+1] << 8) |
+                                  ((uint32_t)sc_raw[g*4+2] << 16) |
+                                  ((uint32_t)sc_raw[g*4+3] << 24);
+                    for (int j = 0; j < 8; j++) {
+                        int v = (sw >> (4*j)) & 0x0F;
+                        if (v & 0x08) v -= 16;
+                        scales[g*8 + j] = v;
                     }
+                }
+                for (int i = 0; i < 256; i++) {
+                    int byte_idx = i / 4;
+                    int bit_off  = 2 * (i & 3);
+                    int q = (qs[byte_idx] >> bit_off) & 0x03;
+                    int sub = i / 16;
+                    sfp_t sv = sfp_mul(d, sfp_mul(sfp_from_int(scales[sub]), sfp_from_int(q)));
+                    out[b*256 + i] = sfp_sub(sv, dmin);
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q8_K: {
+            /* 292 bytes: d(f32,4) + qs(256) + dsubs(16) + scales(16) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
                 sfp_t d = read_f32_bits(io);
-                signed char q[256];
-                if (read_block(io, q, 256)) return PICKLE_ERR_IO;
-                for (int i = 0; i < 256; i++)
-                    out[b*256 + i] = sfp_mul(d, sfp_from_int((int32_t)q[i]));
+                signed char qs[256];
+                if (read_block(io, qs, 256)) return PICKLE_ERR_IO;
+                sfp_t dsubs[4], scales_v[4];
+                for (int s = 0; s < 4; s++) dsubs[s] = read_f32_bits(io);
+                for (int s = 0; s < 4; s++) scales_v[s] = read_f32_bits(io);
+                for (int i = 0; i < 256; i++) {
+                    int sub = i / 64;
+                    sfp_t sub_d = sfp_mul(d, scales_v[sub]);
+                    sfp_t sub_off = dsubs[sub];
+                    out[b*256 + i] = sfp_add(sfp_mul(sub_d, sfp_from_int(qs[i])), sub_off);
+                }
             }
             return PICKLE_OK;
         }
+
         default:
             return PICKLE_ERR_TYPE;
     }
