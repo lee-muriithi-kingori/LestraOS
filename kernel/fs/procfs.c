@@ -49,6 +49,7 @@ enum procfs_kind {
     PROC_UPTIME,    /* /proc/uptime — kernel uptime in seconds */
     PROC_LOADAVG,   /* /proc/loadavg — process load average */
     PROC_KMSG,      /* /proc/kmsg — kernel ring buffer (dmesg) */
+    PROC_CMDLINE,   /* /proc/cmdline — boot command line */
 };
 
 struct procfs_open {
@@ -371,6 +372,13 @@ static size_t gen_kmsg(struct procfs_open* o) {
     return kmsg_read(o->buf, sizeof(o->buf));
 }
 
+/* KE-26: Generate /proc/cmdline — boot command line from GRUB. */
+static size_t gen_cmdline(struct procfs_open* o) {
+    extern char g_boot_cmdline[256];
+    int off = ksnprintf(o->buf, sizeof(o->buf), "%s\n", g_boot_cmdline);
+    return (size_t)off;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -387,6 +395,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/uptime")       == 0) return PROC_UPTIME;
     if (strcmp(path, "/proc/loadavg")      == 0) return PROC_LOADAVG;
     if (strcmp(path, "/proc/kmsg")         == 0) return PROC_KMSG;
+    if (strcmp(path, "/proc/cmdline")      == 0) return PROC_CMDLINE;
     return PROC_NONE;
 }
 
@@ -413,6 +422,7 @@ int procfs_open(const char* path) {
                 case PROC_UPTIME:       o->size = gen_uptime(o);       break;
                 case PROC_LOADAVG:      o->size = gen_loadavg(o);      break;
                 case PROC_KMSG:         o->size = gen_kmsg(o);         break;
+                case PROC_CMDLINE:      o->size = gen_cmdline(o);      break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

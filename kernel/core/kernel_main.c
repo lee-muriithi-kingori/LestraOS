@@ -111,6 +111,8 @@ extern void shell_run_serial(void);  /* serial-only shell (no VGA needed) */
  * Other subsystems (SSH server, HTTP management API) can check this
  * to decide whether to auto-start. */
 int boot_cloud = 0;
+/* KE-26: Full boot cmdline for /proc/cmdline */
+char g_boot_cmdline[256] = {0};
 int boot_serial = 0;
 
 /* Return cloud boot flag for other subsystems */
@@ -572,6 +574,14 @@ void kernel_main(void* mb2_info) {
             if (tag->size < sizeof(struct mb2_tag)) break;
             if (tag->type == MB2_TAG_CMDLINE) {
                 const char* cmdline = (const char*)tag + 8;
+                /* KE-26: Save the full cmdline for /proc/cmdline */
+                extern char g_boot_cmdline[256];
+                size_t cl = 0;
+                while (cmdline[cl] && cl < 255) {
+                    g_boot_cmdline[cl] = cmdline[cl];
+                    cl++;
+                }
+                g_boot_cmdline[cl] = '\0';
                 if (strstr(cmdline, "gui")) boot_gui = 1;
                 if (strstr(cmdline, "legacy")) { boot_gui = 0; boot_legacy = 1; }
                 if (strstr(cmdline, "recovery")) boot_recovery = 1;
