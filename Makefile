@@ -401,7 +401,7 @@ run-cloud: all
 smoke: all
 	@echo "  Running cloud-mode smoke test (30s)..."
 	@timeout 30 qemu-system-x86_64 -L $(HOME)/.local/opt/devtools/usr/share/qemu \
-		 -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64 \
+		 -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64,+smep,+smap \
 		 -nographic -boot d -no-reboot \
 		 -serial stdio -monitor none \
 		 -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -409,6 +409,8 @@ smoke: all
 	@echo "  Smoke log: /tmp/lestra-smoke.log"
 	@grep -q "kernel initialized successfully" /tmp/lestra-smoke.log && echo "  PASS: kernel reached init" || echo "  FAIL: kernel did not reach init"
 	@grep -q "lestramk.org - Lightweight" /tmp/lestra-smoke.log && echo "  PASS: userspace /init banner printed" || echo "  WARN: /init banner not seen"
+	@grep -q "SMEP:.*ENABLED" /tmp/lestra-smoke.log && echo "  PASS: SMEP enabled" || echo "  WARN: SMEP not enabled"
+	@grep -q "SMAP:.*ENABLED" /tmp/lestra-smoke.log && echo "  PASS: SMAP enabled" || echo "  WARN: SMAP not enabled"
 
 run-debug: all
 	@echo "  Starting QEMU with GDB server..."
