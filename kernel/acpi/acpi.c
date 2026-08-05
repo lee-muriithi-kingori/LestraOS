@@ -281,7 +281,21 @@ static void acpi_dispatch_entry(uintptr_t addr, void* user_data) {
 
 /* ----- Public API ----- */
 
+int acpi_is_initialized(void) {
+    return g_acpi.found;
+}
+
 int acpi_init(void) {
+    /* Idempotency: acpi_init() may be invoked twice during boot
+     * (an early call for APIC setup, and the existing late call from
+     * kernel_main after battery_init). The second call must NOT memset
+     * g_acpi back to zero — that would erase the MADT data the APIC
+     * subsystem is already using. */
+    if (g_acpi.found) {
+        pr_debug("acpi: already initialized — skipping re-discovery\n");
+        return 0;
+    }
+
     memset(&g_acpi, 0, sizeof(g_acpi));
 
     pr_info("acpi: initializing table discovery...\n");
@@ -318,4 +332,12 @@ uint32_t acpi_isa_irq_to_gsi(uint8_t isa_irq) {
             return g_acpi.isa_overrides[i].gsi;
     }
     return (uint32_t)isa_irq;  /* Identity mapping */
+}
+
+uint16_t acpi_isa_irq_flags(uint8_t isa_irq) {
+    for (int i = 0; i < g_acpi.n_isa_overrides; i++) {
+        if (g_acpi.isa_overrides[i].source_irq == isa_irq)
+            return g_acpi.isa_overrides[i].flags;
+    }
+    return 0;  /* No override → ISA default (active-high, edge) */
 }

@@ -244,4 +244,18 @@ extern struct acpi_info g_acpi;
  * If no override exists, returns the IRQ itself (identity). */
 uint32_t acpi_isa_irq_to_gsi(uint8_t isa_irq);
 
+/* ISA interrupt-source override flags (MADT IntSrcOverride entry).
+ * Returns 0 if no override exists for this IRQ (meaning the ISA default:
+ * active-high, edge-triggered). Otherwise returns the raw 16-bit flags:
+ *   bits 0-1: polarity (0=conforming, 1=high, 2=reserved, 3=low)
+ *   bits 2-3: trigger  (0=conforming, 1=edge, 2=reserved, 3=level)
+ * "Conforming" for ISA means active-high edge, which the caller should
+ * treat identically to flags==0. */
+uint16_t acpi_isa_irq_flags(uint8_t isa_irq);
+
+/* Idempotency guard: acpi_init() may be called more than once during
+ * boot (early for APIC setup, and again later from the existing init
+ * sequence). The second call is a no-op so g_acpi is never reset. */
+int acpi_is_initialized(void);
+
 #endif /* LESTRA_ACPI_H */

@@ -293,6 +293,35 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing PIC...\n");
     pic_init();
 
+    /* KE-23: Discover ACPI tables EARLY (before any driver registers an
+     * IRQ handler) so the APIC subsystem can use the MADT's LAPIC/IOAPIC
+     * addresses and ISA-override mappings. acpi_init() is idempotent —
+     * the existing late call (after battery_init) becomes a no-op.
+     * Must come after idt_init (needs IDT for spurious vector gate) and
+     * after pic_init (apic_init calls pic_disable). */
+    pr_info("Initializing ACPI table discovery (early)...\n");
+    {
+        extern int acpi_init(void);
+        acpi_init();
+    }
+
+    /* KE-23: Bring up the Local APIC + IOAPIC. If the MADT was found,
+     * this disables the 8259 PIC and routes all ISA IRQs through the
+     * IOAPIC+LAPIC. From here on, register_irq_handler() / irq_enable()
+     * / pic_send_eoi() transparently talk to the APIC. Falls back to
+     * the PIC if no MADT (non-fatal). */
+    pr_info("Initializing APIC subsystem...\n");
+    {
+        extern int apic_init(void);
+        extern int irq_using_apic(void);
+        if (apic_init() == 0) {
+            pr_info("APIC active — interrupts routed via IOAPIC+LAPIC\n");
+        } else {
+            pr_info("APIC unavailable — using legacy 8259 PIC\n");
+        }
+        (void)irq_using_apic;
+    }
+
     /* Initialize memory management */
     pr_info("Initializing memory management...\n");
     if (mmap && mmap_count > 0) {
@@ -443,13 +472,6 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing power management...\n");
     extern int battery_init(void);
     battery_init();
-
-    /* Initialize ACPI table discovery (MADT/HPET/FACP)
-     * Must come after battery_init (which does its own PCI+ACPI
-     * scan) but before driver init that may use IOAPIC/HPET info. */
-    pr_info("Initializing ACPI table discovery...\n");
-    extern int acpi_init(void);
-    acpi_init();
 
     /* Initialize temperature sensors */
     extern int temp_init(void);

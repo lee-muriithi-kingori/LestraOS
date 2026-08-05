@@ -107,7 +107,8 @@ DRIVER_OBJS := $(patsubst kernel/drivers/char/%.c,$(BUILD_DIR)/drivers/char/%.o,
                            $(patsubst kernel/drivers/block/%.c,$(BUILD_DIR)/drivers/block/%.o,$(wildcard kernel/drivers/block/*.c)) \
                            $(patsubst kernel/drivers/audio/%.c,$(BUILD_DIR)/drivers/audio/%.o,$(wildcard kernel/drivers/audio/*.c)) \
                            $(patsubst kernel/drivers/pci/%.c,$(BUILD_DIR)/drivers/pci/%.o,$(wildcard kernel/drivers/pci/*.c)) \
-                           $(patsubst kernel/drivers/net/%.c,$(BUILD_DIR)/drivers/net/%.o,$(wildcard kernel/drivers/net/*.c))
+                           $(patsubst kernel/drivers/net/%.c,$(BUILD_DIR)/drivers/net/%.o,$(wildcard kernel/drivers/net/*.c)) \
+                           $(patsubst kernel/drivers/apic/%.c,$(BUILD_DIR)/drivers/apic/%.o,$(wildcard kernel/drivers/apic/*.c))
 SYSCALL_OBJS := $(patsubst kernel/syscall/%.c,$(BUILD_DIR)/syscall/%.o,$(filter %.c,$(SYSCALL_SRCS))) \
                                 $(patsubst kernel/syscall/%.asm,$(BUILD_DIR)/syscall/%.o,$(filter %.asm,$(SYSCALL_SRCS)))
 UI_OBJS := $(patsubst kernel/ui/%.c,$(BUILD_DIR)/ui/%.o,$(UI_SRCS))
@@ -146,7 +147,7 @@ $(BUILD_DIR)/boot $(BUILD_DIR)/arch $(BUILD_DIR)/core $(BUILD_DIR)/mm \
 $(BUILD_DIR)/sched $(BUILD_DIR)/fs $(BUILD_DIR)/fs/ext2 \
 $(BUILD_DIR)/drivers/char $(BUILD_DIR)/drivers/block $(BUILD_DIR)/drivers/pci \
 $(BUILD_DIR)/drivers/net $(BUILD_DIR)/drivers/audio $(BUILD_DIR)/drivers/power \
-$(BUILD_DIR)/drivers/clock $(BUILD_DIR)/drivers/sensor \
+$(BUILD_DIR)/drivers/clock $(BUILD_DIR)/drivers/sensor $(BUILD_DIR)/drivers/apic \
 $(BUILD_DIR)/syscall $(BUILD_DIR)/libc $(BUILD_DIR)/user $(BUILD_DIR)/ui \
 $(BUILD_DIR)/pkg $(BUILD_DIR)/kpkg $(BUILD_DIR)/desktop $(BUILD_DIR)/ai \
 $(BUILD_DIR)/net $(BUILD_DIR)/audio $(BUILD_DIR)/gui $(BUILD_DIR)/exec \
@@ -246,6 +247,11 @@ $(BUILD_DIR)/net/%.o: kernel/net/%.c | $(BUILD_DIR)/net
 
 # Net driver objects (drivers/net/)
 $(BUILD_DIR)/drivers/net/%.o: kernel/drivers/net/%.c | $(BUILD_DIR)/drivers/net
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# APIC driver objects (drivers/apic/) - KE-23 LAPIC + IOAPIC
+$(BUILD_DIR)/drivers/apic/%.o: kernel/drivers/apic/%.c | $(BUILD_DIR)/drivers/apic
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
