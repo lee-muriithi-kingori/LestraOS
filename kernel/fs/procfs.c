@@ -51,6 +51,7 @@ enum procfs_kind {
     PROC_KMSG,      /* /proc/kmsg — kernel ring buffer (dmesg) */
     PROC_CMDLINE,   /* /proc/cmdline — boot command line */
     PROC_INTERRUPTS, /* /proc/interrupts — IRQ counts */
+    PROC_MOUNTS,    /* /proc/mounts — mounted filesystems */
 };
 
 struct procfs_open {
@@ -421,6 +422,30 @@ static size_t gen_interrupts(struct procfs_open* o) {
     return (size_t)off;
 }
 
+/* KE-26: Generate /proc/mounts — mounted filesystems (Linux-compatible). */
+static size_t gen_mounts(struct procfs_open* o) {
+    extern struct mount* vfs_get_mount(int idx);
+    extern int vfs_get_mount_count(void);
+    int off = 0;
+    int n = vfs_get_mount_count();
+    for (int i = 0; i < n; i++) {
+        struct mount* m = vfs_get_mount(i);
+        if (!m) continue;
+        const char* fstype = (m->fs_type == 0) ? "memfs" :
+                             (m->fs_type == 1) ? "ext2"  : "unknown";
+        off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                         "%s %s %s rw 0 0\n",
+                         m->path[0] ? m->path : "/",
+                         m->path[0] ? m->path : "/",
+                         fstype);
+    }
+    if (n == 0) {
+        off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                         "/ / rootfs rw 0 0\n");
+    }
+    return (size_t)off;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -439,6 +464,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/kmsg")         == 0) return PROC_KMSG;
     if (strcmp(path, "/proc/cmdline")      == 0) return PROC_CMDLINE;
     if (strcmp(path, "/proc/interrupts")   == 0) return PROC_INTERRUPTS;
+    if (strcmp(path, "/proc/mounts")       == 0) return PROC_MOUNTS;
     return PROC_NONE;
 }
 
@@ -467,6 +493,7 @@ int procfs_open(const char* path) {
                 case PROC_KMSG:         o->size = gen_kmsg(o);         break;
                 case PROC_CMDLINE:      o->size = gen_cmdline(o);      break;
                 case PROC_INTERRUPTS:   o->size = gen_interrupts(o);   break;
+                case PROC_MOUNTS:       o->size = gen_mounts(o);       break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;
