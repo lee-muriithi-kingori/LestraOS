@@ -12,6 +12,7 @@
 #include <lestra/printk.h>
 #include <lestra/mm.h>
 #include <lestra/vfs.h>
+#include <lestra/sched.h>
 #include <string.h>
 
 typedef struct {
@@ -70,6 +71,8 @@ static uint64_t* deep_copy_pd(uint64_t* boot_pd) {
     phys_addr_t pd_phys = pmm_alloc_page();
     if (!pd_phys) return NULL;
     uint64_t* pd = (uint64_t*)(uintptr_t)pd_phys;
+    /* KE-26: No stac/clac here — caller (deep_copy_pdpt) wraps the entire
+     * loop in stac/clac. Nested stac/clac would clear AC prematurely. */
     for (int i = 0; i < 512; i++) {
         pd[i] = boot_pd[i] & ~PAGE_USER;  /* kernel-only entries */
     }
@@ -84,6 +87,7 @@ static uint64_t* deep_copy_pdpt(uint64_t* boot_pdpt) {
     phys_addr_t pdpt_phys = pmm_alloc_page();
     if (!pdpt_phys) return NULL;
     uint64_t* pdpt = (uint64_t*)(uintptr_t)pdpt_phys;
+    stac();  /* KE-26: SMAP-safe write to phys page */
     for (int i = 0; i < 512; i++) {
         if (!(boot_pdpt[i] & PAGE_PRESENT)) {
             pdpt[i] = 0;
@@ -100,6 +104,7 @@ static uint64_t* deep_copy_pdpt(uint64_t* boot_pdpt) {
         if (!new_pd) { pdpt[i] = 0; continue; }
         pdpt[i] = ((uint64_t)(uintptr_t)new_pd) | (boot_pdpt[i] & ~PAGE_USER & ~PTE_PHYS_MASK) | PAGE_PRESENT;
     }
+    clac();
     return pdpt;
 }
 
@@ -107,7 +112,9 @@ static uintptr_t* create_user_address_space(void) {
     phys_addr_t pml4_phys = pmm_alloc_page();
     if (!pml4_phys) return NULL;
     uintptr_t* pml4 = (uintptr_t*)pml4_phys;
+    stac();  /* KE-26: SMAP-safe write to phys page */
     memset(pml4, 0, PAGE_SIZE);
+    clac();
 
     /* KE-13 FIX: Deep-copy the kernel's boot page tables instead of
      * sharing PML4[0..3] by pointer. The old code did:
@@ -150,6 +157,8 @@ static uint64_t* split_2mb_huge_page(uint64_t* pd, int pd_idx, uint64_t old_pd_e
     phys_addr_t pt_phys = pmm_alloc_page();
     if (!pt_phys) return NULL;
     uint64_t* pt = (uint64_t*)(uintptr_t)pt_phys;
+    /* KE-26: No stac/clac here — caller (user_map_page) wraps the entire
+     * function in stac/clac. Nested stac/clac would clear AC prematurely. */
     memset(pt, 0, PAGE_SIZE);
 
     /* Extract the 2MB huge page base and flags */
@@ -201,10 +210,19 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
      * user access to them still faults. */
     int is_user = (flags & PAGE_USER) != 0;
 
+    /* KE-26: Wrap the ENTIRE function in stac/clac. All page-table reads
+     * and writes go through the identity map (phys == virt for low memory).
+     * If a page-table page's physical address happens to overlap with a
+     * user-mapped virtual address (e.g., BSS at 0x4ef000), the identity-map
+     * access hits the user PTE and SMAP blocks it. stac allows supervisor
+     * access to user pages for the duration of this function. clac is
+     * called before every return point. */
+    stac();
+
     uintptr_t* pml4_virt = pml4;
     if (!(pml4_virt[pml4_idx] & PAGE_PRESENT)) {
         phys_addr_t pdpt_phys = pmm_alloc_page();
-        if (!pdpt_phys) return;
+        if (!pdpt_phys) { clac(); return; }
         memset((void*)pdpt_phys, 0, PAGE_SIZE);
         pml4_virt[pml4_idx] = pdpt_phys | table_flags | PAGE_PRESENT;
     }
@@ -213,7 +231,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
 
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
         phys_addr_t pd_phys = pmm_alloc_page();
-        if (!pd_phys) return;
+        if (!pd_phys) { clac(); return; }
         memset((void*)pd_phys, 0, PAGE_SIZE);
         pdpt[pdpt_idx] = pd_phys | table_flags | PAGE_PRESENT;
     }
@@ -222,6 +240,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
     /* Check for 1GB huge page at PDPT level — cannot split, bail */
     if (pdpt[pdpt_idx] & PAGE_HUGE) {
         pr_warn("elf: cannot map 0x%lx — 1GB huge page in the way\n", (unsigned long)vaddr);
+        clac();
         return;
     }
 
@@ -233,15 +252,16 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
      * the user's PRIVATE PD copy, not the kernel's boot PD. */
     if (pd[pd_idx] & PAGE_HUGE) {
         uint64_t* pt = split_2mb_huge_page(pd, pd_idx, pd[pd_idx]);
-        if (!pt) return;
+        if (!pt) { clac(); return; }
         if (is_user) pd[pd_idx] |= PAGE_USER;   /* KE-25: make PD entry user-traversable */
         pt[pt_idx] = phys | flags | PAGE_PRESENT;
+        clac();
         return;
     }
 
     if (!(pd[pd_idx] & PAGE_PRESENT)) {
         phys_addr_t pt_phys = pmm_alloc_page();
-        if (!pt_phys) return;
+        if (!pt_phys) { clac(); return; }
         memset((void*)pt_phys, 0, PAGE_SIZE);
         pd[pd_idx] = pt_phys | table_flags | PAGE_PRESENT;
     }
@@ -249,6 +269,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
     uintptr_t* pt = (uintptr_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
     pt[pt_idx] = phys | flags | PAGE_PRESENT;
+    clac();
 }
 
 static void user_map_data(uintptr_t* pml4, uint64_t vaddr, const void* data,
@@ -261,11 +282,18 @@ static void user_map_data(uintptr_t* pml4, uint64_t vaddr, const void* data,
     for (size_t i = 0; i < num_pages; i++) {
         phys_addr_t phys = pmm_alloc_page();
         if (!phys) return;
+        /* KE-26: The physical page may be identity-mapped at the same
+         * virtual address in the CURRENT PML4 (e.g., if another process
+         * already mapped a user page at this address). Under SMAP, a
+         * supervisor write to a user page #PFs. stac/clac allows the
+         * kernel to initialize the page before mapping it. */
+        stac();
         memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
         size_t offset = i * PAGE_SIZE;
         size_t to_copy = data_len - offset;
         if (to_copy > PAGE_SIZE) to_copy = PAGE_SIZE;
         memcpy((void*)(uintptr_t)phys, (const char*)data + offset, to_copy);
+        clac();
         user_map_page(pml4, vaddr + offset, phys, flags);
     }
 }
@@ -285,6 +313,13 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
 
     user_pml4 = create_user_address_space();
     if (!user_pml4) return 0;
+
+    /* KE-26: We do NOT switch CR3 here. The kernel stays on the CURRENT
+     * PML4 (the calling process's) while writing to physical pages via
+     * the identity map. All writes are wrapped in stac/clac to handle
+     * SMAP (the phys pages may overlap with user-mapped virtual addresses
+     * in the current PML4). elf_jump_to_user will switch CR3 to the new
+     * PML4 when jumping to ring 3. */
 
     const elf64_phdr_t* phdrs = (const elf64_phdr_t*)
         ((const char*)elf_data + hdr->e_phoff);
@@ -313,7 +348,9 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
             for (size_t p = 0; p < bss_pages; p++) {
                 phys_addr_t phys = pmm_alloc_page();
                 if (phys) {
+                    stac();  /* KE-26: SMAP-safe write to phys page */
                     memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
+                    clac();
                     user_map_page(user_pml4, bss_start + p * PAGE_SIZE, phys, bss_flags);
                 }
             }
@@ -332,7 +369,9 @@ uint64_t elf_load(const void* elf_data, size_t elf_size) {
     for (size_t i = 0; i < stack_pages; i++) {
         phys_addr_t phys = pmm_alloc_page();
         if (phys) {
+            stac();  /* KE-26: SMAP-safe write to phys page */
             memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
+            clac();
             user_map_page(user_pml4, stack_bottom + i * PAGE_SIZE,
                           phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
         }
@@ -377,13 +416,34 @@ int elf_exec(const char* path) {
      * (it iretq's to userspace), so dynamic allocation would leak. The
      * buffer lives in kernel BSS within the 4 GB identity map, which is
      * deep-copied into every user PML4 as supervisor-present — so it is
-     * reachable from ring-0 interrupt context regardless of CR3. */
+     * reachable from ring-0 interrupt context regardless of CR3.
+     *
+     * KE-26: Also update g_syscall_kstack so the syscall entry path
+     * (syscall_entry.asm) uses the SAME kernel stack as TSS.RSP0
+     * (interrupt delivery). Without this, syscalls would push onto the
+     * old g_syscall_kstack (from sched_start_first) while IRQs push onto
+     * this new static kstack — a messy mismatch that works by accident
+     * but is fragile. */
     static uint8_t kstack[16384] __aligned(16);
     uint64_t kstack_top = (uint64_t)kstack + sizeof(kstack);
     extern void tss_set_rsp0(uint64_t);
     tss_set_rsp0(kstack_top);
+    extern uint64_t g_syscall_kstack;
+    g_syscall_kstack = kstack_top;
+
+    /* KE-26: Update current->pml4 and entry_point so the page fault
+     * handler and scheduler see the NEW address space. Without this,
+     * current->pml4 still points to the OLD process's PML4, and any
+     * page fault resolution would modify the wrong page tables. */
+    struct process* cur = task_current();
+    if (cur) {
+        cur->pml4 = user_pml4;
+        cur->entry_point = entry;
+        cur->user_stack_ptr = user_stack_ptr;
+    }
 
     pr_info("elf: jumping to userspace (tss.rsp0=0x%x)\n", (unsigned)kstack_top);
+
     elf_jump_to_user(entry, user_stack_ptr, (uintptr_t)user_pml4);
 
     pr_warn("elf: userspace returned (should not happen)\n");

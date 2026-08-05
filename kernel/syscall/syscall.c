@@ -229,14 +229,17 @@ struct pollfd {
     short revents;
 };
 
-/* GDT selectors (must match kernel/include/lestra/gdt.h)
- * FIX: USER_CS was 0x23 (which is USER_DS | RPL3). The correct
- * user-mode code selector is USER_CS(0x18) | RPL3 = 0x1B. */
+/* GDT ring-3 selectors (must match kernel/include/lestra/gdt.h after KE-26 swap)
+ * KE-26: GDT was rearranged so USER_DS (slot 3, 0x18) precedes USER_CS
+ * (slot 4, 0x20) — required for sysret SS = (STAR[63:48]+8)|3 to land on
+ * USER_DS. The ring-3 selectors (with RPL=3) are now:
+ *   USER_CS | RPL3 = 0x20 | 3 = 0x23
+ *   USER_DS | RPL3 = 0x18 | 3 = 0x1B */
 #ifndef USER_CS
-#define USER_CS  0x1B  /* ring-3 code selector = 0x18 | RPL=3 */
+#define USER_CS  0x23  /* ring-3 code selector = 0x20 | RPL=3 (KE-26) */
 #endif
 #ifndef USER_DS
-#define USER_DS  0x23  /* ring-3 data selector = 0x20 | RPL=3 */
+#define USER_DS  0x1B  /* ring-3 data selector = 0x18 | RPL=3 (KE-26) */
 #endif
 #ifndef KERNEL_CS
 #define KERNEL_CS 0x08 /* ring-0 code selector */
@@ -1623,11 +1626,25 @@ void syscall_init(void) {
     uint64_t efer = rdmsr(0xC0000080);
     wrmsr(0xC0000080, efer | 1);
 
-    /* STAR: segment selectors for syscall/sysret
-     * Bits 47:32 = SYSCALL CS (KERNEL_CS=0x08; SS = CS+8 = 0x10)
-     * Bits 63:48 = SYSRET CS (USER_CS=0x18; SS = CS+8 = 0x20)
-     * FIX: Previous value used USER_CS(0x23) in bits 63:48 which was wrong. */
-    uint64_t star = ((uint64_t)USER_CS << 48) | ((uint64_t)KERNEL_CS << 32);
+    /* KE-26: STAR — segment selectors for syscall/sysret.
+     *
+     * AMD64 ABI (verified against the AMD APM Vol 2 SYSRET pseudocode):
+     *   syscall: CS = STAR[47:32],            SS = STAR[47:32] + 8
+     *   sysret:  CS = (STAR[63:48] + 16) | 3, SS = (STAR[63:48] + 8) | 3
+     *
+     * With STAR[47:32] = KERNEL_CS (0x08):
+     *   syscall CS = 0x08 (KERNEL_CS), SS = 0x10 (KERNEL_DS)  ✓
+     *
+     * With STAR[63:48] = KERNEL_DS (0x10) and the KE-26 GDT layout
+     * (USER_DS=0x18, USER_CS=0x20):
+     *   sysret CS = (0x10 + 16) | 3 = 0x23 (USER_CS | RPL3)  ✓
+     *   sysret SS = (0x10 + 8)  | 3 = 0x1B (USER_DS | RPL3)  ✓
+     *
+     * Previous bug: STAR[63:48] was USER_CS (0x18 in the old layout),
+     * which made sysret CS = (0x18+16)|3 = 0x2B (TSS lower half!) and
+     * sysret SS = (0x18+8)|3 = 0x23 (old USER_DS). The CPU then ran
+     * /init's .text in ring 0 → SMEP/SMAP #PF → triple-fault. */
+    uint64_t star = ((uint64_t)KERNEL_DS << 48) | ((uint64_t)KERNEL_CS << 32);
     wrmsr(0xC0000081, star);
 
     /* LSTAR: syscall handler entry point (64-bit) */
@@ -1639,7 +1656,7 @@ void syscall_init(void) {
     /* SFMASK: RFLAGS mask - clear IF on syscall */
     wrmsr(0xC0000084, 0x200);
 
-    pr_info("Syscall interface initialized (SYSCALL/SYSRET)\n");
+    pr_info("Syscall interface initialized (SYSCALL/SYSRET, iretq return)\n");
 }
 
 int64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,

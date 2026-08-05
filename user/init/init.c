@@ -57,21 +57,21 @@ void _start(void) {
     /* In a full implementation, init would:
      * 1. Mount filesystems
      * 2. Start system services
-     * 3. Fork+exec /bin/shell on the console
+     * 3. Fork+exec /shell on the console
      * 4. Wait for shell to exit, then respawn
      *
-     * For now: try to exec the shell from the initrd. If execve isn't
-     * implemented yet (returns -1), fall back to printing a notice
-     * and looping so PID 1 stays alive.
+     * The initrd packs the shell binary as /shell (see Makefile:
+     * mkinitrd.py uses os.path.basename, so user/shell -> /shell).
+     * KE-26-b: fixed the path from /bin/shell to /shell to match.
      */
     printf("Starting Lestra Shell...\n\n");
 
-    char* argv[] = { "/bin/shell", NULL };
+    char* argv[] = { "/shell", NULL };
     char* envp[] = { "PATH=/bin", "TERM=lestra", NULL };
-    int rc = execve("/bin/shell", argv, envp);
+    int rc = execve("/shell", argv, envp);
     (void)rc;  /* if execve succeeds we never get here */
 
-    printf("init: execve(/bin/shell) failed (kernel exec not yet implemented)\n");
+    printf("init: execve(/shell) failed\n");
     printf("init: PID 1 idle. Use the in-kernel shell for now.\n");
     while (1) {
         sleep(1);

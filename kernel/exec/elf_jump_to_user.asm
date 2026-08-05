@@ -41,8 +41,10 @@ elf_jump_to_user:
     ; We need to set RFLAGS with interrupts enabled (IF=1) so the user
     ; process can be interrupted by the timer IRQ (for preemption later).
     ;
-    ; CS = 0x1B (USER_CS | RPL3 = 0x18 | 3)
-    ; SS = 0x23 (USER_DS | RPL3 = 0x20 | 3)
+    ; KE-26: GDT was rearranged so USER_DS (0x18) precedes USER_CS (0x20).
+    ; CS = 0x23 (USER_CS | RPL3 = 0x20 | 3)
+    ; SS = 0x1B (USER_DS | RPL3 = 0x18 | 3)
+    ; This matches what sysretq loads from STAR (see syscall_init).
 
     ; KE-25: The pushes below are SUPERVISOR writes to the USER stack (a
     ; user page). Under SMAP (CR4.SMAP=1) these would #PF with AC clear.
@@ -58,35 +60,40 @@ elf_jump_to_user:
 
     mov rsp, r14            ; switch to user stack
 
-    ; Push SS (user data segment with RPL=3)
-    mov rax, 0x23
+    ; Push SS (user data segment with RPL=3) — KE-26: 0x1B = USER_DS|RPL3
+    mov rax, 0x1B
     push rax
 
     ; Push RSP (user stack pointer — same as current RSP)
     push rsp
 
-    ; Push RFLAGS (enable interrupts)
+    ; Push RFLAGS (enable interrupts, clear AC for clean user state)
     pushfq
     pop rax
     or rax, 0x200           ; set IF (interrupt flag)
+    and rax, 0xFFFFFFFFFFFBFFFF  ; clear AC (bit 18) — KE-26: stac set it above
+                                  ; for the supervisor stack writes, but the
+                                  ; user must NOT run with AC set (it's a
+                                  ; no-op in ring 3 but leaks into R11 on the
+                                  ; next syscall, confusing diagnostics).
     push rax
 
-    ; Push CS (user code segment with RPL=3)
-    mov rax, 0x1B
+    ; Push CS (user code segment with RPL=3) — KE-26: 0x23 = USER_CS|RPL3
+    mov rax, 0x23
     push rax
 
     ; Push RIP (user entry point)
     push r15
 
-    ; Clear AC before leaving supervisor mode (ring 3 ignores SMAP).
-    mov rax, [g_smap_enabled]
-    test rax, rax
-    jz .no_clac
-    clac
-.no_clac:
+    ; KE-25: Do NOT clac here. iretq READS the frame we just pushed from
+    ; the USER stack — those are supervisor reads, which under SMAP need
+    ; AC set. We keep AC set through the iretq. The frame's RFLAGS (pushed
+    ; above from pushfq with only IF added) has AC=0, so once iretq loads
+    ; RFLAGS and drops us into ring 3, AC is clear — and SMAP doesn't
+    ; apply to ring 3 anyway.
 
-    ; Set up segment registers for user mode
-    mov ax, 0x23            ; USER_DS | RPL3
+    ; Set up segment registers for user mode — KE-26: 0x1B = USER_DS|RPL3
+    mov ax, 0x1B            ; USER_DS | RPL3
     mov ds, ax
     mov es, ax
     mov fs, ax

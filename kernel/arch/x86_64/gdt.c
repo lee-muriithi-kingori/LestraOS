@@ -130,16 +130,17 @@ void gdt_init(void) {
                   GDT_ACCESS_S | GDT_ACCESS_RW,
                   GDT_GRAN_4K | GDT_GRAN_64BIT);
 
-    /* User code segment (64-bit, ring 3) */
+    /* KE-26: User DATA segment (ring 3) — slot 3 (selector 0x18)
+     * MUST precede USER_CS for the sysret SS = (STAR[63:48]+8)|3 formula. */
     gdt_set_entry(3, 0, 0xFFFFF,
                   GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 |
-                  GDT_ACCESS_S | GDT_ACCESS_EXECUTABLE | GDT_ACCESS_RW,
+                  GDT_ACCESS_S | GDT_ACCESS_RW,
                   GDT_GRAN_4K | GDT_GRAN_64BIT);
 
-    /* User data segment (ring 3) */
+    /* KE-26: User CODE segment (64-bit, ring 3) — slot 4 (selector 0x20) */
     gdt_set_entry(4, 0, 0xFFFFF,
                   GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 |
-                  GDT_ACCESS_S | GDT_ACCESS_RW,
+                  GDT_ACCESS_S | GDT_ACCESS_EXECUTABLE | GDT_ACCESS_RW,
                   GDT_GRAN_4K | GDT_GRAN_64BIT);
 
     gdt_pointer.limit = sizeof(gdt_entries) - 1;

@@ -87,14 +87,49 @@ syscall_entry:
     pop r13
     pop r12
     pop rbx
-    pop r11
-    pop rcx
+    pop r11                     ; r11 = user RFLAGS
+    pop rcx                     ; rcx = user RIP
 
-    ; KE-25: restore the user RSP before sysretq (sysretq loads RIP from
-    ; RCX and RFLAGS from R11 but does NOT change RSP).
-    mov rsp, [g_saved_user_rsp]
+    ; KE-26: Return via IRETQ (not SYSRETQ).
+    ;
+    ; SYSRETQ computes CS/SS from the STAR MSR, but QEMU's qemu64 +smep
+    ; was loading CS=0x08 (KERNEL_CS) instead of the computed 0x23,
+    ; causing the CPU to run /init's .text in ring 0 → SMEP #PF. Rather
+    ; than chase the QEMU sysret quirk, we use IRETQ which takes an
+    ; EXPLICIT frame (RIP, CS, RFLAGS, RSP, SS) from the kernel stack.
+    ; CS is exactly what we push (0x23 = USER_CS|RPL3), not what STAR
+    ; computes. This is the same return mechanism used by interrupt
+    ; handlers and context_switch — unambiguous and SMEP/SMAP-safe.
+    ;
+    ; RAX holds the syscall return value from syscall_dispatch. We must
+    ; NOT clobber it while building the iretq frame. R10 is caller-saved
+    ; and free after the dispatch returns (it held a4, the 4th syscall
+    ; arg, which we don't need anymore). Use R10 as the temp.
+    ;
+    ; We're still on the kernel stack (g_syscall_kstack). The iretq frame
+    ; is pushed onto kernel pages (no SMAP issue). iretq pops it, loads
+    ; RSP from the frame (user RSP), and switches us to ring 3.
+    ;
+    ; swapgs MUST happen before iretq (after iretq we're in ring 3 and
+    ; swapgs would #GP).
+    mov r10, rax                ; r10 = syscall return value (preserve!)
 
     swapgs                      ; restore user GS base
 
-    ; sysretq: loads RIP from RCX, RFLAGS from R11
-    sysretq
+    ; Push the IRETQ frame onto the kernel stack:
+    ;   SS, RSP, RFLAGS, CS, RIP (pushed in reverse order for iretq)
+    mov rax, 0x1B               ; USER_DS | RPL3 (KE-26: 0x18 | 3)
+    push rax                    ; SS
+    push qword [g_saved_user_rsp] ; RSP (user stack pointer)
+    push r11                    ; RFLAGS (user RFLAGS, saved by `syscall`)
+    mov rax, 0x23               ; USER_CS | RPL3 (KE-26: 0x20 | 3)
+    push rax                    ; CS
+    push rcx                    ; RIP (user return address, saved by `syscall`)
+
+    ; Restore the syscall return value to RAX (the libc wrapper reads
+    ; the result from RAX).
+    mov rax, r10
+
+    ; IRETQ pops RIP, CS, RFLAGS, RSP, SS from the stack and switches
+    ; to the privilege level in CS (RPL=3 = ring 3).
+    iretq

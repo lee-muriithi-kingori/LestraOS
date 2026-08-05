@@ -24,11 +24,27 @@ struct gdt_ptr {
     uint64_t base;
 } __packed;
 
-/* Segment selectors */
+/* Segment selectors
+ *
+ * KE-26: GDT layout follows the AMD64 syscall/sysret convention so that
+ * SYSRET can load CS/SS correctly. The ABI requires:
+ *   - syscall:  CS = STAR[47:32],            SS = STAR[47:32] + 8
+ *   - sysret:   CS = (STAR[63:48] + 16) | 3,  SS = (STAR[63:48] + 8) | 3
+ * For sysret CS to land on USER_CS and SS on USER_DS, the GDT MUST have
+ *   KERNEL_CS, KERNEL_DS = KERNEL_CS+8, USER_DS = KERNEL_CS+16, USER_CS = KERNEL_CS+24
+ * i.e. USER_DS immediately precedes USER_CS. The previous layout had
+ * USER_CS before USER_DS, which made sysret load SS = KERNEL_DS|RPL3
+ * (a ring-0 data selector with RPL=3) — the CPU then ran /init's .text
+ * in ring 0, triggering SMEP #PF / SMAP #PF / triple-fault.
+ *
+ * With STAR[63:48] = KERNEL_DS (0x10):
+ *   sysret CS = (0x10 + 16) | 3 = 0x23 (USER_CS | RPL3)
+ *   sysret SS = (0x10 + 8)  | 3 = 0x1B (USER_DS | RPL3)
+ */
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
-#define USER_CS   0x18
-#define USER_DS   0x20
+#define USER_DS   0x18   /* slot 3 — MUST precede USER_CS for sysret */
+#define USER_CS   0x20   /* slot 4 — USER_DS + 8 */
 #define TSS_SEG   0x28
 
 /* GDT access flags

@@ -359,10 +359,15 @@ int proc_create(const char* name, const void* elf_data, size_t elf_size) {
     /* Initialize per-process fd table with stdin/stdout/stderr */
     fd_table_init(p);
 
-    p->saved_state->ss = 0x23;
+    /* KE-26: GDT was rearranged — USER_DS=0x18 (slot 3), USER_CS=0x20 (slot 4).
+     * Ring-3 selectors: CS = 0x23 (USER_CS|RPL3), SS = 0x1B (USER_DS|RPL3).
+     * These must match what sysretq loads (see syscall_init STAR setup) so
+     * that a context switch via iretq and a return-from-syscall via sysretq
+     * land in the same privilege/segment state. */
+    p->saved_state->ss = 0x1B;
     p->saved_state->rsp = p->user_stack_ptr;
     p->saved_state->rflags = 0x202;
-    p->saved_state->cs = 0x1B;
+    p->saved_state->cs = 0x23;
     p->saved_state->rip = p->entry_point;
 
     pr_info("sched: created process %d '%s' entry=0x%x\n",
