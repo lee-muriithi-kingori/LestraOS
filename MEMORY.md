@@ -40,15 +40,20 @@
 - ASLR: ENABLED (stack+12 bits, brk+8 bits, TSC-CSPRNG)
 - Stack canaries: ENABLED (-fstack-protector-strong)
 - kptr_restrict: 1
-- KASLR-lite: DISABLED (pending)
+- KASLR-lite: ENABLED (heap+8 bits, TSC-early)
+- Entropy pool: ACTIVE (16 slots, IRQ-mixed: timer/KB/mouse + RDSEED)
 
 ### Pending Work (priority order)
 1. ~~**Fix RTL8139 multi-packet RX**~~ (KE-12: DONE). Removed per-packet CAPR write. Added `rtl8139_recv_flush()` hook. QEMU model quirk: `RxBufPtr = (val + 16) % RxBufferSize` internally; writing CAPR forward reduces available space and deadlocks can_receive(). Left CAPR at hardware default. QEMU `RxBufferSize = 8192` after reset (wraps at 8K, not 64K). Multi-packet RX works on real hardware; QEMU model still has single-packet-per-tick issue under investigation.
 2. ~~**Fix GP fault in user_map_page**~~ (KE-13: DONE). Root cause: create_user_address_space() shared boot_pml4[0..3] by pointer, so user_map_page() encountered 2MB huge pages, misinterpreted them as PT pointers, and wrote PTEs to arbitrary physical memory. Fix: deep-copy boot page tables (PDPT+PD) into private per-process copies, split 2MB huge pages on demand. Boot-verified clean.
 3. ~~**NIC driver abstraction refactor**~~ (KE-14: DONE)
-4. **KASLR-lite**: Randomize kernel base address (heap done KE-15, full text KASLR blocked by -mcmodel=large)
-5. **Interrupt-mixed entropy pool** (currently TSC-only, INSECURE)
+4. ~~**KASLR-lite**~~ (KE-15: DONE, heap randomization)
+5. ~~**Interrupt-mixed entropy pool**~~ (KE-16: DONE)
 6. **More drivers**: USB, FAT32, framebuffer fonts
+7. **Fix kernel_main.c double %% panic format string bug**
+8. **sys_mmap** returns kmalloc pointers not real VMAs
+9. **sys_futex** is a no-op stub
+10. **Linux signals** are no-ops
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
@@ -70,12 +75,13 @@
 
 ### Known Issues
 - RTL8139 QEMU multi-packet RX: first packet works, QEMU model has can_receive() quirk (buffer wraps at 8K, not 64K; CAPR+16 offset). Real hardware expected to work fine.
-- CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero
+- CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero (KE-16: mitigated with IRQ-mixed pool)
 - sys_mmap returns kmalloc pointers, not real VMAs — needs vmm_map_page
 - sys_futex is a no-op stub
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+fb83394 security: KE-16 interrupt-mixed entropy pool (timer/KB/mouse IRQ feeds + RDSEED)
 ea0b582 security: KE-15 kernel heap KASLR (randomize heap base, 8 bits entropy)
 821a567 refactor: KE-14 NIC driver abstraction (struct nic_ops vtable)
 8ebd973 fix: KE-13 fix GP fault in user_map_page during ELF loading (deep copy + huge page split)
@@ -192,4 +198,33 @@ Stage Summary:
 - KE-15 complete: 10 files changed, 53 insertions, 14 deletions
 - KASLR-lite now ACTIVE: heap+8 bits (TSC-early), combined with userspace ASLR = ~28 total bits
 - Full kernel text KASLR is blocked by -mcmodel=large; requires compiler flag migration
-- Next priority: interrupt-mixed entropy pool or full text KASLR migration
+- Next priority: fix kernel_main.c %% panic bug, USB/FAT32 drivers, sys_mmap VMA support
+
+---
+Task ID: 4
+Agent: Main (super-agent)
+Task: KE-16 — Interrupt-mixed entropy pool (fix broken partial work + complete)
+
+Work Log:
+- Read worklog + git log — found 4 modified files + 2 new files + 1 untracked artifact from crashed previous session
+- Assess: keyboard.c had duplicate scancode declaration, mouse.c had triple-duplicated data reads, timer.c had broken if() block, entropy.c drain only wrote 21 of 48 bytes, csprng.c XORed into uninitialized buffer
+- Fixed timer.c: added #include <lestra/entropy.h>, added static last_tsc, restored if(tick_handler) block
+- Fixed keyboard.c: removed duplicate scancode read, added #include <lestra/entropy.h>
+- Fixed mouse.c: removed triple-duplicated data reads and broken comment, added #include <lestra/entropy.h>
+- Fixed entropy.c: rewrote entropy_drain() with 6 uint64_t accumulators using bit-shift diffusion to properly fill 48 bytes. Made entropy_pool non-static (required for extern reference in inline)
+- Fixed csprng.c: XOR pool_bytes into buf[] (not uninitialized out[]), added RDSEED as CPUID-gated secondary source
+- Added 'Entropy pool: ACTIVE' to security audit in kernel_main.c
+- Build succeeded first try
+- Boot-tested E1000: clean boot, SMEP/SMAP active, DHCP 10.0.2.15, /init loads to userspace
+- Removed ALPHA-entropy-strategy.md planning artifact
+- Committed as fb83394, pushed to GitHub
+- Updated README.md changelog, committed as 6976dd2, pushed
+- Synced MEMORY.md
+
+Stage Summary:
+- KE-16 complete: 8 files changed, 159 insertions, 6 deletions
+- 16-slot lock-free XOR accumulator fed by timer/KB/mouse IRQs
+- RDSEED added as CPUID-gated secondary hardware entropy source
+- Entropy pool drains into AES-CTR DRBG on reseed
+- Security audit shows 7 active protections (was 6)
+- Next priority: fix %% panic bug, driver pacing (USB/FAT32), sys_mmap VMA support
