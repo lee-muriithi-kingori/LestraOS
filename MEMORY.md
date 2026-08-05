@@ -1069,3 +1069,62 @@ Stage Summary:
 - Unlocks: MSI/MSI-X for PCI devices, USB XHCI interrupt routing, LAPIC timer (per-CPU), SMP (IPI)
 - Files changed: apic.c (TEMP TEST removed), lapic.c (idt_reload added), kernel_main.c (dead acpi_init removed), irq.c (APIC backend), apic.h (new), ioapic.c (new), acpi.h (acpi_isa_irq_flags added)
 - Next priority: HPET timer driver, LAPIC timer, USB XHCI, or remaining syscall stubs (sys_chmod, sys_rename)
+---
+Task ID: KE-24
+Agent: Main (super-agent)
+Task: FAT32 read-write filesystem + VFS integration — persistent storage
+
+Work Log:
+- Read worklog tail + MEMORY.md to understand current state (KE-23 APIC was latest)
+- Spawned ALPHA strategist (recommended FAT32 writable) and attempted BETA caution officer (truncated)
+- ALPHA's recommendation accepted: FAT32 writable unlocks persistence — biggest capability leap since boot
+- BETA risks identified: FAT corruption, untested AHCI write, data_offset calculation with NumFATs
+- Implemented fat32.c full rewrite (~740 LOC):
+  - fat_get/fat_set with read-modify-write on FAT sectors
+  - fat32_alloc_cluster: linear FAT scan for free entry
+  - fat32_write_file: cluster chain walk + extension + read-modify-write per cluster
+  - fat32_create_file/fat32_unlink/fat32_mkdir: directory entry manipulation
+  - write_dir_entry: append/replace with full cluster chain write-back
+  - zero_cluster: zero-fill newly allocated clusters
+  - fat32_free_chain: mark clusters as free in FAT
+  - format_83_name: convert 'HELLO.TXT' to 11-byte raw entry name
+  - build_raw_entry: construct 32-byte FAT32 directory entry
+  - CRITICAL FIX: fat_set only mirrors to second FAT when NumFATs >= 2
+    (NumFATs=1 + mirroring = FAT data written to data region = corruption)
+  - CRITICAL FIX: data_offset = reserved + fat_size * NumFATS (not just fat_size)
+  - CRITICAL FIX: fat32_update_entry updates both cluster and size (create_file sets cluster=0,
+    write_file allocates cluster, need to write it back to directory entry)
+- Created fat32_shim.c (~200 LOC): VFS bridge with fd-based interface
+  - FD range 200..299 (16 concurrent open files)
+  - 64KB cache per open file, write-back on close
+  - Directory listing via fat32_list_dir conversion to dirent array
+- Updated vfs.h: FS_TYPE_FAT32
+- Updated vfs.c: FAT32 routing in all 6 I/O paths + mount handler
+  - VFS_FD_IS_FAT32 macro, find_fat32_mount_for_path()
+  - FAT32 mount in vfs_mount('fat32') with memfs stub directory creation
+- Updated kernel_main.c: VFS mount at /fat32, write fn setup, persistence test
+- Updated fat32.h: write_fn typedef, 12 new API declarations
+- Build: clean (no new warnings). kernel.bin + ISO built.
+
+Boot test 1 (cache=none, SMEP+SMAP, E1000, virtio-blk + fat32.img):
+- FAT32 mounted r/w, num_fats=1, data@0x24000
+- VFS: FAT32 mounted at /fat32 (mount #0, read-write)
+- Root directory: 3 entries (HELLO.TXT, TEST.TXT, BIGGER.TXT)
+- KE24TEST.TXT created (size=0), 34 bytes written, cluster 9
+- All 7 security features active, DHCP 10.0.2.15, zero faults
+
+Boot test 2 (same config, persistence verification):
+- Root directory: 4 entries (original 3 + KE24TEST.TXT cluster=9 size=34)
+- 'persistence confirmed!' message printed
+- Python host-side verification: KE24TEST.TXT content = 'lestraOS KE-24: FAT32 write works!'
+
+Stage Summary:
+- KE-24 complete: lestraOS now has PERSISTENT STORAGE
+- FAT32 read-write: cluster alloc, chain extension, file create/unlink/mkdir, dir entry update
+- VFS integration: FS_TYPE_FAT32, FD 200..299, full I/O routing
+- Critical bugs fixed: FAT mirroring with NumFATs=1, data_offset with NumFATs,
+  create_file returning cluster=0 (need update_entry, not just update_entry_size)
+- Persistence verified: write in boot N survives reboot in boot N+1
+- Files changed: fat32.c (rewrite, +490 LOC), fat32_shim.c (new, 200 LOC),
+  fat32.h (+50 LOC), vfs.c (+80 LOC), vfs.h (+1 LOC), kernel_main.c (+20 LOC)
+- Next priority: HPET timer driver, USB XHCI, sys_clone, more UI polish
