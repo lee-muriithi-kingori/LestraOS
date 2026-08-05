@@ -117,20 +117,18 @@ static void clear_kernel_user_bits(uint64_t* pml4) {
 }
 
 static uint64_t* create_proc_pml4(void) {
-    phys_addr_t pml4_phys = pmm_alloc_page();
-    if (!pml4_phys) return NULL;
-    uint64_t* pml4 = (uint64_t*)pml4_phys;
-    memset(pml4, 0, PAGE_SIZE);
-
-    extern uint64_t boot_pml4[];
-    pml4[0] = boot_pml4[0];
-    pml4[1] = boot_pml4[1];
-    pml4[2] = boot_pml4[2];
-    pml4[3] = boot_pml4[3];
-
-    clear_kernel_user_bits(pml4);
-
-    return pml4;
+    /* KE-26: Use the deep-copy approach from create_user_address_space
+     * (in elf.c) instead of sharing boot_pml4[0..3] by pointer. The old
+     * approach had TWO bugs:
+     * 1. Sharing by pointer meant any page-table modification by the
+     *    forked child corrupted the KERNEL's boot page tables.
+     * 2. clear_kernel_user_bits cleared PAGE_USER on leaf entries but
+     *    NOT on intermediate entries, so user pages in the low 4GB were
+     *    unreachable from ring 3 (same as KE-25a).
+     * The deep copy creates private PDPTs and PDs with PAGE_USER cleared,
+     * and user_map_page/vmm_map_page add PAGE_USER to intermediate entries
+     * when mapping user pages. */
+    return create_user_address_space();
 }
 
 static void proc_map_page(struct process* p, uint64_t vaddr, uint64_t phys, uint64_t flags) {

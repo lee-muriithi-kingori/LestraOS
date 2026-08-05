@@ -87,42 +87,70 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
     uint64_t pd_idx   = (virt >> 21) & 0x1FF;
     uint64_t pt_idx   = (virt >> 12) & 0x1FF;
 
+    /* KE-26: Wrap the entire function in stac/clac — page table pages may
+     * overlap with user-mapped virtual addresses, causing SMAP #PF. */
+    stac();
+
+    /* KE-26: PAGE_USER must be set on intermediate entries (PML4/PDPT/PD)
+     * for ring-3 access, not just the leaf PTE. (Same fix as KE-25a in
+     * elf.c's user_map_page.) */
+    int is_user = (flags & PAGE_USER) != 0;
+    uint64_t table_flags = PAGE_PRESENT | PAGE_WRITABLE;
+    if (is_user) table_flags |= PAGE_USER;
+
     /* Allocate page tables if needed */
     if (!(pml4[pml4_idx] & PAGE_PRESENT)) {
         phys_addr_t pdpt_phys = pmm_alloc_page();
-        if (!pdpt_phys) return;
+        if (!pdpt_phys) { clac(); return; }
         memset((void*)pdpt_phys, 0, PAGE_SIZE);
-        pml4[pml4_idx] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        pml4[pml4_idx] = pdpt_phys | table_flags;
     }
+    if (is_user) pml4[pml4_idx] |= PAGE_USER;
 
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & PTE_PHYS_MASK);
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
         phys_addr_t pd_phys = pmm_alloc_page();
-        if (!pd_phys) return;
+        if (!pd_phys) { clac(); return; }
         memset((void*)pd_phys, 0, PAGE_SIZE);
-        pdpt[pdpt_idx] = pd_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        pdpt[pdpt_idx] = pd_phys | table_flags;
     }
+    if (is_user) pdpt[pdpt_idx] |= PAGE_USER;
 
-    /* FIX: bail if PDPT entry is a 1GB huge page */
+    /* Bail if PDPT entry is a 1GB huge page (can't split) */
     if (pdpt[pdpt_idx] & PAGE_HUGE) {
         pr_warn("VMM: refusing to map 0x%x (1GB huge page in the way)\n", (unsigned)virt);
+        clac();
         return;
     }
 
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & PTE_PHYS_MASK);
-    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+
+    /* KE-26: Split 2MB huge pages instead of bailing. The boot PML4 maps
+     * the low 4GB with 2MB huge pages. Without splitting, vmm_map_page
+     * can't map any user pages in the low 4GB (where ELF segments live). */
+    if (pd[pd_idx] & PAGE_HUGE) {
+        uint64_t old_entry = pd[pd_idx];
+        uint64_t huge_base = old_entry & PTE_PHYS_MASK;
+        uint64_t huge_flags = old_entry & ~PTE_PHYS_MASK & ~PAGE_HUGE;
+        huge_flags &= ~PAGE_USER;  /* kernel memory, not user-accessible */
         phys_addr_t pt_phys = pmm_alloc_page();
-        if (!pt_phys) return;
-        memset((void*)pt_phys, 0, PAGE_SIZE);
-        pd[pd_idx] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        if (!pt_phys) { clac(); return; }
+        uint64_t* pt = (uint64_t*)(uintptr_t)pt_phys;
+        memset(pt, 0, PAGE_SIZE);
+        for (int i = 0; i < 512; i++) {
+            pt[i] = huge_base + (uint64_t)i * PAGE_SIZE | huge_flags;
+        }
+        pd[pd_idx] = pt_phys | (old_entry & ~PAGE_HUGE & ~PTE_PHYS_MASK) | PAGE_PRESENT;
+        if (is_user) pd[pd_idx] |= PAGE_USER;
     }
 
-    /* FIX: bail if PD entry is a 2MB huge page (this is the case for
-     * anything in the first 1GB after boot.asm sets up identity mapping). */
-    if (pd[pd_idx] & PAGE_HUGE) {
-        pr_warn("VMM: refusing to map 0x%x (2MB huge page in the way)\n", (unsigned)virt);
-        return;
+    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+        phys_addr_t pt_phys = pmm_alloc_page();
+        if (!pt_phys) { clac(); return; }
+        memset((void*)pt_phys, 0, PAGE_SIZE);
+        pd[pd_idx] = pt_phys | table_flags;
     }
+    if (is_user) pd[pd_idx] |= PAGE_USER;
 
     uint64_t* pt = (uint64_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
@@ -142,6 +170,7 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
 
     pt[pt_idx] = paddr | flags | PAGE_PRESENT;
     invlpg((void*)virt);
+    clac();
 }
 
 /* Unmap a page */

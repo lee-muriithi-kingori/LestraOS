@@ -108,7 +108,11 @@ static uint64_t* deep_copy_pdpt(uint64_t* boot_pdpt) {
     return pdpt;
 }
 
-static uintptr_t* create_user_address_space(void) {
+/* KE-26: Made non-static so scheduler.c's create_proc_pml4 can call it
+ * for fork() — the deep-copy approach avoids the sharing-by-pointer bug
+ * that corrupted kernel page tables when forked children modified their
+ * page tables. */
+uintptr_t* create_user_address_space(void) {
     phys_addr_t pml4_phys = pmm_alloc_page();
     if (!pml4_phys) return NULL;
     uintptr_t* pml4 = (uintptr_t*)pml4_phys;

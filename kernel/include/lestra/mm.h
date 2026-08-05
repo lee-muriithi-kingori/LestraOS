@@ -124,6 +124,10 @@ uintptr_t* vmm_create_address_space(void);
 void vmm_destroy_address_space(uintptr_t* pml4);
 void vmm_switch_address_space(uintptr_t* pml4);
 
+/* KE-26: Deep-copy a user address space from the boot PML4. Used by both
+ * the ELF loader (elf_load) and fork (create_proc_pml4). */
+uintptr_t* create_user_address_space(void);
+
 /* Kernel heap */
 void heap_init(void);
 void* kmalloc(size_t size);
