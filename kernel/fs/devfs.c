@@ -16,6 +16,7 @@
 
 #include <lestra/types.h>
 #include <lestra/devfs.h>
+#include <lestra/mouse.h>
 #include <lestra/printk.h>
 #include <lestra/timer.h>
 #include <string.h>
@@ -26,6 +27,7 @@ enum devfs_kind {
     DEV_ZERO,
     DEV_URANDOM,
     DEV_TTY,
+    DEV_MOUSE,
 };
 
 struct devfs_open {
@@ -76,6 +78,8 @@ static enum devfs_kind classify(const char* path) {
     if (strcmp(path, "/dev/urandom")   == 0) return DEV_URANDOM;
     if (strcmp(path, "/dev/random")    == 0) return DEV_URANDOM; /* same impl */
     if (strcmp(path, "/dev/tty")       == 0) return DEV_TTY;
+    if (strcmp(path, "/dev/mouse")     == 0) return DEV_MOUSE;
+    if (strcmp(path, "/dev/input/mouse0") == 0) return DEV_MOUSE;
     return DEV_NONE;
 }
 
@@ -135,6 +139,16 @@ ssize_t devfs_read(int fd, void* buf, size_t count) {
         case DEV_TTY:
             /* open() already refused, but be defensive. */
             return -1;
+        case DEV_MOUSE: {
+            /* Read one mouse_event struct at a time.
+             * If no event available, return 0 (EAGAIN semantics). */
+            struct mouse_event mev;
+            if (!mouse_get_event(&mev)) return 0;
+            size_t copy = sizeof(mev);
+            if (copy > count) copy = count;
+            memcpy(buf, &mev, copy);
+            return (ssize_t)copy;
+        }
         default:
             return -1;
     }
@@ -151,6 +165,7 @@ ssize_t devfs_write(int fd, const void* buf, size_t count) {
             /* All three silently discard writes — matches Linux. */
             return (ssize_t)count;
         case DEV_TTY:
+        case DEV_MOUSE:
             return -1;
         default:
             return -1;
@@ -161,6 +176,6 @@ ssize_t devfs_write(int fd, const void* buf, size_t count) {
 void devfs_init(void) {
     memset(devfs_opens, 0, sizeof(devfs_opens));
     prng_seed();
-    pr_info("devfs: initialized (FD range %d..%d, devices: null zero urandom tty)\n",
+    pr_info("devfs: initialized (FD range %d..%d, devices: null zero urandom tty mouse)\n",
             DEVFS_FD_BASE, DEVFS_FD_BASE + DEVFS_MAX_OPEN - 1);
 }

@@ -85,6 +85,26 @@ static void input_mouse_callback(const struct mouse_event* mev) {
         ev.mouse.buttons = MOUSE_BTN_RIGHT;
         input_push(&ev);
     }
+    if (pressed & MOUSE_BTN_MIDDLE) {
+        ev.type = EV_MOUSE_DOWN;
+        ev.mouse.buttons = MOUSE_BTN_MIDDLE;
+        input_push(&ev);
+    }
+    if (released & MOUSE_BTN_MIDDLE) {
+        ev.type = EV_MOUSE_UP;
+        ev.mouse.buttons = MOUSE_BTN_MIDDLE;
+        input_push(&ev);
+    }
+
+    /* Push scroll wheel event if non-zero scroll delta */
+    if (mev->scroll != 0) {
+        ev.type = EV_MOUSE_SCROLL;
+        ev.mouse.x = mev->x;
+        ev.mouse.y = mev->y;
+        ev.mouse.scroll = mev->scroll;
+        ev.mouse.buttons = mev->buttons;
+        input_push(&ev);
+    }
 
     prev_mouse_buttons = mev->buttons;
 }

@@ -19,6 +19,7 @@
 struct mouse_event {
     int      dx;       /* X delta (sign-extended, positive = right) */
     int      dy;       /* Y delta (sign-extended, positive = down on screen) */
+    int      scroll;   /* Scroll wheel delta (positive = up, negative = down) */
     uint8_t  buttons;  /* Button bitmask: bit 0=left, bit 1=right, bit 2=middle */
     int      x;        /* Absolute X position (clamped to framebuffer) */
     int      y;        /* Absolute Y position (clamped to framebuffer) */
@@ -28,6 +29,11 @@ struct mouse_event {
 #define MOUSE_BTN_LEFT   0x01
 #define MOUSE_BTN_RIGHT  0x02
 #define MOUSE_BTN_MIDDLE 0x04
+
+/* Mouse device IDs (reported after reset) */
+#define MOUSE_ID_STANDARD     0x00  /* Standard 3-byte packet mouse */
+#define MOUSE_ID_INTELLIMOUSE 0x03  /* Intellimouse: 4-byte packets with scroll wheel */
+#define MOUSE_ID_EXPLORER     0x04  /* Intellimouse Explorer: 5 buttons + scroll */
 
 /* Callback type: called from IRQ context whenever a complete mouse
  * packet is parsed and a new event is generated. The callback

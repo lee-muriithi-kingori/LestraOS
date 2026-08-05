@@ -22,6 +22,7 @@ enum event_type {
     EV_MOUSE_MOVE = 0,
     EV_MOUSE_DOWN,
     EV_MOUSE_UP,
+    EV_MOUSE_SCROLL,
     EV_KEY_DOWN,
     EV_KEY_UP,
 };
@@ -30,7 +31,7 @@ enum event_type {
 struct event {
     enum event_type type;
     union {
-        struct { int x, y; uint8_t buttons; } mouse;
+        struct { int x, y; int scroll; uint8_t buttons; } mouse;
         struct { uint8_t scancode; uint8_t ascii; uint8_t mods; } key;
     };
 };

@@ -62,7 +62,6 @@
 /* Mouse response bytes */
 #define MOUSE_ACK             0xFA   /* Command acknowledged */
 #define MOUSE_SELF_TEST_OK    0xAA   /* Self-test passed */
-#define MOUSE_ID_STANDARD     0x00   /* Standard 3-byte packet mouse */
 
 /* ----- Ring buffer for mouse events ----- */
 #define MOUSE_BUF_SIZE  128
@@ -147,8 +146,9 @@ static void mouse_send_cmd_arg(uint8_t cmd, uint8_t arg) {
 }
 
 /* ----- Packet parsing state ----- */
-static uint8_t  mouse_packet[4];   /* Buffer for incoming packet bytes */
+static uint8_t  mouse_packet[5];   /* Buffer for incoming packet bytes (up to 4) */
 static int      mouse_pkt_idx = 0;  /* Current byte index in packet */
+static int      mouse_pkt_size = 3; /* Packet size: 3 (standard) or 4 (Intellimouse) */
 
 /* ----- IRQ12 handler ----- */
 
@@ -168,18 +168,23 @@ static void mouse_irq_handler(struct interrupt_frame* frame) {
     }
 
     mouse_packet[mouse_pkt_idx++] = data;
-    if (mouse_pkt_idx < 3) return;
+    if (mouse_pkt_idx < mouse_pkt_size) return;
 
-    /* Complete 3-byte packet received. Reset index for next packet. */
+    /* Complete packet received. Reset index for next packet. */
     mouse_pkt_idx = 0;
 
     /* Parse the packet:
      * byte 0: flags
      * byte 1: X delta
-     * byte 2: Y delta */
+     * byte 2: Y delta
+     * byte 3: scroll delta (Intellimouse only, signed byte) */
     uint8_t flags = mouse_packet[0];
     int dx = (int)mouse_packet[1];
     int dy = (int)mouse_packet[2];
+    int scroll = 0;
+    if (mouse_pkt_size >= 4) {
+        scroll = (int)(int8_t)mouse_packet[3];
+    }
 
     /* Sign-extend X delta if bit 4 (X sign) is set */
     if (flags & 0x10) dx |= (int)0xFFFFFF00;
@@ -216,6 +221,7 @@ static void mouse_irq_handler(struct interrupt_frame* frame) {
     struct mouse_event ev;
     ev.dx      = dx;
     ev.dy      = dy;
+    ev.scroll  = scroll;
     ev.buttons = mouse_buttons;
     ev.x       = mouse_x;
     ev.y       = mouse_y;
@@ -273,6 +279,39 @@ int mouse_init(void) {
     pr_info("mouse: reset response: ACK=0x%x, self-test=0x%x, ID=0x%x\n",
             ack, self_ok, mouse_id);
 
+    /* Step 3b: Attempt Intellimouse extension detection.
+     * The magic sample rate sequence (200, 100, 80) causes Intellimouse-
+     * compatible devices to report ID=0x03 (scroll wheel) or ID=0x04 (Explorer).
+     * Standard mice ignore the sequence and keep ID=0x00.
+     * All commands are ACKed; we read and discard the ACKs.
+     */
+    {
+        /* Send sample rate 200 */
+        mouse_send_cmd_arg(MOUSE_CMD_SET_RATE, 200);
+        /* Send sample rate 100 */
+        mouse_send_cmd_arg(MOUSE_CMD_SET_RATE, 100);
+        /* Send sample rate 80 — this triggers the ID report */
+        mouse_send_cmd_arg(MOUSE_CMD_SET_RATE, 80);
+
+        /* Read the new device ID */
+        ps2_send_cmd(PS2_CMD_SEND_TO_AUX);
+        ps2_write_data(0xF2);  /* Get device ID command */
+        io_wait();
+        uint8_t ack2 = ps2_read_data();  /* ACK for 0xF2 */
+        uint8_t new_id = ps2_read_data(); /* Device ID */
+        (void)ack2;
+
+        if (new_id == MOUSE_ID_INTELLIMOUSE) {
+            mouse_pkt_size = 4;
+            pr_info("mouse: Intellimouse detected (ID=0x03, scroll wheel enabled)\n");
+        } else if (new_id == MOUSE_ID_EXPLORER) {
+            mouse_pkt_size = 4;
+            pr_info("mouse: Intellimouse Explorer detected (ID=0x04, 5-btn + scroll)\n");
+        } else {
+            pr_info("mouse: standard mouse (ID=0x%02x, 3-byte packets)\n", new_id);
+        }
+    }
+
     /* Step 4: Set sample rate to 100 samples/second.
      * Command: 0xF3 (set rate), arg: 100 (decimal 100 = 0x64). */
     mouse_send_cmd_arg(MOUSE_CMD_SET_RATE, 100);
@@ -314,8 +353,8 @@ int mouse_init(void) {
     mouse_buttons  = 0;
     mouse_initialized = 1;
 
-    pr_info("mouse: PS/2 mouse initialized (IRQ12), cursor at (%d,%d)\n",
-            mouse_x, mouse_y);
+    pr_info("mouse: PS/2 mouse initialized (IRQ12, %d-byte packets), cursor at (%d,%d)\n",
+            mouse_pkt_size, mouse_x, mouse_y);
     return 0;
 }
 
