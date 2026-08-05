@@ -1111,3 +1111,24 @@ Stage Summary:
 - KE-23 introduces zero regression — the /init reboot loop is pre-existing (proven via KE-22 worktree b39ee5b)
 - The APIC's core job (interrupt delivery) is verified end-to-end via DHCP completing through IOAPIC+LAPIC
 - TOP PRIORITY for next KE: fix the pre-existing /init triple-fault (userspace execution bug, NOT an IRQ-controller bug). Start with TSS.RSP0 mapping in user PML4 + printf flush behavior.
+
+---
+Task ID: KE-24 (in-progress: userspace transition fix)
+Agent: Main (super-agent, resumed session)
+Task: Fix the pre-existing /init triple-fault that reboots the OS ~immediately after "elf: jumping to userspace"
+
+Work Log:
+- Confirmed (via KE-22 b39ee5b worktree) the crash is pre-existing since KE-22; prior agents' "no faults" claims were invalid — they killed QEMU at 9-10s, but boot takes ~12s to reach userspace, so they never observed userspace.
+- Added one-shot diagnostics (since removed) to syscall_dispatch, sys_write, and interrupt_dispatch to trace what reaches the kernel after the userspace jump.
+- KEY FINDING: after "elf: jumping to userspace", ZERO syscalls reach syscall_dispatch, ZERO page faults, ZERO exceptions — a silent triple-fault (CPU reset with no handler printing).
+- ROOT CAUSE #1 (FOUND + FIXED): tss.rsp0 was NEVER set after gdt_init zeroed it (gdt.c:137 `tss.rsp0 = 0`). The gdt.c comment claimed "updated on each ring transition (see syscall_entry)" but syscall_entry.asm and context_switch.asm do NOT touch tss.rsp0 — the code was never written. So when the first timer IRQ fired in ring 3 (IF=1 from elf_jump_to_user), the CPU loaded RSP=0, couldn't push the interrupt frame to address 0 (unmapped), and triple-faulted → silent reboot.
+  FIX: added tss_set_rsp0(uint64_t) to gdt.c/gdt.h; elf_exec now allocates a static 16KB kernel stack and calls tss_set_rsp0(stack_top) BEFORE elf_jump_to_user. The stack lives in kernel BSS within the 4GB identity map (deep-copied into every user PML4 as supervisor-present, so it's reachable from ring-0 interrupt context regardless of CR3).
+- ISOLATION TEST: temporarily cleared IF in elf_jump_to_user (no timer IRQ in userspace). Result: NO reboot (stable 22s), proving the timer IRQ in ring 3 IS the crash trigger. BUT /init STILL made zero syscalls even with IF=0 — so there's a SECOND bug in the userspace execution path.
+- ROOT CAUSE #2 (NOT YET FIXED): /init's syscalls don't reach syscall_dispatch even with interrupts disabled. vprintf (libc/src/stdio.c:478) does call syscall(SYS_WRITE,...), and syscall numbers match (libc SYS_WRITE=3 == kernel LESTRA_SYS_WRITE=3), and syscall_init sets STAR/LSTAR/SFMASK MSRs correctly. Yet the KE-DEBUG trace in syscall_dispatch never fired. Hypothesis: either _start at 0x401000 isn't executing its printf path (despite being mapped executable — no #PF), or syscall_entry.asm crashes between SYSCALL and the call to syscall_dispatch. NOTE: syscall_entry.asm does NOT switch to a kernel stack (uses the user stack via no rsp0 load) — this is a known design gap (gdt.h:65 comment). Needs gdb single-stepping to resolve.
+
+Stage Summary:
+- KE-24 PARTIAL: tss.rsp0 bug found and fixed (gdt.c + gdt.h + elf.c). This is a genuine, necessary fix — tss.rsp0 MUST be set before any ring-3 code runs. The OS still doesn't reach a userspace shell due to the second bug (syscall path).
+- The timer-IRQ crash is isolated (IF=0 avoids the reboot), confirming the interrupt-delivery path was the trigger.
+- Next step for KE-24: use QEMU + gdb to single-step from elf_jump_to_user's iretq through _start's first instructions and the first SYSCALL, to find where execution diverges. Suspects: (a) syscall_entry stack handling, (b) the actual bytes at 0x401000 vs the expected _start, (c) a CR3/swapgs interaction.
+- Files changed (committed): kernel/arch/x86_64/gdt.c (+tss_set_rsp0), kernel/include/lestra/gdt.h (+decl), kernel/exec/elf.c (+tss.rsp0 setup before jump), kernel/arch/x86_64/idt.c (whitespace cleanup).
+- Concurrent agent is separately developing FAT32/VFS write support (fat32.c +591, vfs.c, fat32.h, vfs.h, kernel_main.c KE-24 demo) — left uncommitted for them.

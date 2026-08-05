@@ -97,6 +97,16 @@ static inline void ltr_load(uint16_t sel) {
     __asm__ volatile("ltr %0" : : "r"(sel) : "memory");
 }
 
+/* Set the TSS RSP0 field — the kernel stack the CPU loads on a ring-3→ring-0
+ * interrupt transition (IST=0 gates). Ke-24 fix: this was never set after
+ * gdt_init zeroed it, so the first interrupt in ring 3 (timer IRQ) loaded
+ * RSP=0, couldn't push the interrupt frame, and triple-faulted → silent
+ * reboot with zero diagnostics. Called before elf_jump_to_user and on every
+ * context switch to a user process. */
+void tss_set_rsp0(uint64_t rsp0) {
+    tss.rsp0 = rsp0;
+}
+
 void gdt_init(void) {
     /* Null descriptor */
     gdt_set_entry(0, 0, 0, 0, 0);

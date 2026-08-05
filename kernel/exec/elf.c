@@ -341,7 +341,24 @@ int elf_exec(const char* path) {
     uint64_t entry = elf_load(elf_buf, total);
     if (!entry) return -1;
 
-    pr_info("elf: jumping to userspace\n");
+    /* KE-24 FIX: Set TSS.RSP0 to a valid kernel stack BEFORE jumping to
+     * ring 3. Without this, the first interrupt in userspace (the 1000 Hz
+     * timer IRQ) loads RSP from tss.rsp0=0, the CPU cannot push the
+     * interrupt frame to address 0, and triple-faults → silent reboot.
+     * This was the root cause of the long-standing "/init reboots
+     * immediately after jumping to userspace" bug.
+     *
+     * We use a static 16 KB stack buffer because elf_exec never returns
+     * (it iretq's to userspace), so dynamic allocation would leak. The
+     * buffer lives in kernel BSS within the 4 GB identity map, which is
+     * deep-copied into every user PML4 as supervisor-present — so it is
+     * reachable from ring-0 interrupt context regardless of CR3. */
+    static uint8_t kstack[16384] __aligned(16);
+    uint64_t kstack_top = (uint64_t)kstack + sizeof(kstack);
+    extern void tss_set_rsp0(uint64_t);
+    tss_set_rsp0(kstack_top);
+
+    pr_info("elf: jumping to userspace (tss.rsp0=0x%x)\n", (unsigned)kstack_top);
     elf_jump_to_user(entry, user_stack_ptr, (uintptr_t)user_pml4);
 
     pr_warn("elf: userspace returned (should not happen)\n");

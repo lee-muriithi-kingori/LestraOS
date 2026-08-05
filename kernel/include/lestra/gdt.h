@@ -60,6 +60,19 @@ struct gdt_ptr {
 void gdt_init(void);
 void gdt_set_entry(int index, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
 
+/* Set the RSP0 field in the TSS.
+ *
+ * RSP0 is the stack pointer the CPU loads when transitioning from ring 3
+ * to ring 0 via an interrupt gate with IST=0 (which is all of IRQ vectors
+ * 32-47). If RSP0 is 0 or points to unmapped memory when an interrupt
+ * fires in ring 3, the CPU cannot push the interrupt frame → #DF →
+ * triple fault → silent reboot (no handler prints anything).
+ *
+ * This MUST be set to a valid kernel stack top before ANY code runs in
+ * ring 3 — i.e. before elf_jump_to_user() / context_switch to a user
+ * process — and re-set on every context switch to a user process. */
+void tss_set_rsp0(uint64_t rsp0);
+
 /* --- Task State Segment (long mode) ---
  * PR #6 fix: GDT was missing a TSS descriptor. Without one:
  *  - syscall entry does NOT swap to a kernel stack (no rsp0 load),

@@ -125,7 +125,7 @@ static void default_irq_handler(struct interrupt_frame* frame) {
 /* Main interrupt dispatcher (called from assembly stubs) */
 void interrupt_dispatch(struct interrupt_frame* frame) {
     uint8_t vector = frame->int_no;
-    
+
     if (vector < 32) {
         /* CPU exception */
         if (interrupt_handlers[vector]) {
