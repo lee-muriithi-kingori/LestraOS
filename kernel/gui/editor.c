@@ -164,38 +164,85 @@ static void editor_on_event(struct widget* w, struct event* e) {
         if (keyboard_has_key()) {
             c = keyboard_getchar();
             if (c == '\n') {
-                /* Split line at cursor */
-                editor_new_line(st->cursor_row);
-                st->cursor_row++;
-                st->cursor_col = 0;
-                /* Adjust scroll if needed */
-                if (st->cursor_row - st->scroll_row >= EDIT_ROWS) {
-                    st->scroll_row = st->cursor_row - EDIT_ROWS + 1;
+                /* Split line at cursor: text [0..col) stays on the current
+                   line, text [col..len) moves to the new line below. The old
+                   code only opened a blank slot and left the tail on the
+                   original line, so pressing Enter in the middle of a line
+                   silently discarded everything after the cursor (C1). */
+                int row = st->cursor_row;
+                int col = st->cursor_col;
+                int len = st->line_lens[row];
+                if (col > len) col = len;                  /* defensive clamp */
+                if (len > MAX_LINE_LEN - 1) len = MAX_LINE_LEN - 1;
+                if (st->n_lines < MAX_LINES) {
+                    /* Open a slot at row+1 (shifts lines below down by 1,
+                       leaves lines[row+1] empty). lines[row] is untouched. */
+                    editor_new_line(row);
+                    /* Move the tail [col..len) to the new line below. */
+                    int tail_len = len - col;
+                    if (tail_len > MAX_LINE_LEN - 1) tail_len = MAX_LINE_LEN - 1;
+                    if (tail_len > 0) {
+                        memcpy(st->lines[row + 1], st->lines[row] + col, tail_len);
+                        st->lines[row + 1][tail_len] = '\0';
+                        st->line_lens[row + 1] = tail_len;
+                    } else {
+                        st->lines[row + 1][0] = '\0';
+                        st->line_lens[row + 1] = 0;
+                    }
+                    /* Truncate the current line at the cursor. */
+                    st->lines[row][col] = '\0';
+                    st->line_lens[row] = col;
+                    /* Move cursor to the start of the new line. */
+                    st->cursor_row = row + 1;
+                    st->cursor_col = 0;
+                    /* Adjust scroll if the cursor left the viewport. */
+                    if (st->cursor_row - st->scroll_row >= EDIT_ROWS) {
+                        st->scroll_row = st->cursor_row - EDIT_ROWS + 1;
+                    }
                 }
             } else if (c == '\b') {
                 if (st->cursor_col > 0) {
-                    st->cursor_col--;
-                    /* Shift chars left */
+                    /* Delete char before cursor (within current line). */
                     char* line = st->lines[st->cursor_row];
                     int len = st->line_lens[st->cursor_row];
-                    for (int i = st->cursor_col; i < len; i++) {
-                        line[i] = line[i + 1];
+                    if (len > MAX_LINE_LEN - 1) len = MAX_LINE_LEN - 1;
+                    if (st->cursor_col > len) st->cursor_col = len;  /* defensive */
+                    if (st->cursor_col > 0 && len > 0) {
+                        st->cursor_col--;
+                        /* Shift chars left */
+                        for (int i = st->cursor_col; i < len; i++) {
+                            line[i] = line[i + 1];
+                        }
+                        st->line_lens[st->cursor_row] = len - 1;
                     }
-                    st->line_lens[st->cursor_row]--;
                 } else if (st->cursor_row > 0) {
-                    /* Merge with previous line */
-                    int prev_len = st->line_lens[st->cursor_row - 1];
-                    st->cursor_col = prev_len;
-                    st->cursor_row--;
-                    /* Move remaining chars to prev line */
-                    char* prev = st->lines[st->cursor_row];
-                    char* cur = st->lines[st->cursor_row + 1];
-                    int cur_len = st->line_lens[st->cursor_row + 1];
-                    for (int i = 0; i < cur_len && prev_len + i < MAX_LINE_LEN; i++) {
-                        prev[prev_len + i] = cur[i];
+                    /* Merge current line into the previous line. */
+                    int prev_row = st->cursor_row - 1;
+                    int prev_len = st->line_lens[prev_row];
+                    int cur_len  = st->line_lens[st->cursor_row];
+                    /* Defensive clamps (invariant: 0 <= len <= MAX_LINE_LEN-1). */
+                    if (prev_len < 0) prev_len = 0;
+                    if (prev_len > MAX_LINE_LEN - 1) prev_len = MAX_LINE_LEN - 1;
+                    if (cur_len  < 0) cur_len  = 0;
+                    if (cur_len  > MAX_LINE_LEN - 1) cur_len  = MAX_LINE_LEN - 1;
+                    char* prev = st->lines[prev_row];
+                    char* cur  = st->lines[st->cursor_row];
+                    /* Copy as many chars from cur as fit, leaving room for
+                       the NUL terminator. The old code wrote the unclamped
+                       prev_len+cur_len into line_lens, which then drove OOB
+                       reads in the in-line backspace loop (C2). */
+                    int room = (MAX_LINE_LEN - 1) - prev_len;
+                    if (room < 0) room = 0;
+                    int copy_n = (cur_len < room) ? cur_len : room;
+                    if (copy_n > 0) {
+                        memcpy(prev + prev_len, cur, copy_n);
                     }
-                    st->line_lens[st->cursor_row] = prev_len + cur_len;
-                    /* Shift lines up */
+                    prev[prev_len + copy_n] = '\0';
+                    st->line_lens[prev_row] = prev_len + copy_n;  /* clamped */
+                    /* Cursor sits at the join point in the previous line. */
+                    st->cursor_col = prev_len;
+                    st->cursor_row = prev_row;
+                    /* Shift lines up to fill the gap left by the merged line. */
                     for (int i = st->cursor_row + 1; i < st->n_lines - 1; i++) {
                         memcpy(st->lines[i], st->lines[i+1], MAX_LINE_LEN);
                         st->line_lens[i] = st->line_lens[i+1];
@@ -206,13 +253,15 @@ static void editor_on_event(struct widget* w, struct event* e) {
                 /* Insert character at cursor */
                 char* line = st->lines[st->cursor_row];
                 int len = st->line_lens[st->cursor_row];
+                if (len > MAX_LINE_LEN - 1) len = MAX_LINE_LEN - 1;
+                if (st->cursor_col > len) st->cursor_col = len;  /* defensive */
                 if (len < MAX_LINE_LEN - 1) {
                     /* Shift chars right */
                     for (int i = len; i > st->cursor_col; i--) {
                         line[i] = line[i-1];
                     }
                     line[st->cursor_col] = c;
-                    st->line_lens[st->cursor_row]++;
+                    st->line_lens[st->cursor_row] = len + 1;
                     st->cursor_col++;
                 }
             }

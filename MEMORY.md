@@ -52,10 +52,10 @@
 6. ~~**sys_mmap** returns kmalloc pointers not real VMAs~~ (KE-17: DONE)
 7. ~~**Fix virtio_blk I/O timeout**~~ (KE-19: DONE)
 8. ~~**PS/2 mouse improvements**~~ (KE-20: DONE, Intellimouse scroll + middle button + /dev/mouse)
-9. **More drivers**: USB UHCI/EHCI, VBE mode setting, PC speaker, ACPI table parsing
-10. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
-11. **sys_futex** is a no-op stub
-12. **Linux signals** are no-ops
+9. ~~**sys_futex** is a no-op stub~~ (KE-21: DONE, wired to futex_dispatch + SMAP fix)
+10. ~~**Linux signals** are no-ops~~ (KE-21: DONE, linux_compat forwards to native signals)
+11. **More drivers**: USB UHCI/EHCI, VBE mode setting, PC speaker, ACPI table parsing
+12. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
@@ -91,11 +91,21 @@
 - Security audit: `KASLR-lite: ENABLED (heap+8 bits, TSC-early)`
 - Combined with existing userspace ASLR: ~28 total bits (stack 12 + brk 8 + heap 8)
 
+### Signal Hardening + Linux Compat (KE-21)
+- **signals.c**: All user-pointer dereferences replaced with access_ok + copy_from_user/copy_to_user
+- **linux_compat.c**: LINUX_SYS_RT_SIGACTION/PROCMASK/RETURN/KILL now forward to native LESTRA_SYS
+- **futex.c**: SMAP fix — bare `*uaddr` replaced with `get_user()`
+- **syscall.c**: sys_futex now delegates to futex_dispatch() (was no-op stub)
+- **scheduler.c**: Real `task_sleep()` with timer-based wake deadlines via `wake_tick` field
+- **task_block() fix**: Single-process stuck-in-BLOCKED bug fixed (state restored to RUNNING)
+- **GUI scroll**: compositor routes EV_MOUSE_SCROLL, editor/terminal/file_explorer handle scroll wheel
+
 ### Known Issues
 - RTL8139 QEMU multi-packet RX: first packet works, QEMU model has can_receive() quirk (buffer wraps at 8K, not 64K; CAPR+16 offset). Real hardware expected to work fine.
 - CSPRNG uses TSC fallback on qemu64 (no RDRAND) — entropy is weak but non-zero (KE-16: mitigated with IRQ-mixed pool)
-- sys_futex is a no-op stub
-- Linux signals (rt_sigaction etc.) are no-ops
+- FUTEX_WAIT uses non-atomic load (not cmpxchg) — TOCTOU race window exists
+- No FUTEX_REQUEUE/CMP_REQUEUE/WAKE_OP — returns -ENOSYS
+- No fork/clone — single-process only (vfork works)
 
 ### PS/2 Mouse Upgrade (KE-20)
 - **Intellimouse detection**: Magic sample rate sequence (200/100/80) → QEMU returns ID=0x03
@@ -108,6 +118,7 @@
 - **QEMU confirmed**: Default PS/2 mouse supports Intellimouse extensions (ID=0x03)
 
 ### Commit History (recent)
+f429998 security: KE-21 SMAP-harden signals + wire Linux compat signals + futex + task_sleep
 7383f2d drivers: KE-20 PS/2 mouse Intellimouse scroll wheel + middle button fix + /dev/mouse
 4b259e1 fix: KE-19 virtio_blk I/O timeout (volatile DMA poll) + legacy queue size fix
 2f8bea0 mm: KE-17 sys_mmap returns real VMAs instead of kmalloc pointers

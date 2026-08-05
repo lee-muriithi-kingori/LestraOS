@@ -178,3 +178,49 @@ int menu_handle_event(struct event* e) {
             return 0;
     }
 }
+
+/* ============================================================
+ * Desktop right-click default menu
+ *
+ * The compositor calls this when the user right-clicks on the
+ * desktop (or anywhere not consumed by a widget). It builds a
+ * small menu that wires into the other overlay subsystems:
+ * lock screen, power menu, screenshot, brightness, volume.
+ * ============================================================ */
+
+/* Forward decls for the other overlay subsystems we dispatch to. */
+extern void lock_screen_show(void);
+extern void power_menu_show(void);
+extern void screenshot_enter_mode(void);
+extern void brightness_show_at(int x, int y);
+extern void brightness_hide(void);
+extern void volume_slider_show_at(int x, int y);
+extern void volume_slider_hide(void);
+
+/* Anchors for the flyouts (top-right, just below the top bar). */
+static void desktop_menu_lock(void)    { lock_screen_show(); }
+static void desktop_menu_power(void)   { power_menu_show(); }
+static void desktop_menu_screenshot(void) { screenshot_enter_mode(); }
+
+static void desktop_menu_brightness(void) {
+    /* Only one flyout at a time — dismiss the sibling. */
+    volume_slider_hide();
+    brightness_show_at((int)fb_w - 280, 60);
+}
+
+static void desktop_menu_volume(void) {
+    brightness_hide();
+    volume_slider_show_at((int)fb_w - 56, 60);
+}
+
+void menu_show_desktop_default(int x, int y) {
+    static struct menu_item items[] = {
+        { "Lock Screen",   desktop_menu_lock,      0, 0 },
+        { "Power Menu",    desktop_menu_power,     0, 0 },
+        { "Screenshot",    desktop_menu_screenshot,0, 0 },
+        { "",              NULL,                   0, 0 },  /* separator */
+        { "Brightness",    desktop_menu_brightness,0, 0 },
+        { "Volume",        desktop_menu_volume,    0, 0 },
+    };
+    menu_show(x, y, items, (int)(sizeof(items) / sizeof(items[0])));
+}
