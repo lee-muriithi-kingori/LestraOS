@@ -13,6 +13,7 @@
 #include <lestra/types.h>
 #include <lestra/fb.h>
 #include <lestra/input.h>
+#include <lestra/keyboard.h>
 #include <lestra/gui.h>
 #include <lestra/ui_pro.h>
 #include <lestra/font.h>
@@ -48,6 +49,47 @@ extern int  left_drawer_get_width(void);
 /* External: dock (gui/dock.c) */
 extern void dock_render(void);
 extern int  dock_handle_event(struct event* e);
+
+/* ----- Overlay subsystems (gui/*.c) -----
+ * Each is a singleton with static zero-initialised state — no _init()
+ * call is needed. They are rendered on top of the main UI (after
+ * widgets, before the cursor) and get first crack at input events
+ * when active, so a modal overlay intercepts input before any
+ * window or desktop handler sees it. */
+extern void lock_screen_render(void);
+extern int  lock_screen_handle_event(struct event* e);
+extern void lock_screen_show(void);
+
+extern void power_menu_render(void);
+extern int  power_menu_handle_event(struct event* e);
+extern void power_menu_show(void);
+
+extern void screenshot_render(void);
+extern int  screenshot_handle_event(struct event* e);
+extern void screenshot_enter_mode(void);
+
+extern void clipboard_render(void);
+extern int  clipboard_handle_event(struct event* e);
+
+extern int  shortcuts_handle_event(struct event* e);
+
+extern void menu_render(void);
+extern int  menu_handle_event(struct event* e);
+extern void menu_show_desktop_default(int x, int y);
+
+extern void brightness_render(void);
+extern int  brightness_handle_event(struct event* e);
+extern void brightness_show_at(int x, int y);
+extern void brightness_hide(void);
+extern void brightness_apply_post_render(void);
+
+extern void volume_slider_render(void);
+extern int  volume_slider_handle_event(struct event* e);
+extern void volume_slider_show_at(int x, int y);
+extern void volume_slider_hide(void);
+
+/* Top-bar volume-icon hit-rect accessor (gui/top_bar.c). */
+extern int  top_bar_get_volume_icon_rect(int* x, int* y, int* w, int* h);
 
 static struct widget* widgets[MAX_WIDGETS];
 static int n_widgets = 0;
@@ -373,6 +415,49 @@ static void dispatch_events(void) {
     /* External: drawer event handler (gui/drawer.c) */
     extern int drawer_handle_event(struct event* e);
     while (input_poll(&e)) {
+        /* ---- Modal overlays (swallow everything when active) ----
+         * Checked first so a locked / power-menu / screenshot session
+         * intercepts all input before any other handler sees it. */
+        if (lock_screen_handle_event(&e)) continue;
+        if (power_menu_handle_event(&e)) continue;
+        if (screenshot_handle_event(&e)) continue;
+
+        /* ---- Global keyboard shortcuts (Alt+Tab, Alt+F4, Super, Esc) ----
+         * Wiring this changes the Super key from press-toggle (drawer's
+         * legacy behaviour) to release-toggle (shortcuts' designed
+         * behaviour). The drawer still toggles on Super — just on key
+         * release instead of key press. See worklog FIX-OVERLAYS. */
+        if (shortcuts_handle_event(&e)) continue;
+
+        /* ---- Custom overlay triggers (keyboard shortcuts) ---- */
+        if (e.type == EV_KEY_DOWN) {
+            uint8_t mods = e.key.mods;
+            uint8_t sc   = e.key.scancode;
+            /* Ctrl+Alt+L — lock the session. */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_L) {
+                lock_screen_show();
+                continue;
+            }
+            /* Ctrl+Alt+P — power menu. */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_P) {
+                power_menu_show();
+                continue;
+            }
+            /* Ctrl+Alt+B — brightness flyout (top-right). */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_B) {
+                volume_slider_hide();
+                brightness_show_at((int)fb_w - 280, 60);
+                continue;
+            }
+        }
+
+        /* ---- Popups (swallow mouse events when open) ---- */
+        if (clipboard_handle_event(&e)) continue;
+        if (menu_handle_event(&e)) continue;
+        if (brightness_handle_event(&e)) continue;
+        if (volume_slider_handle_event(&e)) continue;
+
+        /* ---- Existing desktop / window handlers ---- */
         /* Drawer gets first crack at FAB clicks, Super key, Esc */
         if (drawer_handle_event(&e)) continue;
 
@@ -399,12 +484,32 @@ static void dispatch_events(void) {
                     drag_widget->y = fb_h - drag_widget->h;
             }
         } else if (e.type == EV_MOUSE_DOWN) {
+            /* Right-click anywhere → desktop context menu (which in
+             * turn wires into lock / power / screenshot / brightness /
+             * volume overlays). */
+            if (e.mouse.buttons & MOUSE_BTN_RIGHT) {
+                menu_show_desktop_default(cursor_x, cursor_y);
+                continue;
+            }
             if (fab_contains(cursor_x, cursor_y)) {
                 continue;
             }
             /* Top floating bar gets first crack (mic button, search box). */
             if (top_bar_handle_click(cursor_x, cursor_y)) {
                 continue;
+            }
+            /* Volume icon click → pop up the volume slider flyout
+             * (anchored top-right, just below the top bar). Dismiss
+             * the brightness flyout so only one is open at a time. */
+            {
+                int vx, vy, vw, vh;
+                if (top_bar_get_volume_icon_rect(&vx, &vy, &vw, &vh) &&
+                    cursor_x >= vx && cursor_x < vx + vw &&
+                    cursor_y >= vy && cursor_y < vy + vh) {
+                    brightness_hide();
+                    volume_slider_show_at((int)fb_w - 56, 60);
+                    continue;
+                }
             }
             struct widget* w = find_widget_at(cursor_x, cursor_y);
             if (w) {
@@ -468,6 +573,11 @@ void compositor_init(void) {
      * the Material-Design app grid before the run loop starts. */
     top_bar_init();
     app_grid_init();
+    /* The 8 overlay subsystems (lock_screen, power_menu, screenshot,
+     * clipboard, shortcuts, context_menu, brightness, volume_slider)
+     * use static zero-initialised state and do not require explicit
+     * _init() calls. They are wired into the render loop and event
+     * dispatch — see compositor_run() and dispatch_events(). */
 }
 
 void compositor_run(void);
@@ -548,6 +658,22 @@ void compositor_run(void) {
         if (drawer_is_open()) {
             drawer_render();
         }
+
+        /* ---- Overlay subsystems ----
+         * Drawn on top of the main UI but below the cursor. Order
+         * matters: small popups first (lower z), full-screen modals
+         * last (top z), so a modal overlay paints over everything. */
+        brightness_render();
+        volume_slider_render();
+        clipboard_render();
+        menu_render();             /* right-click context menu */
+        screenshot_render();       /* full-screen region-select */
+        power_menu_render();       /* full-screen power overlay */
+        lock_screen_render();      /* full-screen lock (most modal) */
+
+        /* Global brightness dimming — multiply the final composited
+         * frame by the user's brightness setting (no-op at 100%). */
+        brightness_apply_post_render();
 
         cursor_render();
         fb_swap();

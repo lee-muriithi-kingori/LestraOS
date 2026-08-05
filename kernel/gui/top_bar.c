@@ -473,3 +473,45 @@ static void tb_draw_volume_icon(int x, int y, uint32_t color) {
         fb_draw_line(x1, y1, x2, y2, color);
     }
 }
+
+/* ============================================================
+ * Accessor: volume icon hit-rect
+ *
+ * The compositor uses this to detect clicks on the speaker icon
+ * so it can pop up the volume_slider overlay (gui/volume_slider.c)
+ * without having to replicate the right-cluster layout math.
+ *
+ * Returns 1 if the bar is visible and the rect was filled in,
+ * 0 otherwise (caller should ignore the rect).
+ * ============================================================ */
+int top_bar_get_volume_icon_rect(int* out_x, int* out_y,
+                                 int* out_w, int* out_h) {
+    if (!tb_inited || tb_visible <= 0) return 0;
+
+    int bar_w = (int)fb_w - 2 * TB_MARGIN_X;
+    int bar_y = TB_MARGIN_TOP - TB_HEIGHT + tb_visible + tb_idle_nudge_offset;
+
+    /* Replicate the right-cluster layout from top_bar_render() to
+     * locate the volume icon. The cluster is laid out right-to-left:
+     * clock, battery, wifi, volume, mic. */
+    extern void rtc_get_time(uint8_t*, uint8_t*, uint8_t*);
+    uint8_t hh, mm, ss;
+    rtc_get_time(&hh, &mm, &ss);
+    char clock_buf[16];
+    ksnprintf(clock_buf, sizeof(clock_buf), "%u:%02u:%02u",
+              (unsigned)hh, (unsigned)mm, (unsigned)ss);
+    int clock_w = fb_text_width(clock_buf);
+
+    int rx = TB_MARGIN_X + bar_w - 14;
+    rx -= clock_w;   /* clock text */
+    rx -= 12;        /* gap after clock */
+    rx -= 36;        /* battery icon */
+    rx -= 28;        /* wifi icon */
+    /* Volume icon is drawn at (rx - 20, bar_y + (TB_HEIGHT - 16) / 2). */
+
+    if (out_x) *out_x = rx - 24;   /* 4 px left padding for easier clicking */
+    if (out_y) *out_y = bar_y + (TB_HEIGHT - 20) / 2;
+    if (out_w) *out_w = 28;
+    if (out_h) *out_h = 20;
+    return 1;
+}
