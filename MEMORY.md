@@ -281,3 +281,36 @@ Stage Summary:
 - Combined ASLR: ~36 total bits (stack 12 + brk 8 + heap 8 + mmap 8)
 - Foundation for dynamic linking, JIT, shared memory, mprotect()
 - Next priority: driver pacing (USB/FAT32/framebuffer), sys_futex, signals
+
+---
+Task ID: 6
+Agent: Main (super-agent)
+Task: KE-19 — Fix virtio_blk I/O timeout + FAT32 end-to-end
+
+Work Log:
+- Read worklog + MEMORY.md + git log — KE-18 (FAT32) committed but I/O requests timed out
+- Found uncommitted virtio_blk.c changes in git stash (legacy queue size clamping fix)
+- Baseline boot test: kernel boots clean without virtio-blk (all 7 security features active)
+- With virtio-blk: QEMU hung completely — diagnosed as stale QEMU process holding file lock
+- After killing stale QEMU: kernel booted but needed `-boot d` flag (QEMU tried to boot raw disk)
+- Boot log showed: virtio_blk detected (modern transport), FAT32 mounted, then "request timeout"
+- Spawned ALPHA (high-reward strategist) and BETA (caution officer) advisory subagents
+- ALPHA diagnosed: GCC -O2 hoists vblk_used->idx read out of the polling loop
+  - Evidence: IO port access uses asm volatile (unhoistable), but DMA-written BSS RAM is not
+  - The existing barrier() is a compiler barrier only, doesn't prevent register caching
+- BETA confirmed: volatile diagnosis plausible but recommended confirming via -O0 test
+- Applied fix: cast vblk_used to volatile* inside the polling loop + enhanced timeout diagnostics
+- Applied git stash fix: don't clamp queue size in legacy mode (layout mismatch)
+- First boot: I/O timeout GONE, FAT32 mounted! But corrupt FAT32 image (bad BPB from previous cycle)
+- Recreated FAT32 image with correct BPB (reserved=32 sectors, proper cluster offsets)
+- Second boot: FAT32 end-to-end working: 3 files read, "Hello from lestraOS FAT32 driver!"
+- Regression tested: clean boot without virtio-blk, all 7 security features verified
+- Committed as 4b259e1, pushed to GitHub
+- Updated README.md changelog, synced MEMORY.md
+
+Stage Summary:
+- KE-19 complete: virtio_blk driver now works on QEMU 10.0.11 (modern transport)
+- Root cause was compiler optimization hoisting DMA-written memory reads
+- FAT32 read-only filesystem works end-to-end: mount, list, read files
+- Important discovery: `-boot d` required when virtio-blk device present
+- Next priority: more drivers (USB, framebuffer fonts), sys_futex, signals
