@@ -48,7 +48,7 @@ void gdt_set_entry(int index, uint32_t base, uint32_t limit,
  * Sized so that a #DF (e.g., kernel stack overflow on syscall)
  lands on its own stack instead of dying as a triple fault. */
 #define IST_STACK_SIZE 8192
-static struct tss_entry tss __aligned(16);
+struct tss_entry tss __aligned(16);
 static uint8_t ist1_stack[IST_STACK_SIZE] __aligned(16);
 
 static inline void tss_set_entry(int index, struct tss_entry* t) {

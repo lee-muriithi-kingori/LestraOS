@@ -5,11 +5,23 @@
 ;; Assembly stubs for all 256 interrupt vectors.
 ;; Each stub saves CPU state and calls the C interrupt dispatcher.
 ;;
+;; KE-30: Added g_isr_frame pointer so context_switch can locate the
+;; interrupt frame on the kernel stack and perform a full register swap.
+;;
 
 bits 64
 
 global isr_stubs
 extern interrupt_dispatch
+
+; KE-30: Global pointer to the interrupt frame on the kernel stack.
+; Set by isr_common before calling interrupt_dispatch. Used by
+; context_switch to save/restore the full register state during
+; preemptive context switching. Points to the saved rax on the stack
+; (i.e. RSP at the point where the 15 GPRs have been pushed).
+global g_isr_frame
+section .data
+g_isr_frame: dq 0
 
 ; Macro for ISR without error code
 %macro ISR_NOERR 1
@@ -96,9 +108,19 @@ isr_common:
     push r14
     push r15
     
+    ; KE-30: Save pointer to the interrupt frame (saved rax) on the stack.
+    ; context_switch uses this to find and swap the full register state.
+    ; RSP currently points to the saved rax.
+    mov [g_isr_frame], rsp
+    
     ; Call C handler with pointer to saved state
     mov rdi, rsp
     call interrupt_dispatch
+    
+    ; KE-30: Clear g_isr_frame so that any schedule() call from a
+    ; syscall handler (which does NOT go through isr_common) will
+    ; use direct mode instead of trying to swap a stale ISR frame.
+    mov qword [g_isr_frame], 0
     
     ; Restore all registers
     pop r15

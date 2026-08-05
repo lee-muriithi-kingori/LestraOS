@@ -23,11 +23,27 @@ struct fd_entry {
     int flags;              /* open flags (O_RDONLY, O_WRONLY, O_RDWR, …) */
 };
 
+/* KE-30: Extended to hold the FULL register state for preemptive
+ * context switching. When the timer IRQ fires in user mode, isr_common
+ * pushes all 15 GPRs + interrupt frame (rip/cs/rflags/rsp/ss). The
+ * context_switch reads/writes this full frame from/to the ISR stack,
+ * so we need storage for all 15 GPRs (not just callee-saved).
+ *
+ * Layout matches the ISR frame on the kernel stack (see isr.asm):
+ *   [0..14] = 15 GPRs in isr_common push order
+ *   [15..16] = int_no, err_code (saved for diagnostics, not restored)
+ *   [17..21] = rip, cs, rflags, rsp, ss (interrupt frame)
+ *   [22]    = fs_base (MSR 0xC0000100)
+ */
 struct cpu_state {
-    uint64_t r15, r14, r13, r12;
-    uint64_t rbp, rbx;
-    uint64_t rax;
+    /* GPRs in isr_common push order (rax first, r15 last) */
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    /* Interrupt metadata (not restored on switch, but saved for debugging) */
+    uint64_t int_no, err_code;
+    /* User return state (from interrupt frame) */
     uint64_t rip, cs, rflags, rsp, ss;
+    /* FS segment base */
     uint64_t fs_base;
 } __packed;
 

@@ -24,9 +24,9 @@ static int next_pid = 1;
 static int scheduler_enabled = 0;
 uint64_t save_kernel_cr3 = 0;
 
-/* External: context switch assembly */
+/* External: context switch assembly (KE-30: v3 — ISR frame swap + ret) */
 extern void context_switch(struct cpu_state* old_state, struct cpu_state* new_state,
-                           uint64_t new_pml4, uint64_t new_kstack);
+                           uint64_t new_pml4, uint64_t new_kstack_top);
 
 /* External: ELF loader */
 extern uint64_t elf_load(const void* elf_data, size_t elf_size);
@@ -648,6 +648,9 @@ void schedule(void) {
         context_switch(prev->saved_state, next->saved_state,
                        (uint64_t)next->pml4, next->kernel_stack_top);
     } else {
+        /* First process: no old state to save, no ISR frame to swap.
+         * context_switch(NULL, ...) will skip the save and ISR frame
+         * write, but still switch CR3 and restore callee-saved regs. */
         context_switch(NULL, next->saved_state,
                        (uint64_t)next->pml4, next->kernel_stack_top);
     }
@@ -669,11 +672,10 @@ void sched_enable(void) {
     pr_info("sched: scheduling enabled\n");
 }
 
-/* KE-29: Explicit disable for elf_exec. The timer IRQ handler's
- * sched_tick() → schedule() path triple-faults when context_switch
- * runs with a user PML4 that doesn't fully cover kernel addresses.
- * This is a stopgap until the context_switch triple-fault (bug #3)
- * is properly fixed. */
+/* KE-30: sched_disable kept as API but no longer needed as a stopgap.
+ * The context_switch triple-fault (bug #3) is now fixed — context_switch
+ * v3 uses ISR frame swap + ret instead of direct iretq, so preemption
+ * works correctly even during elf_exec. The scheduler stays enabled. */
 void sched_disable(void) {
     scheduler_enabled = 0;
 }

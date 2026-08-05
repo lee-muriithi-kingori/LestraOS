@@ -1,7 +1,32 @@
 ;;
-;; Lestra OS - Real Context Switch v2 (x86_64)
-;; Saves/restores FS_BASE MSR per-thread + wraps in cli/sti
-;; Only saves callee-saved regs (caller-saved are in the IRQ frame)
+;; Lestra OS - Context Switch v3 (x86_64) - KE-30
+;;
+;; Two modes:
+;;
+;; 1. ISR-swap (g_isr_frame != NULL):
+;;    From timer IRQ -> sched_tick -> schedule.
+;;    Writes new state into ISR frame on stack, ret so
+;;    isr_common pops new regs and iretqs.
+;;
+;; 2. Direct (g_isr_frame == NULL):
+;;    From C code (task_sleep, proc_exit).
+;;    Builds iretq frame, iretqs to user space.
+;;
+;; Args: rdi=old_state rsi=new_state rdx=new_pml4 rcx=new_kstack_top
+;;
+;; struct cpu_state offsets:
+;;   rax:0 rbx:8 rcx:0x10 rdx:0x18 rsi:0x20 rdi:0x28 rbp:0x30
+;;   r8:0x38 r9:0x40 r10:0x48 r11:0x50 r12:0x58 r13:0x60
+;;   r14:0x68 r15:0x70 (ret_addr:0x78)
+;;   int_no:0x80 err_code:0x88
+;;   rip:0x90 cs:0x98 rflags:0xA0 rsp:0xA8 ss:0xB0
+;;
+;; ISR frame offsets (from g_isr_frame):
+;;   rax:0 rbx:8 rcx:0x10 rdx:0x18 rsi:0x20 rdi:0x28
+;;   rbp:0x30 r8:0x38 r9:0x40 r10:0x48 r11:0x50
+;;   r12:0x58 r13:0x60 r14:0x68 r15:0x70
+;;   int_no:0x80 err_code:0x88
+;;   rip:0x90 cs:0x98 rflags:0xA0 rsp:0xA8 ss:0xB0
 ;;
 
 bits 64
@@ -9,74 +34,265 @@ default rel
 
 global context_switch
 
-%define OFF_R15   0x00
-%define OFF_R14   0x08
-%define OFF_R13   0x10
-%define OFF_R12   0x18
-%define OFF_RBP   0x20
-%define OFF_RBX   0x28
-%define OFF_RAX   0x30
-%define OFF_RIP   0x38
-%define OFF_CS    0x40
-%define OFF_RFLAGS 0x48
-%define OFF_RSP   0x50
-%define OFF_SS    0x58
-%define OFF_FSBASE 0x60
+; struct cpu_state offsets
+%define CS_RAX    0x00
+%define CS_RBX    0x08
+%define CS_RCX    0x10
+%define CS_RDX    0x18
+%define CS_RSI    0x20
+%define CS_RDI    0x28
+%define CS_RBP    0x30
+%define CS_R8     0x38
+%define CS_R9     0x40
+%define CS_R10    0x48
+%define CS_R11    0x50
+%define CS_R12    0x58
+%define CS_R13    0x60
+%define CS_R14    0x68
+%define CS_R15    0x70
+%define CS_INTNO  0x78
+%define CS_ERR    0x80
+%define CS_RIP    0x88
+%define CS_CS     0x90
+%define CS_RFLAGS 0x98
+%define CS_RSP    0xA0
+%define CS_SS     0xA8
+%define CS_FSBASE 0xB0
+
+; ISR frame offsets (from g_isr_frame)
+%define ISR_RAX    0x00
+%define ISR_RBX    0x08
+%define ISR_RCX    0x10
+%define ISR_RDX    0x18
+%define ISR_RSI    0x20
+%define ISR_RDI    0x28
+%define ISR_RBP    0x30
+%define ISR_R8     0x38
+%define ISR_R9     0x40
+%define ISR_R10    0x48
+%define ISR_R11    0x50
+%define ISR_R12    0x58
+%define ISR_R13    0x60
+%define ISR_R14    0x68
+%define ISR_R15    0x70
+%define ISR_INTNO  0x80
+%define ISR_ERR    0x88
+%define ISR_RIP    0x90
+%define ISR_CS     0x98
+%define ISR_RFLAGS 0xA0
+%define ISR_RSP    0xA8
+%define ISR_SS     0xB0
+
+extern g_isr_frame
+extern g_syscall_kstack
+extern tss
 
 section .text
 
 context_switch:
     cli
 
-    test    rdi, rdi
+    ;; Save new_pml4 (rdx) and new_kstack_top (rcx) on the stack.
+    ;; We will pop them after reading new_state (rbp).
+    push    rdx
+    push    rcx
+
+    ;; Save old_state in r15 (callee-saved, won't be clobbered by calls)
+    mov     r15, rdi
+    ;; Save new_state in r11 (caller-saved, safe to clobber —
+    ;; in ISR-swap mode, isr_common will restore r11 from the frame;
+    ;; in direct mode, we restore it from new_state before iretq)
+    mov     r11, rsi
+
+    ;; =============================================
+    ;; SAVE old process
+    ;; =============================================
+    test    r15, r15
     jz      .no_save
 
-    mov     [rdi + OFF_R15], r15
-    mov     [rdi + OFF_R14], r14
-    mov     [rdi + OFF_R13], r13
-    mov     [rdi + OFF_R12], r12
-    mov     [rdi + OFF_RBP], rbp
-    mov     [rdi + OFF_RBX], rbx
-    mov     [rdi + OFF_RAX], rax
-
+    ;; Save FS base MSR
     mov     ecx, 0xC0000100
     rdmsr
-    mov     [rdi + OFF_FSBASE], eax
-    mov     [rdi + OFF_FSBASE + 4], edx
+    mov     [r15 + CS_FSBASE], eax
+    mov     [r15 + CS_FSBASE + 4], edx
 
+    ;; Check for ISR frame
+    mov     r8, [g_isr_frame]
+    test    r8, r8
+    jz      .save_no_isr
+
+    ;; Save all 15 GPRs from ISR frame to old_state
+    mov     rax, [r8 + ISR_RAX];  mov [r15 + CS_RAX], rax
+    mov     rax, [r8 + ISR_RBX];  mov [r15 + CS_RBX], rax
+    mov     rax, [r8 + ISR_RCX];  mov [r15 + CS_RCX], rax
+    mov     rax, [r8 + ISR_RDX];  mov [r15 + CS_RDX], rax
+    mov     rax, [r8 + ISR_RSI];  mov [r15 + CS_RSI], rax
+    mov     rax, [r8 + ISR_RDI];  mov [r15 + CS_RDI], rax
+    mov     rax, [r8 + ISR_RBP];  mov [r15 + CS_RBP], rax
+    mov     rax, [r8 + ISR_R8];   mov [r15 + CS_R8], rax
+    mov     rax, [r8 + ISR_R9];   mov [r15 + CS_R9], rax
+    mov     rax, [r8 + ISR_R10];  mov [r15 + CS_R10], rax
+    mov     rax, [r8 + ISR_R11];  mov [r15 + CS_R11], rax
+    mov     rax, [r8 + ISR_R12];  mov [r15 + CS_R12], rax
+    mov     rax, [r8 + ISR_R13];  mov [r15 + CS_R13], rax
+    mov     rax, [r8 + ISR_R14];  mov [r15 + CS_R14], rax
+    mov     rax, [r8 + ISR_R15];  mov [r15 + CS_R15], rax
+
+    ;; Save user return state
+    mov     rax, [r8 + ISR_RIP];   mov [r15 + CS_RIP], rax
+    mov     rax, [r8 + ISR_CS];    mov [r15 + CS_CS], rax
+    mov     rax, [r8 + ISR_RFLAGS];mov [r15 + CS_RFLAGS], rax
+    mov     rax, [r8 + ISR_RSP];  mov [r15 + CS_RSP], rax
+    mov     rax, [r8 + ISR_SS];   mov [r15 + CS_SS], rax
+    jmp     .save_done
+
+.save_no_isr:
+    ;; No ISR frame — save callee-saved from registers
+    mov     [r15 + CS_RBX], rbx
+    mov     [r15 + CS_RBP], rbp
+    mov     [r15 + CS_R12], r12
+    mov     [r15 + CS_R13], r13
+    mov     [r15 + CS_R14], r14
+    mov     [r15 + CS_R15], r15
+
+.save_done:
 .no_save:
-    mov     r12, rsi
+    ;; =============================================
+    ;; Mode decision: ISR-swap or direct?
+    ;; =============================================
+    mov     r8, [g_isr_frame]
+    test    r8, r8
+    jnz     .isr_swap
 
+    ;; =============================================
+    ;; DIRECT MODE
+    ;; =============================================
+    ;; Pop saved args
+    pop     r9                        ; r9  = new_kstack_top
+    pop     r8                        ; r8  = new_pml4
+
+    ;; Switch CR3
     mov     rax, cr3
-    cmp     rax, rdx
-    je      .skip_cr3
-    mov     cr3, rdx
-.skip_cr3:
+    cmp     rax, r8
+    je      .dir_cr3_ok
+    mov     cr3, r8
+.dir_cr3_ok:
 
-    mov     rsp, rcx
+    ;; Update TSS.RSP0 and g_syscall_kstack
+    mov     [tss + 4], r9
+    mov     [g_syscall_kstack], r9
 
+    ;; Switch to new kernel stack, build iretq frame
+    mov     rsp, r9
+    sub     rsp, 8                    ; alignment
+
+    ;; Read all values from new_state (r11) into temporaries FIRST
+    mov     rax, [r11 + CS_RIP]
+    mov     rcx, [r11 + CS_CS]
+    mov     rdx, [r11 + CS_RFLAGS]
+    mov     rsi, [r11 + CS_RSP]
+    mov     rdi, [r11 + CS_SS]
+    mov     rbx, [r11 + CS_RBX]
+    mov     rbp, [r11 + CS_RBP]
+    mov     r12, [r11 + CS_R12]
+    mov     r13, [r11 + CS_R13]
+    mov     r14, [r11 + CS_R14]
+    mov     r15, [r11 + CS_R15]
+    mov     r8,  [r11 + CS_R8]
+    mov     r9,  [r11 + CS_R9]
+    mov     r10, [r11 + CS_R10]
+
+    ;; Restore FS base
     mov     ecx, 0xC0000100
-    mov     eax, [r12 + OFF_FSBASE]
-    mov     edx, [r12 + OFF_FSBASE + 4]
+    mov     eax, [r11 + CS_FSBASE]
+    mov     edx, [r11 + CS_FSBASE + 4]
     wrmsr
 
-    mov     rax, [r12 + OFF_SS]
-    push    rax
-    mov     rax, [r12 + OFF_RSP]
-    push    rax
-    mov     rax, [r12 + OFF_RFLAGS]
-    push    rax
-    mov     rax, [r12 + OFF_CS]
-    push    rax
-    mov     rax, [r12 + OFF_RIP]
-    push    rax
+    ;; Push iretq frame: SS, RSP, RFLAGS, CS, RIP
+    push    rdi                      ; SS
+    push    rsi                      ; RSP
+    push    rdx                      ; RFLAGS
+    push    rcx                      ; CS
+    push    rax                      ; RIP
 
-    mov     r15, [r12 + OFF_R15]
-    mov     r14, [r12 + OFF_R14]
-    mov     r13, [r12 + OFF_R13]
-    mov     rbp, [r12 + OFF_RBP]
-    mov     rbx, [r12 + OFF_RBX]
-    mov     rax, [r12 + OFF_RAX]
-    mov     r12, [r12 + OFF_R12]
+    ;; Restore remaining GPRs
+    mov     rax, [r11 + CS_RAX]
+    mov     rcx, [r11 + CS_RCX]
+    mov     rdx, [r11 + CS_RDX]
+    mov     rsi, [r11 + CS_RSI]
+    mov     rdi, [r11 + CS_RDI]
+    mov     r11, [r11 + CS_R11]
 
     iretq
+
+    ;; =============================================
+    ;; ISR-SWAP MODE
+    ;; =============================================
+.isr_swap:
+    ;; Pop saved args (still on stack below our pushes)
+    mov     r9,  [rsp + 8]             ; new_kstack_top
+    mov     r10, [rsp]                 ; new_pml4
+
+    ;; Write new process's GPRs into ISR frame
+    mov     rax, [r11 + CS_RAX];   mov [r8 + ISR_RAX], rax
+    mov     rax, [r11 + CS_RBX];   mov [r8 + ISR_RBX], rax
+    mov     rax, [r11 + CS_RCX];   mov [r8 + ISR_RCX], rax
+    mov     rax, [r11 + CS_RDX];   mov [r8 + ISR_RDX], rax
+    mov     rax, [r11 + CS_RSI];   mov [r8 + ISR_RSI], rax
+    mov     rax, [r11 + CS_RDI];   mov [r8 + ISR_RDI], rax
+    mov     rax, [r11 + CS_RBP];   mov [r8 + ISR_RBP], rax
+    mov     rax, [r11 + CS_R8];    mov [r8 + ISR_R8], rax
+    mov     rax, [r11 + CS_R9];    mov [r8 + ISR_R9], rax
+    mov     rax, [r11 + CS_R10];   mov [r8 + ISR_R10], rax
+    mov     rax, [r11 + CS_R11];   mov [r8 + ISR_R11], rax
+    mov     rax, [r11 + CS_R12];   mov [r8 + ISR_R12], rax
+    mov     rax, [r11 + CS_R13];   mov [r8 + ISR_R13], rax
+    mov     rax, [r11 + CS_R14];   mov [r8 + ISR_R14], rax
+    mov     rax, [r11 + CS_R15];   mov [r8 + ISR_R15], rax
+
+    ;; Write new process's user return state into ISR frame
+    mov     rax, [r11 + CS_RIP];   mov [r8 + ISR_RIP], rax
+    mov     rax, [r11 + CS_CS];    mov [r8 + ISR_CS], rax
+    mov     rax, [r11 + CS_RFLAGS];mov [r8 + ISR_RFLAGS], rax
+    mov     rax, [r11 + CS_RSP];  mov [r8 + ISR_RSP], rax
+    mov     rax, [r11 + CS_SS];   mov [r8 + ISR_SS], rax
+
+    ;; Switch CR3
+    mov     rax, cr3
+    cmp     rax, r10
+    je      .isr_cr3_ok
+    mov     cr3, r10
+.isr_cr3_ok:
+
+    ;; Update TSS.RSP0 and g_syscall_kstack
+    mov     [tss + 4], r9
+    mov     [g_syscall_kstack], r9
+
+    ;; Restore FS base
+    mov     ecx, 0xC0000100
+    mov     eax, [r11 + CS_FSBASE]
+    mov     edx, [r11 + CS_FSBASE + 4]
+    wrmsr
+
+    ;; Restore callee-saved regs from new_state (r11).
+    ;; Order matters: read all values BEFORE overwriting the
+    ;; register that holds the new_state pointer.
+    ;; r11 holds new_state. We must NOT overwrite r11 until last.
+    ;; The callee-saved regs are: rbx, rbp, r12, r13, r14, r15.
+    ;; r11 is caller-saved, so isr_common will restore it from the
+    ;; ISR frame (which we just wrote). We don't need to restore r11.
+    mov     rbx, [r11 + CS_RBX]
+    mov     rbp, [r11 + CS_RBP]
+    mov     r12, [r11 + CS_R12]
+    mov     r13, [r11 + CS_R13]
+    mov     r14, [r11 + CS_R14]
+    mov     r15, [r11 + CS_R15]
+
+    ;; rax is the syscall return value. Restore it too.
+    mov     rax, [r11 + CS_RAX]
+
+    ;; Return to interrupt_dispatch -> isr_common.
+    ;; isr_common will pop all 15 GPRs (now the new process's values)
+    ;; and iretq using the updated interrupt frame.
+    add     rsp, 16                   ; clean up our two saved args
+    ret
