@@ -142,7 +142,18 @@ uintptr_t* create_user_address_space(void) {
         uint64_t* boot_pdpt = (uint64_t*)(uintptr_t)(boot_pml4[i] & PTE_PHYS_MASK);
         uint64_t* new_pdpt = deep_copy_pdpt(boot_pdpt);
         if (!new_pdpt) continue;
+        /* KE-27: Re-arm AC here. deep_copy_pdpt() does its own stac()/clac()
+         * around its internal page-table writes, so by the time it returns AC
+         * has been cleared. The pml4[i] store below writes to the freshly-
+         * allocated PML4 physical page via the identity map of the CURRENT
+         * (caller's) PML4. If that physical address identity-maps onto a page
+         * the caller has mapped USER (e.g. init's BSS at 0x407000-0x507000
+         * when execve(/shell) runs in init's context), the supervisor store
+         * #PFs under SMAP. This was the root cause of the execve(/shell)
+         * SMAP-violation panic that blocked the shell from booting. */
+        stac();
         pml4[i] = ((uint64_t)(uintptr_t)new_pdpt) | (boot_pml4[i] & ~PAGE_USER & ~PTE_PHYS_MASK) | PAGE_PRESENT;
+        clac();
     }
 
     return pml4;
