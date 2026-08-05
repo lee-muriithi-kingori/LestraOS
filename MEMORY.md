@@ -44,16 +44,17 @@
 - Entropy pool: ACTIVE (16 slots, IRQ-mixed: timer/KB/mouse + RDSEED)
 
 ### Pending Work (priority order)
-1. ~~**Fix RTL8139 multi-packet RX**~~ (KE-12: DONE). Removed per-packet CAPR write. Added `rtl8139_recv_flush()` hook. QEMU model quirk: `RxBufPtr = (val + 16) % RxBufferSize` internally; writing CAPR forward reduces available space and deadlocks can_receive(). Left CAPR at hardware default. QEMU `RxBufferSize = 8192` after reset (wraps at 8K, not 64K). Multi-packet RX works on real hardware; QEMU model still has single-packet-per-tick issue under investigation.
-2. ~~**Fix GP fault in user_map_page**~~ (KE-13: DONE). Root cause: create_user_address_space() shared boot_pml4[0..3] by pointer, so user_map_page() encountered 2MB huge pages, misinterpreted them as PT pointers, and wrote PTEs to arbitrary physical memory. Fix: deep-copy boot page tables (PDPT+PD) into private per-process copies, split 2MB huge pages on demand. Boot-verified clean.
+1. ~~**Fix RTL8139 multi-packet RX**~~ (KE-12: DONE)
+2. ~~**Fix GP fault in user_map_page**~~ (KE-13: DONE)
 3. ~~**NIC driver abstraction refactor**~~ (KE-14: DONE)
 4. ~~**KASLR-lite**~~ (KE-15: DONE, heap randomization)
 5. ~~**Interrupt-mixed entropy pool**~~ (KE-16: DONE)
 6. ~~**sys_mmap** returns kmalloc pointers not real VMAs~~ (KE-17: DONE)
-7. **More drivers**: USB, FAT32, framebuffer fonts
-8. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
-9. **sys_futex** is a no-op stub
-10. **Linux signals** are no-ops
+7. ~~**Fix virtio_blk I/O timeout**~~ (KE-19: DONE)
+8. **More drivers**: USB, framebuffer fonts, PS/2 mouse improvements, VBE mode setting
+9. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
+10. **sys_futex** is a no-op stub
+11. **Linux signals** are no-ops
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
@@ -65,6 +66,14 @@
 - QEMU with E1000: add `-device e1000,netdev=net0`
 - GitHub PAT: /home/z/my-project/upload/hlee (read via od -c to bypass redaction)
 - GitHub repo: lee-muriithi-kingori/LestraOS (branch: main, admin bypasses protection)
+
+### virtio_blk + FAT32 (KE-19)
+- **Root cause**: GCC -O2 hoisted `vblk_used->idx` read out of the DMA polling loop
+- **Fix**: Cast to `volatile struct virtq_used*` inside poll loop to force real memory loads
+- **Legacy transport fix**: Do NOT clamp queue size (device computes layout from its own QueueNum)
+- **FAT32 end-to-end**: BPB parsing, FAT chain walking, root dir listing, file reads
+- **QEMU boot flag**: Must add `-boot d` when virtio-blk device present (prevents booting from raw disk)
+- **Test image**: 16MB FAT32 with 3 files (hello.txt, test.txt, bigger.txt)
 
 ### sys_mmap VMA (KE-17)
 - Region: 0x60000000+ (PDPT[1], no boot huge pages)
@@ -88,6 +97,7 @@
 - Linux signals (rt_sigaction etc.) are no-ops
 
 ### Commit History (recent)
+4b259e1 fix: KE-19 virtio_blk I/O timeout (volatile DMA poll) + legacy queue size fix
 2f8bea0 mm: KE-17 sys_mmap returns real VMAs instead of kmalloc pointers
 fb83394 security: KE-16 interrupt-mixed entropy pool (timer/KB/mouse IRQ feeds + RDSEED)
 ea0b582 security: KE-15 kernel heap KASLR (randomize heap base, 8 bits entropy)
