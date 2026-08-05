@@ -481,13 +481,22 @@ void task_sleep(uint64_t ms) {
      *      so a subsequent schedule() can pick us.
      *   2. This loop's own deadline check — handles the case where no
      *      other task is runnable and schedule() returns without switching;
-     *      we then hlt() to avoid burning CPU until the next IRQ0 fires.
+     *      we then halt the CPU until the next IRQ0 tick.
      *
      * Together these guarantee the sleep duration is honored AND the
      * CPU is yielded (either to another task or to the hlt instruction)
      * instead of the previous behaviour where task_sleep() ignored `ms`
      * entirely and just yielded once, causing poll()/select() callers
-     * to busy-loop at 100% CPU. */
+     * to busy-loop at 100% CPU.
+     *
+     * NOTE on interrupt enablement: SYSCALL clears RFLAGS.IF (SFMASK is
+     * set to 0x200 in syscall_init), so syscall handlers run with
+     * interrupts disabled. A plain hlt() would therefore halt forever
+     * (no IRQ could wake us). We use the standard "sti; hlt" sequence:
+     * sti re-enables interrupts, and the CPU guarantees no interrupt is
+     * taken until after the following hlt begins — so there is no race
+     * between sti and hlt. The timer IRQ then fires, its handler runs
+     * sched_check_wakeups() (which may wake us), and we resume. */
     extern uint64_t timer_get_ms(void);
     uint64_t deadline = timer_get_ms() + ms;
     current->wake_tick = deadline;
@@ -503,9 +512,10 @@ void task_sleep(uint64_t ms) {
         /* If schedule() returned without switching (no other task
          * runnable), halt the CPU until the next IRQ0 tick to avoid
          * a busy-loop. The timer IRQ's sched_check_wakeups() will
-         * wake us when the deadline passes. */
+         * wake us when the deadline passes. We use sti;hlt (not a
+         * bare hlt) because SYSCALL cleared IF on entry. */
         if (current->state == PROC_BLOCKED) {
-            hlt();
+            __asm__ volatile("sti; hlt" ::: "memory");
         }
     }
 
