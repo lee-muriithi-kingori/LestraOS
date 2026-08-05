@@ -1,10 +1,13 @@
 /*
  * Lestra OS - Signal delivery (rt_sigaction, kill, rt_sigprocmask, rt_sigreturn)
+ *
+ * SMAP-hardened: all user-pointer access goes through uaccess.h helpers.
  */
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/sched.h>
 #include <lestra/mm.h>
+#include <lestra/uaccess.h>
 #include <string.h>
 
 #define SIGHUP    1
@@ -36,18 +39,24 @@ int64_t signal_sigaction(int signum, uint64_t act, uint64_t oldact, uint64_t sig
     if (signum == SIGKILL || signum == SIGSTOP) return -22;
     struct process* p = task_current();
     if (!p) return -1;
+    /* struct sigaction is 4 x uint64_t: handler, flags, restorer, mask */
     if (oldact) {
-        uint64_t* o = (uint64_t*)oldact;
-        o[0] = p->sigactions[signum].sa_handler;
-        o[1] = p->sigactions[signum].sa_flags;
-        o[2] = 0;
-        o[3] = p->sigactions[signum].sa_mask;
+        if (!access_ok((void*)oldact, 32)) return -14; /* EFAULT */
+        uint64_t kern_old[4] = {
+            p->sigactions[signum].sa_handler,
+            p->sigactions[signum].sa_flags,
+            0, /* restorer */
+            p->sigactions[signum].sa_mask
+        };
+        if (copy_to_user((void*)oldact, kern_old, 32) < 0) return -14;
     }
     if (act) {
-        uint64_t* a = (uint64_t*)act;
-        p->sigactions[signum].sa_handler = a[0];
-        p->sigactions[signum].sa_flags = a[1];
-        p->sigactions[signum].sa_mask = a[3];
+        if (!access_ok((void*)act, 32)) return -14; /* EFAULT */
+        uint64_t kern_act[4] = {0};
+        if (copy_from_user(kern_act, (void*)act, 32) < 0) return -14;
+        p->sigactions[signum].sa_handler = kern_act[0];
+        p->sigactions[signum].sa_flags    = kern_act[1];
+        p->sigactions[signum].sa_mask    = kern_act[3];
     }
     return 0;
 }
@@ -81,9 +90,15 @@ int64_t signal_sigprocmask(int how, uint64_t set, uint64_t oldset, uint64_t sigs
     (void)sigsetsize;
     struct process* p = task_current();
     if (!p) return -1;
-    if (oldset) *(uint64_t*)oldset = p->signal_blocked;
+    if (oldset) {
+        if (!access_ok((void*)oldset, sizeof(uint64_t))) return -14; /* EFAULT */
+        uint64_t blocked = p->signal_blocked;
+        if (copy_to_user((void*)oldset, &blocked, sizeof(uint64_t)) < 0) return -14;
+    }
     if (set) {
-        uint64_t m = *(uint64_t*)set;
+        if (!access_ok((void*)set, sizeof(uint64_t))) return -14; /* EFAULT */
+        uint64_t m = 0;
+        if (copy_from_user(&m, (void*)set, sizeof(uint64_t)) < 0) return -14;
         switch (how) {
             case 0: p->signal_blocked |= m; break;   /* SIG_BLOCK */
             case 1: p->signal_blocked &= ~m; break;  /* SIG_UNBLOCK */

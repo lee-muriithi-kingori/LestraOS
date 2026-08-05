@@ -4,6 +4,7 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/sched.h>
+#include <lestra/uaccess.h>
 #include <string.h>
 
 #define FUTEX_WAIT 0
@@ -60,15 +61,25 @@ static void bucket_remove(int bucket, int idx) {
 
 int64_t futex_dispatch(uint32_t* uaddr, uint32_t op, uint32_t val,
                         uint64_t timeout, uint32_t* uaddr2, uint32_t val3) {
+    (void)timeout; (void)uaddr2;
     if (!uaddr) return -14;
+    /* Validate the user pointer range once on entry. The per-access
+     * reads below use get_user() which re-checks + wraps with stac/clac
+     * so we never #PF under SMAP. */
+    if (!access_ok(uaddr, sizeof(uint32_t))) return -14;
     uint32_t op_clean = op & ~FUTEX_PRIVATE_FLAG;
     op_clean &= ~FUTEX_CLOCK_REALTIME;
 
     switch (op_clean) {
         case FUTEX_WAIT: {
-            if (*uaddr != val) return -11;
+            /* SMAP-safe read of the user word: get_user() wraps the
+             * dereference with stac/clac. Returns -EFAULT (-14) on a
+             * bad pointer; we map that to -EAGAIN so callers retry. */
+            uint32_t kuval = 0;
+            if (get_user(&kuval, uaddr) < 0) return -14;
+            if (kuval != val) return -11;  /* -EAGAIN */
             int slot = alloc_waiter();
-            if (slot < 0) return -12;
+            if (slot < 0) return -12;      /* -ENOMEM */
             struct futex_waiter* w = &futex_waiters[slot];
             w->in_use = 1; w->uaddr = uaddr; w->expected_val = val;
             w->bitset = 0xFFFFFFFF;
@@ -81,7 +92,9 @@ int64_t futex_dispatch(uint32_t* uaddr, uint32_t op, uint32_t val,
             return 0;
         }
         case FUTEX_WAIT_BITSET: {
-            if (*uaddr != val) return -11;
+            uint32_t kuval = 0;
+            if (get_user(&kuval, uaddr) < 0) return -14;
+            if (kuval != val) return -11;  /* -EAGAIN */
             int slot = alloc_waiter();
             if (slot < 0) return -12;
             struct futex_waiter* w = &futex_waiters[slot];

@@ -439,6 +439,18 @@ static void dispatch_events(void) {
             drag_widget = NULL;
             struct widget* w = find_widget_at(cursor_x, cursor_y);
             if (w && w->on_event) w->on_event(w, &e);
+        } else if (e.type == EV_MOUSE_SCROLL) {
+            /* Scroll wheel: route to whatever widget is under the cursor.
+             * Update cursor position from the event itself so the hit
+             * test matches where the wheel was actually rolled (the
+             * compositor only updates cursor_x/y on EV_MOUSE_MOVE, so
+             * without this, a wheel rolled while the mouse is still
+             * would test against the last reported position — usually
+             * fine, but the explicit sync avoids subtle drift). */
+            cursor_x = e.mouse.x;
+            cursor_y = e.mouse.y;
+            struct widget* w = find_widget_at(cursor_x, cursor_y);
+            if (w && w->on_event) w->on_event(w, &e);
         } else if (e.type == EV_KEY_DOWN || e.type == EV_KEY_UP) {
             for (int i = n_widgets - 1; i >= 0; i--) {
                 if (widgets[i]->visible && widgets[i]->focused && widgets[i]->on_event) {

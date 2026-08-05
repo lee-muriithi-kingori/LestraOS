@@ -22,7 +22,7 @@
  * Known limitations:
  *   - No shared library loading yet. Static-pie binaries work; dynamic
  *     binaries (most of glibc) need an ld-linux loader port.
- *   - No signals (kill/sigaction return -ENOSYS).
+ *   - Signals forwarded to native implementation (kill/sigaction/sigprocmask/sigreturn).
  *   - No threads (clone returns -ENOSYS).
  *   - No fork (returns -ENOSYS) — use vfork instead.
  *
@@ -179,6 +179,10 @@ static inline int64_t lestra_syscall6(uint64_t num, uint64_t a1, uint64_t a2, ui
 #define LESTRA_SYS_GETDENTS     20
 #define LESTRA_SYS_REBOOT       21
 #define LESTRA_SYS_UNAME        22
+#define LESTRA_SYS_KILL          24
+#define LESTRA_SYS_RT_SIGACTION    25
+#define LESTRA_SYS_RT_SIGPROCMASK  26
+#define LESTRA_SYS_RT_SIGRETURN    27
 
 /* Linux errno values (must match what glibc expects). */
 #define LINUX_EPERM            1
@@ -353,11 +357,13 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
             return (int64_t)lestra_syscall6(LESTRA_SYS_EXECVE, a1, a2, a3, 0, 0, 0);
 
         case LINUX_SYS_RT_SIGACTION:
+            return (int64_t)lestra_syscall6(LESTRA_SYS_RT_SIGACTION, a1, a2, a3, a4, 0, 0);
+
         case LINUX_SYS_RT_SIGPROCMASK:
+            return (int64_t)lestra_syscall6(LESTRA_SYS_RT_SIGPROCMASK, a1, a2, a3, a4, 0, 0);
+
         case LINUX_SYS_RT_SIGRETURN:
-            /* Signals not implemented. Pretend success so binaries that
-             * install signal handlers during startup don't crash. */
-            return 0;
+            return (int64_t)lestra_syscall6(LESTRA_SYS_RT_SIGRETURN, 0, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_CLONE:
         case LINUX_SYS_FORK:
@@ -369,8 +375,7 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
             return (int64_t)lestra_syscall6(LESTRA_SYS_WAITPID, a1, a2, a3, 0, 0, 0);
 
         case LINUX_SYS_KILL:
-            /* No signals. */
-            return -LINUX_ENOSYS;
+            return (int64_t)lestra_syscall6(LESTRA_SYS_KILL, a1, a2, 0, 0, 0, 0);
 
         case LINUX_SYS_FCNTL:
             /* Most fcntl cmds are no-ops for us. */

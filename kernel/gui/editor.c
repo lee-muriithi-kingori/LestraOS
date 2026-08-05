@@ -143,6 +143,22 @@ static void editor_on_event(struct widget* w, struct event* e) {
         return;
     }
 
+    if (e->type == EV_MOUSE_SCROLL) {
+        /* Wheel up (scroll > 0) views earlier lines, so the view
+         * window moves up (scroll_row decreases). Wheel down (scroll
+         * < 0) moves the view toward the end of the file. Clamped to
+         * [0, max(0, n_lines - EDIT_ROWS)] so the view never runs
+         * past either end of the buffer. */
+        int delta = e->mouse.scroll;
+        int max_scroll = st->n_lines - EDIT_ROWS;
+        if (max_scroll < 0) max_scroll = 0;
+        int new_scroll = st->scroll_row - delta;
+        if (new_scroll < 0) new_scroll = 0;
+        if (new_scroll > max_scroll) new_scroll = max_scroll;
+        st->scroll_row = new_scroll;
+        return;
+    }
+
     if (e->type == EV_KEY_DOWN && st->active) {
         char c;
         if (keyboard_has_key()) {

@@ -161,7 +161,9 @@ void top_bar_render(void) {
         if (tb_idle_nudge_offset < 0) tb_idle_nudge_offset = 0;
     }
 
-    int bar_y = TB_MARGIN_TOP - tb_visible + tb_idle_nudge_offset;
+    /* Slide-in: bar starts above screen (TB_MARGIN_TOP - TB_HEIGHT) and
+     * slides down to TB_MARGIN_TOP as tb_visible goes 0 -> TB_HEIGHT. */
+    int bar_y = TB_MARGIN_TOP - TB_HEIGHT + tb_visible + tb_idle_nudge_offset;
     int bar_w = (int)fb_w - 2 * TB_MARGIN_X;
 
     /* ---- Bar background with rounded corners ---- */
@@ -311,7 +313,9 @@ void top_bar_render(void) {
 /* Returns 1 if the click was consumed by the top bar, 0 otherwise. */
 int top_bar_handle_click(int x, int y) {
     if (!tb_inited) return 0;
-    int bar_y = TB_MARGIN_TOP - tb_visible + tb_idle_nudge_offset;
+    /* Slide-in: bar starts above screen (TB_MARGIN_TOP - TB_HEIGHT) and
+     * slides down to TB_MARGIN_TOP as tb_visible goes 0 -> TB_HEIGHT. */
+    int bar_y = TB_MARGIN_TOP - TB_HEIGHT + tb_visible + tb_idle_nudge_offset;
     if (y < bar_y || y > bar_y + TB_HEIGHT) return 0;
 
     /* Mic button hit-test (right cluster). */

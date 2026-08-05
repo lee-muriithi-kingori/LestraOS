@@ -48,6 +48,7 @@ struct fe_state {
     int  ctx_open;
     int  ctx_x, ctx_y;
     int  ctx_target;     /* index into entries[] */
+    int  list_scroll;    /* index of first visible entry in the grid */
 };
 
 static struct fe_state fe_state;
@@ -94,6 +95,7 @@ static void fe_join_path(const char* base, const char* rel, char* out,
 static void fe_refresh(struct fe_state* st) {
     st->n_entries = 0;
     st->selected = -1;
+    st->list_scroll = 0;   /* new directory: snap back to the top */
 
     /* vfs_open with O_DIRECTORY on the cwd. */
     int fd = vfs_open(st->cwd, O_RDONLY | O_DIRECTORY);
@@ -151,44 +153,70 @@ static void fe_draw_sidebar(struct widget* w) {
 }
 
 /* ---------- file grid ---------- */
+
+/* Compute grid geometry (cols, rows, cell sizes) shared by draw and
+ * hit-test so the two paths never disagree about which cell a click
+ * landed in. */
+static void fe_grid_geom(struct widget* w, int* gx, int* gy,
+                         int* gw, int* gh, int* cols, int* rows) {
+    *gx = w->x + FE_PAD + FE_SIDEBAR_W + FE_PAD;
+    *gy = w->y + FE_TITLE_H + FE_ADDR_H + FE_PAD;
+    *gw = w->w - 2 * FE_PAD - FE_SIDEBAR_W - FE_PAD;
+    *gh = w->h - FE_TITLE_H - FE_ADDR_H - 2 * FE_PAD;
+    int cell_w = 96, cell_h = 80;
+    int c = *gw / cell_w; if (c < 1) c = 1;
+    int r = *gh / cell_h; if (r < 1) r = 1;
+    *cols = c;
+    *rows = r;
+    (void)cell_w; (void)cell_h;
+}
+
 static void fe_draw_grid(struct widget* w) {
-    int gx = w->x + FE_PAD + FE_SIDEBAR_W + FE_PAD;
-    int gy = w->y + FE_TITLE_H + FE_ADDR_H + FE_PAD;
-    int gw = w->w - 2 * FE_PAD - FE_SIDEBAR_W - FE_PAD;
-    int gh = w->h - FE_TITLE_H - FE_ADDR_H - 2 * FE_PAD;
+    int gx, gy, gw, gh, cols, rows;
+    fe_grid_geom(w, &gx, &gy, &gw, &gh, &cols, &rows);
+    int cell_w = 96, cell_h = 80;
 
     fb_fill_rect(gx, gy, gw, gh, 0xFF0A0C12);
 
-    int cell_w = 96, cell_h = 80;
-    int cols = gw / cell_w;
-    if (cols < 1) cols = 1;
-    int rows = gh / cell_h;
-
-    for (int i = 0; i < fe_state.n_entries && i < cols * rows; i++) {
+    int visible = cols * rows;
+    for (int i = 0; i < visible && fe_state.list_scroll + i < fe_state.n_entries; i++) {
+        int entry_idx = fe_state.list_scroll + i;
         int cx = gx + (i % cols) * cell_w + 8;
         int cy = gy + (i / cols) * cell_h + 8;
-        if (i == fe_state.selected) {
+        if (entry_idx == fe_state.selected) {
             fb_fill_rect(cx - 4, cy - 4, cell_w - 8, cell_h - 8,
                          0xFF06B6D4);
         }
         /* Folder icon: a yellow-ish rectangle. File icon: a slate page. */
-        uint32_t icon = fe_state.entries[i].is_dir ? 0xFFFBBF24 : 0xFF94A3B8;
+        uint32_t icon = fe_state.entries[entry_idx].is_dir ? 0xFFFBBF24 : 0xFF94A3B8;
         fb_draw_rounded(cx + 16, cy, 48, 36, 6, icon, icon);
         /* White "page corner" on files. */
-        if (!fe_state.entries[i].is_dir) {
+        if (!fe_state.entries[entry_idx].is_dir) {
             fb_fill_rect(cx + 50, cy, 14, 14, 0xFFFFFFFF);
         }
         /* Label (truncated to ~11 chars). */
         char label[12];
-        size_t l = strlen(fe_state.entries[i].name);
+        size_t l = strlen(fe_state.entries[entry_idx].name);
         if (l > 11) {
-            memcpy(label, fe_state.entries[i].name, 9);
+            memcpy(label, fe_state.entries[entry_idx].name, 9);
             label[9] = '.'; label[10] = '.'; label[11] = '\0';
         } else {
-            strncpy(label, fe_state.entries[i].name, sizeof(label) - 1);
+            strncpy(label, fe_state.entries[entry_idx].name, sizeof(label) - 1);
             label[sizeof(label) - 1] = '\0';
         }
         fb_draw_string_small(cx, cy + 42, label, UI_TEXT_PRIMARY);
+    }
+
+    /* Scroll position indicator (only when there's more than fits). */
+    if (fe_state.n_entries > visible) {
+        int bar_x = gx + gw - 6;
+        int bar_h = gh - 4;
+        fb_fill_rect(bar_x, gy + 2, 4, bar_h, 0xFF1E293B);
+        int thumb_h = bar_h * visible / fe_state.n_entries;
+        if (thumb_h < 8) thumb_h = 8;
+        int max_scroll = fe_state.n_entries - visible;
+        int thumb_y = gy + 2 + (bar_h - thumb_h) * fe_state.list_scroll / max_scroll;
+        fb_fill_rect(bar_x, thumb_y, 4, thumb_h, UI_ACCENT);
     }
 }
 
@@ -238,24 +266,38 @@ static void fe_draw(struct widget* w) {
 
 /* ---------- event handling ---------- */
 static int fe_hit_grid_cell(struct widget* w, int mx, int my, int* idx_out) {
-    int gx = w->x + FE_PAD + FE_SIDEBAR_W + FE_PAD;
-    int gy = w->y + FE_TITLE_H + FE_ADDR_H + FE_PAD;
-    int gw = w->w - 2 * FE_PAD - FE_SIDEBAR_W - FE_PAD;
-    int gh = w->h - FE_TITLE_H - FE_ADDR_H - 2 * FE_PAD;
+    int gx, gy, gw, gh, cols, rows;
+    fe_grid_geom(w, &gx, &gy, &gw, &gh, &cols, &rows);
     int cell_w = 96, cell_h = 80;
-    int cols = gw / cell_w;
-    if (cols < 1) cols = 1;
     if (mx < gx || mx >= gx + gw || my < gy || my >= gy + gh) return 0;
     int col = (mx - gx) / cell_w;
     int row = (my - gy) / cell_h;
     if (col < 0 || col >= cols || row < 0) return 0;
-    int idx = row * cols + col;
+    int idx = fe_state.list_scroll + row * cols + col;
     if (idx < 0 || idx >= fe_state.n_entries) return 0;
     *idx_out = idx;
     return 1;
 }
 
 static void fe_on_event(struct widget* w, struct event* e) {
+    if (e->type == EV_MOUSE_SCROLL) {
+        /* Wheel up (scroll > 0) views earlier entries, so list_scroll
+         * moves toward 0. Wheel down moves toward n_entries. Each tick
+         * shifts by one full row (cols entries) to match the visual
+         * grid layout. Clamped to [0, max(0, n_entries - visible)]. */
+        int gx, gy, gw, gh, cols, rows;
+        fe_grid_geom(w, &gx, &gy, &gw, &gh, &cols, &rows);
+        int visible = cols * rows;
+        int max_scroll = fe_state.n_entries - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        int delta_entries = e->mouse.scroll * cols;
+        int new_scroll = fe_state.list_scroll - delta_entries;
+        if (new_scroll < 0) new_scroll = 0;
+        if (new_scroll > max_scroll) new_scroll = max_scroll;
+        fe_state.list_scroll = new_scroll;
+        return;
+    }
+
     if (e->type != EV_MOUSE_DOWN) return;
     int mx = e->mouse.x, my = e->mouse.y;
     /* Close button */
@@ -341,6 +383,7 @@ struct widget* file_explorer_create(int x, int y) {
     strncpy(fe_state.cwd, "/", sizeof(fe_state.cwd) - 1);
     fe_state.selected = -1;
     fe_state.sidebar_selected = 0;
+    fe_state.list_scroll = 0;
     fe_refresh(&fe_state);
 
     fe_widget.x = x;

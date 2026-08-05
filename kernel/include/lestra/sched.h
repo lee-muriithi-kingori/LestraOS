@@ -61,6 +61,7 @@ struct process {
     char exe_path[256];
     uint64_t brk;
     uint64_t stack_bottom;               /* bottom of mapped stack region (grows downward) */
+    uint64_t wake_tick;                  /* timer_get_ms() deadline while sleeping in task_sleep; 0 = not sleeping */
     struct fd_entry fds[MAX_FD_PER_PROC]; /* per-process file descriptor table */
 };
 

@@ -32,9 +32,20 @@
 #define TERM_COLS  ((TERM_W - 2 * TERM_PAD) / CHAR_W)
 #define TERM_ROWS  ((TERM_H - TERM_TITLE_H - 2 * TERM_PAD) / CHAR_H)
 
+/* Lines of history kept beyond the visible screen. The ring buffer is
+ * written every time term_scroll() pushes the top row off-screen, so
+ * scrollback_count grows by 1 per overflow line and caps at the buffer
+ * size. The user can then scroll the view back through this history
+ * via EV_MOUSE_SCROLL (wheel up = view older content). */
+#define TERM_SCROLLBACK 256
+
 /* Terminal state */
 struct term_state {
     char screen[TERM_ROWS][TERM_COLS + 1];
+    char scrollback[TERM_SCROLLBACK][TERM_COLS + 1];  /* ring buffer */
+    int  scrollback_count;   /* number of valid lines in the ring (<= TERM_SCROLLBACK) */
+    int  scrollback_head;    /* next write index in the ring (wraps) */
+    int  scrollback_offset;  /* 0 = viewing latest; >0 = viewing older history */
     int cursor_col;
     int cursor_row;
     char input_buf[256];
@@ -52,6 +63,12 @@ static void term_scroll(void);
 static void term_putc(char c);
 static void term_puts(const char* s);
 static void term_execute(void);
+static void term_snap_to_bottom(void);
+
+/* Public: scroll the terminal view by `lines` (positive = view older
+ * content, negative = view newer content). Clamped to buffer bounds so
+ * the caller can pass the raw wheel delta from EV_MOUSE_SCROLL. */
+void terminal_scroll(int lines);
 
 /* Shell command dispatch (from kernel/core/shell.c) */
 extern void shell_execute_line(const char* line, void (*out)(char c));
@@ -108,6 +125,20 @@ static void term_puts(const char* s) {
 }
 
 static void term_scroll(void) {
+    /* Capture the top row before it gets shifted off-screen — this is
+     * the line that becomes part of scrollback history. */
+    memcpy(term_state.scrollback[term_state.scrollback_head],
+           term_state.screen[0], TERM_COLS);
+    term_state.scrollback[term_state.scrollback_head][TERM_COLS] = '\0';
+    term_state.scrollback_head =
+        (term_state.scrollback_head + 1) % TERM_SCROLLBACK;
+    if (term_state.scrollback_count < TERM_SCROLLBACK)
+        term_state.scrollback_count++;
+
+    /* New output just arrived — snap the view back to the bottom so
+     * the user sees the latest text instead of stale history. */
+    term_state.scrollback_offset = 0;
+
     for (int r = 0; r < TERM_ROWS - 1; r++) {
         memcpy(term_state.screen[r], term_state.screen[r + 1], TERM_COLS);
         term_state.screen[r][TERM_COLS] = '\0';
@@ -116,11 +147,44 @@ static void term_scroll(void) {
     term_state.screen[TERM_ROWS - 1][TERM_COLS] = '\0';
 }
 
+/* Snap the scrollback view back to the latest output. Called whenever
+ * the user types input or new output arrives via a non-overflowing
+ * term_putc path, so an interactive session never leaves the user
+ * staring at stale history while their keystrokes go elsewhere. */
+static void term_snap_to_bottom(void) {
+    term_state.scrollback_offset = 0;
+}
+
+/* Resolve a logical scrollback line index (0 = oldest,
+ * scrollback_count-1 = newest) to the corresponding ring slot. */
+static int term_scrollback_index(int logical) {
+    int idx = (term_state.scrollback_head
+               - term_state.scrollback_count
+               + logical
+               + TERM_SCROLLBACK) % TERM_SCROLLBACK;
+    return idx;
+}
+
+/* Public: scroll the view by `lines`. Positive = view older content
+ * (increase offset), negative = view newer (decrease offset). Clamped
+ * to [0, scrollback_count] so the view never runs past the available
+ * history. */
+void terminal_scroll(int lines) {
+    int max_offset = term_state.scrollback_count;
+    int new_offset = term_state.scrollback_offset + lines;
+    if (new_offset < 0) new_offset = 0;
+    if (new_offset > max_offset) new_offset = max_offset;
+    term_state.scrollback_offset = new_offset;
+}
+
 static void term_clear_screen(void) {
     for (int r = 0; r < TERM_ROWS; r++) {
         memset(term_state.screen[r], ' ', TERM_COLS);
         term_state.screen[r][TERM_COLS] = '\0';
     }
+    term_state.scrollback_count = 0;
+    term_state.scrollback_head = 0;
+    term_state.scrollback_offset = 0;
     term_state.cursor_col = 0;
     term_state.cursor_row = 0;
 }
@@ -166,20 +230,47 @@ static void term_draw(struct widget* w) {
     int body_h = w->h - TERM_TITLE_H - 2 * TERM_PAD;
     fb_fill_rect(body_x, body_y, body_w, body_h, 0xFF000000);
 
-    /* Render text */
+    /* Render text. When the user has scrolled back (scrollback_offset > 0),
+     * the top rows of the view come from the scrollback ring instead of
+     * the live screen; the bottom rows come from the live screen. The
+     * total history is scrollback_count (old lines) + TERM_ROWS (current
+     * screen), and the view shows TERM_ROWS consecutive lines ending at
+     * (total - offset). */
+    int offset = ts->scrollback_offset;
     for (int r = 0; r < TERM_ROWS; r++) {
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = ts->screen[r][c];
-            if (ch && ch != ' ') {
-                fb_draw_char(body_x + c * CHAR_W, body_y + r * CHAR_H,
-                             ch, UI_TEXT_PRIMARY);
+        /* Combined-history index of the line drawn at view row r:
+         * 0 = oldest, total-1 = newest. View ends at total-1-offset. */
+        int combined = ts->scrollback_count - offset + r;
+        const char* line;
+        if (combined < 0) {
+            /* Offset past the top of history — blank line above the
+             * oldest available content. */
+            line = NULL;
+        } else if (combined < ts->scrollback_count) {
+            line = ts->scrollback[term_scrollback_index(combined)];
+        } else {
+            int screen_row = combined - ts->scrollback_count;
+            if (screen_row >= 0 && screen_row < TERM_ROWS)
+                line = ts->screen[screen_row];
+            else
+                line = NULL;
+        }
+        if (line) {
+            for (int c = 0; c < TERM_COLS; c++) {
+                char ch = line[c];
+                if (ch && ch != ' ') {
+                    fb_draw_char(body_x + c * CHAR_W, body_y + r * CHAR_H,
+                                 ch, UI_TEXT_PRIMARY);
+                }
             }
         }
     }
 
-    /* Cursor (blinking cyan block) */
+    /* Cursor (blinking cyan block). Hide it when the user has scrolled
+     * back — the live cursor is off-screen in that case and drawing it
+     * would visually overlap a historical line. */
     uint64_t now = timer_get_ms();
-    if ((now / 500) % 2 == 0) {
+    if (offset == 0 && (now / 500) % 2 == 0) {
         int cx = body_x + ts->cursor_col * CHAR_W;
         int cy = body_y + ts->cursor_row * CHAR_H;
         fb_fill_rect(cx, cy, CHAR_W, CHAR_H, UI_ACCENT);
@@ -195,7 +286,18 @@ static void term_on_event(struct widget* w, struct event* e) {
         return;
     }
 
+    if (e->type == EV_MOUSE_SCROLL) {
+        /* Wheel up (scroll > 0) views older history; wheel down views
+         * newer. terminal_scroll() clamps to buffer bounds. */
+        terminal_scroll(e->mouse.scroll);
+        return;
+    }
+
     if (e->type == EV_KEY_DOWN && ts->active) {
+        /* Any keystroke snaps the view back to the live cursor so the
+         * user sees what they're typing, even if they had scrolled
+         * back to read prior output. */
+        term_snap_to_bottom();
         uint8_t scancode = e->key.scancode;
         uint8_t ascii = e->key.ascii;
 

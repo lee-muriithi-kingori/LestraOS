@@ -1287,36 +1287,35 @@ static int64_t sys_setrlimit(int resource, const void* rlim_ptr) {
     return -EPERM;
 }
 
+/* Forward declaration — the full implementation (hash table + wait
+ * queues + task_block/task_unblock) lives in kernel/exec/futex.c.
+ * Previously this syscall was a non-blocking stub that ignored the
+ * 135-LOC futex_dispatch(); we now delegate to it so that user-space
+ * futex_wait/futex_wake actually blocks and wakes. */
+int64_t futex_dispatch(uint32_t* uaddr, uint32_t op, uint32_t val,
+                       uint64_t timeout, uint32_t* uaddr2, uint32_t val3);
+
 static int64_t sys_futex(uint32_t* uaddr, int op, uint32_t val,
                           uint64_t timeout, uint32_t* uaddr2, uint32_t val3) {
-    (void)uaddr2; (void)val3; (void)timeout;
+    /* Validate the user pointer range up front (SMAP-safe pattern
+     * preserved from the old stub). futex_dispatch() re-validates
+     * and uses get_user() for the actual *uaddr read so we never
+     * #PF under SMAP. */
     if (!uaddr) return -EFAULT;
     if (!access_ok(uaddr, sizeof(uint32_t))) return -EFAULT;
-    /* Snapshot the user word via get_user — under SMAP, direct *uaddr
-     * would #PF. Note: this is a non-atomic snapshot; a real futex
-     * needs an atomic cmpxchgE on the user word, which is TIER 2c. */
-    uint32_t kuval = 0;
-    if (get_user(&kuval, uaddr) < 0) return -EFAULT;
 
-    switch (op) {
-        case FUTEX_WAIT:
-            /* Wait until *uaddr == val. In our single-threaded kernel
-             * we can't truly block on a userspace word changing, so we
-             * check once and either return 0 (match) or -EAGAIN (mismatch).
-             * A real implementation would sleep and schedule, but for now
-             * this basic stub is sufficient for simple futex usage. */
-            if (kuval != val) return -EAGAIN;
-            /* Value matches — nothing to wait for, return success. */
-            return 0;
-
-        case FUTEX_WAKE:
-            /* Wake up to 'val' waiters on this futex. Since we don't
-             * have a wait queue, just return 0 (no waiters woken). */
-            return 0;
-
-        default:
-            return -ENOSYS;
-    }
+    /* Delegate to the real implementation in kernel/exec/futex.c.
+     * futex_dispatch handles FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET,
+     * FUTEX_WAKE_BITSET (and masks FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME).
+     * Unsupported ops (FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP)
+     * return -ENOSYS from futex_dispatch's default case. */
+    int64_t ret = futex_dispatch(uaddr, (uint32_t)op, val, timeout,
+                                 uaddr2, val3);
+    /* futex_dispatch returns negative errno-style codes (-11 = -EAGAIN,
+     * -12 = -ENOMEM, -14 = -EFAULT, -38 = -ENOSYS). Map the raw
+     * -14 to our -EFAULT convention to match the rest of this file. */
+    if (ret == -14) return -EFAULT;
+    return ret;
 }
 
 static int64_t sys_socket(int domain, int type, int protocol) {

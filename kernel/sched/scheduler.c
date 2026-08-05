@@ -437,6 +437,16 @@ void task_block(void) {
     if (!current) return;
     current->state = PROC_BLOCKED;
     schedule();
+    /* We've been resumed — either because another task called
+     * task_unblock() on us and the scheduler picked us again, or
+     * because no other task was runnable and schedule() returned
+     * immediately without context-switching. In the latter case our
+     * state is still PROC_BLOCKED; restore PROC_RUNNING so the next
+     * schedule() doesn't permanently skip us (a stuck-in-BLOCKED
+     * bug that would otherwise hang a single-process caller). */
+    if (current->state == PROC_BLOCKED) {
+        current->state = PROC_RUNNING;
+    }
 }
 
 void task_unblock(void* task) {
@@ -455,23 +465,79 @@ void task_unblock_pid(int pid) {
 }
 
 void task_sleep(uint64_t ms) {
-    (void)ms;
-    /* Simplified: yield the CPU. A real impl would set a timer wakeup. */
-    if (scheduler_enabled) schedule();
+    if (!current) return;
+    if (ms == 0) {
+        /* Zero sleep = plain yield. */
+        if (scheduler_enabled) schedule();
+        return;
+    }
+
+    /* Honor the requested sleep duration by recording a wake deadline
+     * (in timer_get_ms() units) and blocking until it passes.
+     *
+     * The wake is driven from two places:
+     *   1. sched_check_wakeups() — runs on every timer IRQ tick; if our
+     *      deadline has passed it transitions us PROC_BLOCKED -> PROC_RUNNABLE
+     *      so a subsequent schedule() can pick us.
+     *   2. This loop's own deadline check — handles the case where no
+     *      other task is runnable and schedule() returns without switching;
+     *      we then hlt() to avoid burning CPU until the next IRQ0 fires.
+     *
+     * Together these guarantee the sleep duration is honored AND the
+     * CPU is yielded (either to another task or to the hlt instruction)
+     * instead of the previous behaviour where task_sleep() ignored `ms`
+     * entirely and just yielded once, causing poll()/select() callers
+     * to busy-loop at 100% CPU. */
+    extern uint64_t timer_get_ms(void);
+    uint64_t deadline = timer_get_ms() + ms;
+    current->wake_tick = deadline;
+
+    while (1) {
+        /* Re-check deadline first — sched_check_wakeups may have already
+         * advanced us past it during a prior schedule(). */
+        if ((int64_t)(timer_get_ms() - deadline) >= 0) break;
+
+        current->state = PROC_BLOCKED;
+        schedule();
+
+        /* If schedule() returned without switching (no other task
+         * runnable), halt the CPU until the next IRQ0 tick to avoid
+         * a busy-loop. The timer IRQ's sched_check_wakeups() will
+         * wake us when the deadline passes. */
+        if (current->state == PROC_BLOCKED) {
+            hlt();
+        }
+    }
+
+    current->wake_tick = 0;
+    current->state = PROC_RUNNING;
 }
 
 void task_set_priority(int p) { (void)p; }
 
 /* Called on timer tick to check for processes that need waking */
 void sched_check_wakeups(void) {
-    /* Check if any blocked process is waiting for a zombie child */
+    extern uint64_t timer_get_ms(void);
+    uint64_t now = timer_get_ms();
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (procs[i].state == PROC_BLOCKED && wait_target[i] > 0) {
+        if (procs[i].state != PROC_BLOCKED) continue;
+
+        /* waitpid wake: blocked because we're waiting for a child */
+        if (wait_target[i] > 0) {
             struct process* target = sched_find_by_pid_impl(wait_target[i]);
             if (target && target->state == PROC_ZOMBIE) {
                 procs[i].state = PROC_RUNNABLE;
                 wait_target[i] = 0;
             }
+            continue;  /* a waitpid waiter can't also be a sleeper */
+        }
+
+        /* task_sleep wake: blocked because we asked to sleep until wake_tick */
+        if (procs[i].wake_tick != 0 &&
+            (int64_t)(now - procs[i].wake_tick) >= 0) {
+            procs[i].state = PROC_RUNNABLE;
+            /* Leave wake_tick non-zero so task_sleep()'s loop can see we
+             * were woken by the timer and clear it on exit. */
         }
     }
 }
