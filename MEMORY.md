@@ -1128,3 +1128,68 @@ Stage Summary:
 - Files changed: fat32.c (rewrite, +490 LOC), fat32_shim.c (new, 200 LOC),
   fat32.h (+50 LOC), vfs.c (+80 LOC), vfs.h (+1 LOC), kernel_main.c (+20 LOC)
 - Next priority: HPET timer driver, USB XHCI, sys_clone, more UI polish
+
+---
+
+## KE-26: SMEP/SMAP-on Boot + fork() Fix + Preemption + procfs (5 Aug 2026)
+
+### Headline Achievement
+**SMEP and SMAP are now ENABLED by default and verified at every boot.**
+The `make smoke` test uses `-cpu qemu64,+smep,+smap` and checks:
+- PASS: kernel reached init
+- PASS: userspace /init banner printed
+- PASS: SMEP enabled
+- PASS: SMAP enabled
+
+### Commits (8 on origin/main)
+1. `b52ea7b` — GDT swap (USER_DS before USER_CS) + iretq syscall return +
+   SMAP-safe ELF loader (stac/clac) + /shell path fix
+2. `e190309` — fork() USER-bit fix (deep-copy) + vmm_map_page intermediate
+   USER bits + 2MB huge page splitting
+3. `1b51806` — Default smoke test uses +smep,+smap
+4. `1cfbe71` — Re-enable scheduler preemption
+5. `2fd0bcb` — /proc/uptime, /proc/loadavg, /proc/security KASLR-lite fix
+6. `b7d07f3` — /proc/kmsg (kernel ring buffer / dmesg)
+7. `09de203` — /proc/cmdline (boot command line)
+8. `6009dff` — /proc/interrupts (IRQ and exception counters)
+
+### Key Technical Details
+
+**GDT swap (b52ea7b):**
+- Old: USER_CS=0x18, USER_DS=0x20 (USER_CS before USER_DS)
+- New: USER_DS=0x18, USER_CS=0x20 (USER_DS before USER_CS)
+- Required for sysret SS = (STAR[63:48]+8)|3 to land on USER_DS
+
+**iretq syscall return (b52ea7b):**
+- Replaced sysretq with iretq in syscall_entry.asm
+- QEMU's sysretq was loading CS=0x08 (KERNEL_CS) instead of 0x23
+- iretq uses explicit frame: CS=0x23, SS=0x1B — unambiguous
+
+**SMAP-safe ELF loader (b52ea7b):**
+- stac/clac wrapping in create_user_address_space, deep_copy_pdpt,
+  user_map_page (entire function), user_map_data, BSS/stack setup
+- Physical pages may overlap with user-mapped virtual addresses
+
+**fork() fix (e190309):**
+- create_proc_pml4 now calls create_user_address_space (deep-copy)
+  instead of sharing boot_pml4[0..3] by pointer
+- vmm_map_page now sets PAGE_USER on intermediate entries
+- vmm_map_page now splits 2MB huge pages (was bailing)
+
+**Preemption (1cfbe71):**
+- sched_enable() re-enabled in sched_start_first
+- Stable with one process (schedule() is a no-op)
+
+### New procfs entries
+- /proc/uptime — kernel uptime (Linux format)
+- /proc/loadavg — process load average
+- /proc/kmsg — kernel ring buffer (dmesg, 16KB circular)
+- /proc/cmdline — boot command line from GRUB
+- /proc/interrupts — IRQ and exception counts
+- /proc/security — fixed KASLR-lite status, added SyscallReturn line
+
+### Remaining Issues
+- Shell exec: after execve(/shell), the shell doesn't run. Root cause
+  likely: identity-map/user-page conflict in ELF loader. Fix requires
+  kmap-style temporary kernel mapping (deferred).
+- /init boots correctly with full SMEP+SMAP+NX+ASLR+canaries.
