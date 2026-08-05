@@ -22,7 +22,7 @@ static void timer_irq_handler(struct interrupt_frame* frame) {
 
     /* KE-16: Feed TSC jitter into interrupt-mixed entropy pool.
      * The TSC delta between timer fires contains real hardware
-     * timing entropy on real hardware (±microsecond jitter from
+     * timing entropy on real hardware (+-microsecond jitter from
      * interrupt latency). On QEMU the jitter is near-zero but still
      * adds mixing diversity with the keyboard/mouse pool feeds. */
     static uint64_t last_tsc = 0;
@@ -35,29 +35,18 @@ static void timer_irq_handler(struct interrupt_frame* frame) {
     }
 
     extern void sched_tick(void);
-    /* KE-25: sched_tick() already calls schedule() when the scheduler is
-     * enabled. The previous UNCONDITIONAL schedule(frame) call here fired
-     * a context switch on every timer IRQ even with preemption disabled,
-     * which — once PID 1 became `current` — drove the broken
-     * context_switch path every tick and triple-faulted. Removing the
-     * duplicate call means context switches only happen when the
-     * scheduler is explicitly enabled. */
     sched_tick();
 
-    /* Pump the network stack. net_tick() is a no-op if net_init() hasn't
-     * been called yet or if there's no NIC. Called from IRQ0 context so
-     * it must be cheap; net_tick() drains only a bounded number of
-     * packets per call. */
+    /* Pump the network stack. */
     extern void net_tick(void);
     net_tick();
 
-    /* Cron daemon — check scheduled tasks every second */
+    /* Cron daemon -- check scheduled tasks every second */
     static uint64_t last_cron_tick = 0;
-    if (ticks - last_cron_tick >= frequency) {  /* every 1 second */
+    if (ticks - last_cron_tick >= frequency) {
         last_cron_tick = ticks;
         extern void cron_tick(void);
         cron_tick();
-        /* Service manager — check services and SSH sessions */
         extern void service_tick(void);
         service_tick();
     }

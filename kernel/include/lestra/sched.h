@@ -73,6 +73,7 @@ struct process {
 
 void sched_init(void);
 void sched_enable(void);
+void sched_disable(void);
 void sched_yield(void);
 void sched_tick(void);
 void sched_check_wakeups(void);

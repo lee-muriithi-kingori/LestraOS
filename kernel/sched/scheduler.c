@@ -669,6 +669,15 @@ void sched_enable(void) {
     pr_info("sched: scheduling enabled\n");
 }
 
+/* KE-29: Explicit disable for elf_exec. The timer IRQ handler's
+ * sched_tick() → schedule() path triple-faults when context_switch
+ * runs with a user PML4 that doesn't fully cover kernel addresses.
+ * This is a stopgap until the context_switch triple-fault (bug #3)
+ * is properly fixed. */
+void sched_disable(void) {
+    scheduler_enabled = 0;
+}
+
 void sched_start_first(const char* name, const void* elf_data, size_t elf_size) {
     int pid = proc_create(name, elf_data, elf_size);
     if (pid < 0) {
