@@ -270,12 +270,6 @@ static void acpi_dispatch_entry(uintptr_t addr, void* user_data) {
     if (hdr->length < sizeof(struct acpi_header) || hdr->length > 0x100000)
         return;
 
-    /* Log all discovered tables for debugging */
-    char sig[5] = {0};
-    memcpy(sig, hdr->signature, 4);
-    pr_info("acpi:   table '%s' at 0x%x (len=%u)\n",
-            sig, (unsigned)addr, hdr->length);
-
     if (memcmp(hdr->signature, "FACP", 4) == 0) {
         parse_fadt(addr);
     } else if (memcmp(hdr->signature, "APIC", 4) == 0) {
