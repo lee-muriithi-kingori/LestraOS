@@ -40,6 +40,9 @@ int vprintk(const char* fmt, va_list args);
 void early_printk(const char* str);
 void early_putchar(char c);
 
+/* KE-26: Kernel ring buffer (dmesg equivalent) — read via /proc/kmsg */
+size_t kmsg_read(char* buf, size_t max);
+
 /* Formatted output helpers */
 int print_dec(uint64_t value, char* buf, size_t bufsize);
 int print_hex(uint64_t value, char* buf, size_t bufsize, bool uppercase);

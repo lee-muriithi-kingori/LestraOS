@@ -48,6 +48,7 @@ enum procfs_kind {
     PROC_SECURITY,  /* /proc/security — protection status */
     PROC_UPTIME,    /* /proc/uptime — kernel uptime in seconds */
     PROC_LOADAVG,   /* /proc/loadavg — process load average */
+    PROC_KMSG,      /* /proc/kmsg — kernel ring buffer (dmesg) */
 };
 
 struct procfs_open {
@@ -363,6 +364,13 @@ static size_t gen_loadavg(struct procfs_open* o) {
     return (size_t)off;
 }
 
+/* KE-26: Generate /proc/kmsg — kernel ring buffer (dmesg equivalent).
+ * Returns the entire ring buffer contents. */
+static size_t gen_kmsg(struct procfs_open* o) {
+    extern size_t kmsg_read(char* buf, size_t max);
+    return kmsg_read(o->buf, sizeof(o->buf));
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -378,6 +386,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/security")     == 0) return PROC_SECURITY;
     if (strcmp(path, "/proc/uptime")       == 0) return PROC_UPTIME;
     if (strcmp(path, "/proc/loadavg")      == 0) return PROC_LOADAVG;
+    if (strcmp(path, "/proc/kmsg")         == 0) return PROC_KMSG;
     return PROC_NONE;
 }
 
@@ -403,6 +412,7 @@ int procfs_open(const char* path) {
                 case PROC_SECURITY:     o->size = gen_security(o);     break;
                 case PROC_UPTIME:       o->size = gen_uptime(o);       break;
                 case PROC_LOADAVG:      o->size = gen_loadavg(o);      break;
+                case PROC_KMSG:         o->size = gen_kmsg(o);         break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

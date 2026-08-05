@@ -15,6 +15,40 @@
 /* Cap for %s format specifier — matches the buffer cap below (PR #7 fix). */
 #define PRINTK_MAX_STR 1024
 
+/* KE-26: Kernel ring buffer (dmesg/kmsg equivalent).
+ * Stores all printk output in a circular buffer for later retrieval via
+ * /proc/kmsg. 16 KB is enough for ~200 lines of boot output. */
+#define KMSG_SIZE 16384
+static char kmsg_buf[KMSG_SIZE];
+static size_t kmsg_write_idx = 0;  /* next write position (wraps) */
+static size_t kmsg_len = 0;        /* total bytes written (caps at KMSG_SIZE) */
+
+/* Write a character to the ring buffer. */
+static void kmsg_write(char c) {
+    kmsg_buf[kmsg_write_idx] = c;
+    kmsg_write_idx = (kmsg_write_idx + 1) % KMSG_SIZE;
+    if (kmsg_len < KMSG_SIZE) kmsg_len++;
+}
+
+/* Read the ring buffer into a user buffer. Returns bytes read.
+ * If the buffer is larger than the available data, only the available
+ * data is copied. The buffer is read from oldest to newest. */
+size_t kmsg_read(char* buf, size_t max) {
+    size_t to_copy = kmsg_len < max ? kmsg_len : max;
+    size_t start;
+    if (kmsg_len < KMSG_SIZE) {
+        /* Buffer not yet full — start from 0 */
+        start = 0;
+    } else {
+        /* Buffer is full — start from the oldest byte (write_idx) */
+        start = kmsg_write_idx;
+    }
+    for (size_t i = 0; i < to_copy; i++) {
+        buf[i] = kmsg_buf[(start + i) % KMSG_SIZE];
+    }
+    return to_copy;
+}
+
 /* Simple itoa for numbers */
 static int itoa(int64_t value, char* buf, int base, bool uppercase) {
     char* digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -96,6 +130,7 @@ void early_printk(const char* str) {
 }
 
 static void print_char(char c) {
+    kmsg_write(c);  /* KE-26: store in ring buffer for /proc/kmsg */
     vga_putchar(c);
     serial_default_putchar(c);
 }
