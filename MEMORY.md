@@ -1193,3 +1193,84 @@ The `make smoke` test uses `-cpu qemu64,+smep,+smap` and checks:
   likely: identity-map/user-page conflict in ELF loader. Fix requires
   kmap-style temporary kernel mapping (deferred).
 - /init boots correctly with full SMEP+SMAP+NX+ASLR+canaries.
+
+---
+## KE-27 — execve(/shell) SMAP violation FIXED (commit e399f71)
+
+### Environment re-bootstrap (after full env reset wiped toolchain + repo)
+This cycle the entire lestraOS environment was gone (no ~/.config/lestra, no
+~/.local/opt/devtools, no repo). Re-built a no-root toolchain from scratch:
+
+- **PAT**: persisted to `~/.config/lestra/github_pat` + `upload/.lestra_pat`
+  (upload/ survived the reset). apply-pat.sh at `~/.config/lestra/apply-pat.sh`.
+  NOTE: GitHub username is `lee-muriithi-kingori` (DOUBLE-i "muriithi").
+- **nasm 2.16.03**: built from source → ~/.local/opt/devtools/usr/bin/nasm
+- **qemu-system-x86_64 10.0.11**: extracted from Debian trixie .debs (no root):
+  qemu-system-x86 + qemu-system-common + qemu-system-data + seabios + vgabios
+  + ipxe-qemu (NIC ROMs) + libslirp0 + libfdt1 + libcapstone5 + libpmem1 +
+  librdmacm1t64 + libibverbs1 + libvdeplug2t64 + libfuse3-4 + libaio1t64 +
+  liburing2 + libndctl6 + libdaxctl1 + libnl-3-200 + libnl-route-3-200 +
+  libkmod2 + libjte2 + libefivar1t64 + libefiboot1t64 + libdevmapper1.02.1.
+  All .so libs → ~/.local/opt/devtools/usr/lib. Run with LD_LIBRARY_PATH set.
+- **grub-mkrescue 2.12 + xorriso 1.5.6**: extracted from .debs (grub-common,
+  grub-pc-bin, xorriso, libisoburn1t64, libisofs6t64, libburn4t64). grub
+  i386-pc modules at ~/.local/opt/devtools/usr/lib/grub/i386-pc.
+- **env.sh** (in repo root): exports DEVTOOLS, PATH, LD_LIBRARY_PATH,
+  QEMU_DATADIR. `source env.sh` before any make/qemu.
+- BIOS/ROMs (bios-256k.bin, vgabios-stdvga.bin, efi-e1000.rom etc.) at
+  ~/.local/opt/devtools/usr/share/qemu. Smoke uses `-L $DEVTOOLS/share/qemu`.
+
+### The KE-27 fix
+**Bug**: execve(/shell) panicked with SMAP violation at 0x426000 during
+create_user_address_space. Smoke log:
+  PF: addr=0x426000 err=0x3 P W K SMAP proc=init(1)
+  RIP: 0x174cd6  → create_user_address_space, the `pml4[i] = ...` store
+
+**Root cause**: create_user_address_space() calls deep_copy_pdpt() to deep-copy
+boot_pml4[0..3]. deep_copy_pdpt() does its own stac()/clac() around its internal
+page-table writes, so when it returns, AC has been cleared. The caller then
+stores the new PDPT pointer into `pml4[i]` WITHOUT stac — an unprotected
+supervisor write to the freshly-allocated PML4 physical page via the identity
+map. Under SMAP, this faults when pmm_alloc_page() returns a physical page whose
+identity-mapped virtual address collides with a USER-mapped page in the CURRENT
+(caller's) PML4 (e.g. init's BSS 0x407000-0x507000 when execve runs in init).
+
+**Fix** (kernel/exec/elf.c, create_user_address_space): wrap the `pml4[i]` store
+in stac()/clac() to re-arm AC after deep_copy_pdpt()'s clac. 1-line semantic
+fix (+10 lines of explanation). Matches the KE-26 SMAP-safety pattern.
+
+### Verification (25s QEMU, -cpu qemu64,+smep,+smap) — all PASS, NO panic:
+  - kernel initialized successfully
+  - /init banner printed (lestramk.org - Lightweight Operating System)
+  - SMEP enabled, SMAP enabled
+  - syscall: execve(/shell) -> elf_exec loads all 4 PT_LOAD segments
+  - elf: jumping to userspace (tss.rsp0=...) — SHELL RUNS IN RING 3
+Previously this exact path panicked. The shell now executes in userspace
+under full SMEP+SMAP+NX+ASLR+canaries. HEADLINE MILESTONE.
+
+### Next priorities
+1. Shell I/O: the shell jumps to userspace cleanly but produces no serial
+   output (it writes to the GUI framebuffer, not serial). Add a serial
+   console write path in the shell (or a serial printk) so smoke can verify
+   shell execution. Then test interactive commands.
+2. Scheduler preemption with 2+ processes: now that execve works, fork() +
+   preemption can be exercised for real. Verify context_switch is stable.
+3. kmap: implement a proper kernel-only temporary physical-page mapping to
+   replace the identity-map-reliant stac/clac pattern in the ELF loader
+   (architecturally cleaner, removes the "phys collides with user virt" class
+   of SMAP bugs entirely).
+4. Continue kernel features: framebuffer font rendering, ACPI HPET timer,
+   RTL8139/e1000 RX path, AHCI writes, more syscalls (futex, signals).
+
+### Carry-forward (critical for next cycle after env reset)
+- PAT: `~/.config/lestra/github_pat` (or `upload/.lestra_pat`). Username
+  `lee-muriithi-kingori` (double-i). Push bypasses branch-protection.
+- Toolchain: all at `~/.local/opt/devtools/usr`. If wiped, re-bootstrap via
+  the .deb-extraction procedure above (nasm from source; qemu/grub/xorriso
+  from Debian trixie .debs). env.sh in repo root sets up PATH/LD_LIBRARY_PATH.
+- `source env.sh` then `make kernel iso` then boot with:
+  qemu-system-x86_64 -L $DEVTOOLS/share/qemu -cdrom build/lestraos.iso \
+    -m 512M -cpu qemu64,+smep,+smap -netdev user,id=net0 -device e1000,netdev=net0 \
+    -display none -no-reboot -serial file:/tmp/lestra.log & ; sleep 15 ; kill %1
+- Makefile uses TABs for recipes; do NOT use the Edit tool on recipe lines
+  (it converts tabs→spaces). Use sed with literal \t for recipe edits.
