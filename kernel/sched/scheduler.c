@@ -679,17 +679,15 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
     current = &procs[pid - 1];
     current->state = PROC_RUNNING;
 
-    /* KE-25: Preemption is intentionally NOT enabled here yet. The timer
-     * IRQ → sched_tick → schedule() → context_switch path currently
-     * triple-faults on the first preemption of PID 1 (the context-switch
-     * assembly corrupts the saved userspace frame / kernel stack).
-     * Running PID 1 cooperatively (no preemption) lets /init execute
-     * real syscalls — write() prints its banner, execve() can replace
-     * the image — proving the userspace + fd-table path works end to
-     * end. Re-enabling preemption is the next milestone (see worklog). */
-    /* sched_enable(); */
+    /* KE-26: Re-enabled preemption. The KE-26 fixes (GDT swap, iretq
+     * syscall return, vmm_map_page intermediate USER bits, fork deep-copy)
+     * should make the context_switch path stable. With only PID 1 running,
+     * schedule() is a no-op (no other runnable process), so this is safe
+     * to test. Once fork() creates child processes, real preemption will
+     * kick in. */
+    sched_enable();
 
-    pr_info("sched: starting first process '%s' (pid %d) [cooperative]\n", name, pid);
+    pr_info("sched: starting first process '%s' (pid %d) [preemptive]\n", name, pid);
 
     /* KE-25: Do NOT pre-switch CR3 here. elf_jump_to_user() saves the
      * CURRENT cr3 into save_kernel_cr3 and then switches to the user
