@@ -624,34 +624,96 @@ static int64_t sys_brk(void* addr) {
     return (int64_t)current_brk;
 }
 
+#define MMAP_ANONYMOUS 0x20
+
+/* mmap region: starts at 0x60000000 (1.5 GB), above the identity-mapped 1 GB
+ * and above the brk region (~0x40000000).  PDPT[1] is never allocated by
+ * boot.asm, so vmm_map_page will create fresh 4KB page tables here
+ * without any huge-page conflicts. */
+#define MMAP_REGION_BASE   0x60000000ULL
+#define MMAP_REGION_END    0x7FFFFFFFFFFFULL   /* well below stack */
+
+/* Bump allocator for mmap virtual addresses.  Initialized once with
+ * ASLR slide on first call. */
+static uintptr_t mmap_next_addr = 0;
+
+static uintptr_t mmap_alloc_vaddr(size_t num_pages) {
+    if (!mmap_next_addr) {
+        /* First mmap: apply ASLR slide within a 1 MB range (256 slots @ 4 KB). */
+        uint64_t slide = (csprng_u64() & ((1ULL << ASLR_MMAP_BITS) - 1)) << 12;
+        mmap_next_addr = MMAP_REGION_BASE + slide;
+    }
+    uintptr_t start = mmap_next_addr;
+    mmap_next_addr += num_pages * PAGE_SIZE;
+    /* Overflow / out-of-region guard */
+    if (mmap_next_addr > MMAP_REGION_END || mmap_next_addr < start) {
+        return 0;  /* caller returns -ENOMEM */
+    }
+    return start;
+}
+
 static int64_t sys_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    /* Minimal mmap: anonymous pages only. File-backed mmap requires
-     * page-cache integration we don't have yet. */
-    (void)prot;
-    if (!(flags & 0x20 /* MAP_ANONYMOUS */)) {
+    /* Anonymous mmap backed by real VMAs in the process page table.
+     * File-backed mmap requires page-cache integration we don't have yet. */
+    if (!(flags & MMAP_ANONYMOUS)) {
         (void)fd; (void)offset;
         return -ENOSYS;
     }
     if (length == 0) return -EINVAL;
-    /* Round up to page size, allocate physical pages, return a kernel-
-     * visible virtual address. For now we just kmalloc and return that
-     * pointer — the user process is single-threaded and the kernel heap
-     * is identity-mapped, so this works for our minimal userspace. */
-    size_t rounded = (length + PAGE_SIZE - 1) & ~((size_t)PAGE_SIZE - 1);
-    void* p = kmalloc(rounded);
-    if (!p) return -ENOMEM;
-    memset(p, 0, rounded);
-    /* NOTE: real mmap ASLR requires VMM-backed per-process address space
-     * management (allocate pages at a random virtual address in the user PML4).
-     * Current implementation returns identity-mapped kernel heap pointers.
-     * Deferred until sys_mmap is backed by vmm_map_page. */
-    return (int64_t)p;
+    /* If caller provided a hint address and MAP_FIXED is set, reject —
+     * we don't support fixed mappings yet (no VMA collision check). */
+    if (addr && (flags & 0x10 /* MAP_FIXED */)) return -ENOSYS;
+    (void)addr;
+
+    struct process* cur = task_current();
+    if (!cur || !cur->pml4) return -EFAULT;
+
+    size_t num_pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uintptr_t vaddr = mmap_alloc_vaddr(num_pages);
+    if (!vaddr) return -ENOMEM;
+
+    uint64_t page_flags = PAGE_USER_RW;
+    if (!(prot & 2)) page_flags &= ~PAGE_WRITABLE;  /* PROT_WRITE clear → RO */
+    if (!(prot & 4)) page_flags |= PAGE_NX;         /* PROT_EXEC clear → NX */
+
+    for (size_t i = 0; i < num_pages; i++) {
+        phys_addr_t phys = pmm_alloc_page();
+        if (!phys) {
+            /* Rollback: unmap and free what we already mapped. */
+            for (size_t j = 0; j < i; j++) {
+                phys_addr_t p = vmm_get_phys(cur->pml4, vaddr + j * PAGE_SIZE);
+                if (p) pmm_free_page(p);
+                vmm_unmap_page(cur->pml4, vaddr + j * PAGE_SIZE);
+            }
+            return -ENOMEM;
+        }
+        /* Zero the physical page BEFORE mapping (SMAP-safe: phys addr
+         * is in the identity-mapped kernel region, not user space). */
+        memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
+        vmm_map_page(cur->pml4, vaddr + i * PAGE_SIZE, phys, page_flags);
+    }
+    return (int64_t)vaddr;
 }
 
 static int64_t sys_munmap(void* addr, size_t length) {
-    (void)addr; (void)length;
-    /* We don't track mmap regions yet; kfree would be unsafe because
-     * we don't know if the caller actually owns the pointer. Leak. */
+    if (!addr) return -EINVAL;
+    if (length == 0) return -EINVAL;
+    /* Round down addr and up length to page boundaries. */
+    uintptr_t start = (uintptr_t)addr & PAGE_MASK;
+    uintptr_t end   = ((uintptr_t)addr + length + PAGE_SIZE - 1) & PAGE_MASK;
+    size_t num_pages = (end - start) / PAGE_SIZE;
+
+    struct process* cur = task_current();
+    if (!cur || !cur->pml4) return -EFAULT;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        uintptr_t va = start + i * PAGE_SIZE;
+        phys_addr_t phys = vmm_get_phys(cur->pml4, va);
+        if (phys) {
+            pmm_free_page(phys);
+            vmm_unmap_page(cur->pml4, va);
+        }
+    }
     return 0;
 }
 
