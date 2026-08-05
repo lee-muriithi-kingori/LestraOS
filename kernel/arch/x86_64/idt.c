@@ -123,8 +123,15 @@ static void default_irq_handler(struct interrupt_frame* frame) {
 }
 
 /* Main interrupt dispatcher (called from assembly stubs) */
+/* KE-26: IRQ/interrupt counter for /proc/interrupts.
+ * Counts how many times each vector (0-255) has fired. */
+uint64_t irq_counts[256] = {0};
+
 void interrupt_dispatch(struct interrupt_frame* frame) {
     uint8_t vector = frame->int_no;
+
+    /* KE-26: Count this interrupt */
+    if (vector < 256) irq_counts[vector]++;
 
     if (vector < 32) {
         /* CPU exception */

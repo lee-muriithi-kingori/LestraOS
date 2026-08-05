@@ -50,6 +50,7 @@ enum procfs_kind {
     PROC_LOADAVG,   /* /proc/loadavg — process load average */
     PROC_KMSG,      /* /proc/kmsg — kernel ring buffer (dmesg) */
     PROC_CMDLINE,   /* /proc/cmdline — boot command line */
+    PROC_INTERRUPTS, /* /proc/interrupts — IRQ counts */
 };
 
 struct procfs_open {
@@ -379,6 +380,47 @@ static size_t gen_cmdline(struct procfs_open* o) {
     return (size_t)off;
 }
 
+/* KE-26: Generate /proc/interrupts — IRQ counts (Linux-compatible format). */
+static size_t gen_interrupts(struct procfs_open* o) {
+    extern uint64_t irq_counts[256];
+    int off = 0;
+    off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                     "           CPU0\n");
+    /* IRQs 32-47 are the PIC/IOAPIC IRQs 0-15 */
+    const char* irq_names[] = {
+        "timer", "keyboard", "cascade", "com2", "com1", "lpt2",
+        "floppy", "lpt1", "rtc", "acpi", "irq10", "irq11",
+        "ps2-mouse", "fpu", "ata-primary", "ata-secondary"
+    };
+    for (int i = 0; i < 16; i++) {
+        uint64_t count = irq_counts[32 + i];
+        if (count > 0) {
+            off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                             "%3d: %8lu %s\n",
+                             i, (unsigned long)count, irq_names[i]);
+        }
+    }
+    /* Also show CPU exceptions (vectors 0-31) if any */
+    const char* exc_names[] = {
+        "divide-error", "debug", "nmi", "breakpoint", "overflow",
+        "bound-range", "invalid-opcode", "device-not-available",
+        "double-fault", "coprocessor", "invalid-tss", "segment-not-present",
+        "stack-segment", "general-protection", "page-fault", "reserved",
+        "x87-fp-exception", "alignment-check", "machine-check",
+        "simd-exception", "virtualization", "reserved", "reserved",
+        "reserved", "reserved", "reserved", "reserved", "reserved",
+        "reserved", "reserved", "security", "reserved"
+    };
+    for (int i = 0; i < 32; i++) {
+        if (irq_counts[i] > 0) {
+            off += ksnprintf(o->buf + off, sizeof(o->buf) - off,
+                             "ERR %2d: %8lu %s\n",
+                             i, (unsigned long)irq_counts[i], exc_names[i]);
+        }
+    }
+    return (size_t)off;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -396,6 +438,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/loadavg")      == 0) return PROC_LOADAVG;
     if (strcmp(path, "/proc/kmsg")         == 0) return PROC_KMSG;
     if (strcmp(path, "/proc/cmdline")      == 0) return PROC_CMDLINE;
+    if (strcmp(path, "/proc/interrupts")   == 0) return PROC_INTERRUPTS;
     return PROC_NONE;
 }
 
@@ -423,6 +466,7 @@ int procfs_open(const char* path) {
                 case PROC_LOADAVG:      o->size = gen_loadavg(o);      break;
                 case PROC_KMSG:         o->size = gen_kmsg(o);         break;
                 case PROC_CMDLINE:      o->size = gen_cmdline(o);      break;
+                case PROC_INTERRUPTS:   o->size = gen_interrupts(o);   break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;
