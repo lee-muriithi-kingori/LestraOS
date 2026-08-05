@@ -957,4 +957,22 @@ void ai_init(void) {
     ai_tool_register("uptime",      "Get system uptime",                     ai_tool_uptime);
 
     pr_info("AI subsystem initialized (%d tools registered)\n", tool_count);
+
+    /* Boot-time pickle self-test: parses the embedded tiny GGUF model
+     * and runs one forward pass to verify the GGUF parser + transformer
+     * + soft-float math work end-to-end. Replaces the old "rule-based
+     * only" offline assistant with a real (tiny) neural inference
+     * engine. See kernel/ai/pickle.c, kernel/include/lestra/pickle.h,
+     * and the standalone lestramanika repo. */
+    {
+        extern int pickle_selftest(int32_t* out_token);
+        int32_t tok = -1;
+        pr_info("AI: running pickle GGUF self-test (embedded tiny Llama model)...\n");
+        int rc = pickle_selftest(&tok);
+        if (rc == 0) {
+            pr_info("AI: pickle self-test PASSED — forward pass produced token %d\n", (int)tok);
+        } else {
+            pr_info("AI: pickle self-test FAILED rc=%d\n", rc);
+        }
+    }
 }
