@@ -1069,3 +1069,45 @@ Stage Summary:
 - Unlocks: MSI/MSI-X for PCI devices, USB XHCI interrupt routing, LAPIC timer (per-CPU), SMP (IPI)
 - Files changed: apic.c (TEMP TEST removed), lapic.c (idt_reload added), kernel_main.c (dead acpi_init removed), irq.c (APIC backend), apic.h (new), ioapic.c (new), acpi.h (acpi_isa_irq_flags added)
 - Next priority: HPET timer driver, LAPIC timer, USB XHCI, or remaining syscall stubs (sys_chmod, sys_rename)
+
+---
+Task ID: KE-23 (Verification Addendum)
+Agent: Main (super-agent, resumed session)
+Task: Independently verify KE-23 APIC subsystem + characterize a reboot loop seen in longer boot tests
+
+Work Log:
+- Resumed after context loss; re-read MEMORY.md tail + git log (KE-23 already committed by concurrent cron-agent: 3529a5a, 0c74239, 9004025, pushed to origin/main)
+- Re-built from HEAD and ran extended (25s) QEMU boot tests with proper `pkill -9 qemu-system-x86_64` (earlier `kill $QPID` left forked QEMU alive, inflating boot counts in logs)
+- Observed a reboot loop: ~2 boots per 25s. Pattern: boot → ... → "elf: jumping to userspace" → [no /init output] → silent triple-fault → reboot
+- Investigated "B123456" string that appears before each boot banner: traced to boot/boot.asm lines 127-176 — these are NORMAL boot-stage progress markers ('B','1'..'6','L') written to COM1 during early bootstrap. NOT a crash symptom.
+- Hypothesized APIC spurious-vector #GP (missing idt_reload) was the cause — but the idt_reload fix is already applied (lapic.c:123) and the reboot PERSISTS, so that is NOT the cause.
+- Hypothesized LAPIC MMIO (0xFEE00000) unmapped in user PML4 → lapic_eoi page-faults when timer IRQ fires in ring 3. Verified FALSE: elf.c create_user_address_space deep-copies boot PML4[0..3] (4GB identity map, supervisor-only) so 0xFEE00000 IS mapped in every user address space.
+- DEFINITIVE TEST: built KE-22 (commit b39ee5b, pure pre-APIC) in an isolated `git worktree` and ran the same 25s boot test. KE-22 exhibits the IDENTICAL reboot loop: 2 boots, 2 userspace jumps, 2 reboots, zero /init serial output.
+- CONCLUSION: the /init triple-fault is PRE-EXISTING since at least KE-22. The KE-22 agents ran 9-10s tests and the crash manifests at ~12-13s, so it went unobserved. KE-23 introduces ZERO regression.
+
+KE-23 verification (confirmed correct, no regression):
+- LAPIC enabled at 0xFEE00000 (id=0, version=0x14, max-lvt=5) ✓
+- IOAPIC enabled at 0xFEC00000 (id=0, version=0x20, 24 redirection entries) ✓
+- PIC disabled, irq_controller promoted to APIC ✓
+- Full interrupt pipeline proven: PIT → ISA IRQ0 → IOAPIC GSI 2 (MADT override) → LAPIC vector 32 → timer_irq_handler → net_tick → DHCP ACK 10.0.2.15 ✓
+- All 7 security features active (SMEP/SMAP/NX/ASLR/canaries/KASLR-lite/entropy) ✓
+- ISA IRQ overrides applied (IRQ0→GSI2, IRQ5/9/10/11 active-low level-triggered) ✓
+- idt_reload() after spurious vector 0xFF gate install (prevents latent #GP) ✓
+- acpi_init() made idempotent + early call before driver IRQ registration ✓
+
+Pre-existing /init crash (NOT a KE-23 regression — present at KE-22 b39ee5b):
+- Symptom: ~7s after "elf: jumping to userspace", /init triple-faults (silent CPU reset, no exception print)
+- /init produces ZERO serial output before crashing (its printf("\n") / write(1,...) never appears on COM1)
+- /init's _start is at 0x401000 (page-aligned .text, correctly mapped); BSS segment (0x406fe8, memsz=1048952) is mapped+zeroed by elf.c
+- Likely causes to investigate next (in priority order):
+  1. User stack / TSS.RSP0 mapping when first timer IRQ fires in ring 3 (CPU loads RSP from TSS.RSP0; if that kernel stack page isn't mapped in the USER PML4 at the moment of the ring-3→ring-0 transition, the CPU can't push the interrupt frame → #DF → triple fault)
+  2. printf buffering in libc/src/stdio.c (output may be buffered, never flushed before crash — explains zero serial output even though /init ran ~7s)
+  3. The sleep(1) loop path (init.c:76-78) — task_sleep sti;hlt + scheduler interaction after many iterations
+  4. SYSCALL MSR setup (STAR/LSTAR/SFMASK) — first write syscall may #GP if MSRs misconfigured
+- Reproducer: `qemu-system-x86_64 -cdrom build/lestraos.iso -m 256M -serial stdio -display none -boot d -cpu qemu64,+smep,+smap -netdev user,id=net0 -device e1000,netdev=net0 -L /home/z/.local/opt/devtools/qemu-data` — reboot visible within ~13s
+
+Stage Summary:
+- KE-23 (APIC subsystem) is COMPLETE, CORRECT, COMMITTED (3529a5a), and PUSHED to origin/main
+- KE-23 introduces zero regression — the /init reboot loop is pre-existing (proven via KE-22 worktree b39ee5b)
+- The APIC's core job (interrupt delivery) is verified end-to-end via DHCP completing through IOAPIC+LAPIC
+- TOP PRIORITY for next KE: fix the pre-existing /init triple-fault (userspace execution bug, NOT an IRQ-controller bug). Start with TSS.RSP0 mapping in user PML4 + printf flush behavior.
