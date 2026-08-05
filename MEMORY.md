@@ -51,10 +51,11 @@
 5. ~~**Interrupt-mixed entropy pool**~~ (KE-16: DONE)
 6. ~~**sys_mmap** returns kmalloc pointers not real VMAs~~ (KE-17: DONE)
 7. ~~**Fix virtio_blk I/O timeout**~~ (KE-19: DONE)
-8. **More drivers**: USB, framebuffer fonts, PS/2 mouse improvements, VBE mode setting
-9. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
-10. **sys_futex** is a no-op stub
-11. **Linux signals** are no-ops
+8. ~~**PS/2 mouse improvements**~~ (KE-20: DONE, Intellimouse scroll + middle button + /dev/mouse)
+9. **More drivers**: USB UHCI/EHCI, VBE mode setting, PC speaker, ACPI table parsing
+10. ~~**Fix kernel_main.c double %% panic format string bug**~~ (PHANTOM: bug does not exist)
+11. **sys_futex** is a no-op stub
+12. **Linux signals** are no-ops
 
 ### Build Environment
 - Toolchain: /home/z/.local/opt/devtools/ (NASM 2.16, QEMU 10.0.11, GRUB 2.12)
@@ -96,7 +97,18 @@
 - sys_futex is a no-op stub
 - Linux signals (rt_sigaction etc.) are no-ops
 
+### PS/2 Mouse Upgrade (KE-20)
+- **Intellimouse detection**: Magic sample rate sequence (200/100/80) → QEMU returns ID=0x03
+- **Scroll wheel**: 4-byte packet parsing, signed byte 3 = scroll delta
+- **EV_MOUSE_SCROLL**: New input event type routed through input subsystem
+- **Middle button fix**: EV_MOUSE_DOWN/UP now generated for MOUSE_BTN_MIDDLE (was missing)
+- **`/dev/mouse` + `/dev/input/mouse0`**: devfs device node, reads mouse_event structs
+- **struct mouse_event**: Added `scroll` field
+- **struct event mouse union**: Added `scroll` field
+- **QEMU confirmed**: Default PS/2 mouse supports Intellimouse extensions (ID=0x03)
+
 ### Commit History (recent)
+7383f2d drivers: KE-20 PS/2 mouse Intellimouse scroll wheel + middle button fix + /dev/mouse
 4b259e1 fix: KE-19 virtio_blk I/O timeout (volatile DMA poll) + legacy queue size fix
 2f8bea0 mm: KE-17 sys_mmap returns real VMAs instead of kmalloc pointers
 fb83394 security: KE-16 interrupt-mixed entropy pool (timer/KB/mouse IRQ feeds + RDSEED)
