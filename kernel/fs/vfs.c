@@ -29,6 +29,7 @@
 #include <lestra/ext2.h>
 #include <lestra/procfs.h>
 #include <lestra/devfs.h>
+#include <lestra/fat32.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
 #include <string.h>
@@ -44,6 +45,17 @@ extern int  ext2_close_file(int fd);
 extern int  ext2_readdir(int fd, struct dirent* entry);
 extern int  ext2_stat_file(const char* path, struct stat* st);
 extern int  ext2_file_size(int fd);
+
+/* ---- FAT32 plumbing (definitions in fat32_shim.c) ---- */
+extern int  fat32_shim_open(const char* path);
+extern int  fat32_shim_create(const char* path);
+extern int  fat32_shim_read(int fd, void* buf, int count);
+extern int  fat32_shim_write(int fd, const void* buf, int count);
+extern int  fat32_shim_close(int fd);
+extern int  fat32_shim_readdir(int fd, struct dirent* entry);
+extern int  fat32_shim_stat(const char* path, struct stat* st);
+extern int  fat32_shim_file_size(int fd);
+
 
 /* ========================================================================
  * memfs: in-memory filesystem with directory support
@@ -263,6 +275,18 @@ static int find_ext2_mount_for_path(const char* path) {
     return -1;
 }
 
+/* Find the FAT32 mount that covers the given path.
+ * Returns mount index, or -1 if no FAT32 mount covers the path. */
+static int find_fat32_mount_for_path(const char* path) {
+    for (int i = 0; i < num_mounts; i++) {
+        if (mounts[i].fs_type == FS_TYPE_FAT32 &&
+            path_under_mount(path, mounts[i].path)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* ========================================================================
  * VFS public API
  * ======================================================================== */
@@ -369,6 +393,50 @@ int vfs_mount(const char* source, const char* target, const char* fs_type) {
         return 0;
     }
 
+    if (strcmp(fs_type, "fat32") == 0) {
+        if (!fat32_is_mounted()) {
+            pr_warn("VFS: FAT32 not mounted (block driver not initialized?)\n");
+            return -1;
+        }
+        int mi = num_mounts;
+        strncpy(mounts[mi].path, target, MAX_PATH_LEN - 1);
+        mounts[mi].path[MAX_PATH_LEN - 1] = '\0';
+        mounts[mi].fs_type = FS_TYPE_FAT32;
+        mounts[mi].root = NULL;
+        mounts[mi].fs = NULL;
+        mounts[mi].private_data = NULL;
+
+        /* Create a stub directory in memfs for the mount point. */
+        if (strcmp(target, "/") != 0) {
+            int existing = memfs_resolve_path(target);
+            if (existing < 0) {
+                char basename_buf[MAX_NAME_LEN];
+                int parent_idx;
+                if (memfs_split_path(target, &parent_idx,
+                                     basename_buf, sizeof(basename_buf)) == 0) {
+                    int slot = memfs_alloc_slot();
+                    if (slot >= 0) {
+                        strncpy(fs_files[slot].name, basename_buf, MAX_NAME_LEN - 1);
+                        fs_files[slot].name[MAX_NAME_LEN - 1] = '\0';
+                        fs_files[slot].exists   = 1;
+                        fs_files[slot].is_dir   = 1;
+                        fs_files[slot].mode     = S_IFDIR | 0755;
+                        fs_files[slot].size     = 0;
+                        fs_files[slot].parent_idx = parent_idx;
+                        fs_files[slot].num_children = 0;
+                        memfs_add_child(parent_idx, slot);
+                        fs_num_files++;
+                    }
+                }
+            }
+        }
+
+        num_mounts++;
+        pr_info("VFS: FAT32 mounted at '%s' (mount #%d, %s)\n",
+                target, mi, fat32_is_writable() ? "read-write" : "read-only");
+        return 0;
+    }
+
     pr_warn("VFS: unknown fs_type '%s'\n", fs_type);
     return -1;
 }
@@ -414,6 +482,7 @@ struct vnode* vfs_lookup(const char* path) {
  * without a per-process fd table. */
 #define VFS_FD_IS_MEMFS(fd)   ((fd) >= 3 && (fd) < 3 + MAX_FILES)
 #define VFS_FD_IS_EXT2(fd)    ((fd) >= 100 && (fd) < 100 + 16)
+#define VFS_FD_IS_FAT32(fd)   ((fd) >= 200 && (fd) < 200 + 16)
 #define VFS_FD_IS_PROCFS(fd)  ((fd) >= PROCFS_FD_BASE && (fd) < PROCFS_FD_BASE + PROCFS_MAX_OPEN)
 #define VFS_FD_IS_DEVFS(fd)   ((fd) >= DEVFS_FD_BASE && (fd) < DEVFS_FD_BASE + DEVFS_MAX_OPEN)
 
@@ -504,6 +573,15 @@ int vfs_open(const char* path, int flags) {
         }
     }
 
+    /* 4. Try FAT32 if path falls under a FAT32 mount point. */
+    int fmi = find_fat32_mount_for_path(path);
+    if (fmi >= 0) {
+        int ffd = fat32_shim_open(path);
+        if (ffd >= 0) {
+            return ffd + 200;   /* FAT32 fd space */
+        }
+    }
+
     return -1;
 }
 
@@ -516,6 +594,9 @@ int vfs_close(int fd) {
     }
     if (VFS_FD_IS_EXT2(fd)) {
         return ext2_close_file(fd - 100);
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        return fat32_shim_close(fd - 200);
     }
     int idx = fd - 3;
     if (idx >= 0 && idx < MAX_FILES && fs_files[idx].exists) {
@@ -533,6 +614,9 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
     }
     if (VFS_FD_IS_EXT2(fd)) {
         return (ssize_t)ext2_read_fd(fd - 100, buf, (int)count);
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        return (ssize_t)fat32_shim_read(fd - 200, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -567,6 +651,9 @@ ssize_t vfs_write(int fd, const void* buf, size_t count) {
          * track the path per-fd here. For now, return -1.
          * Future: add write support to ext2_shim. */
         return -1;
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        return (ssize_t)fat32_shim_write(fd - 200, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -625,6 +712,11 @@ int vfs_readdir(int fd, struct dirent* entry) {
     /* ext2 fd delegation. */
     if (VFS_FD_IS_EXT2(fd)) {
         return ext2_readdir(fd - 100, entry);
+    }
+
+    /* FAT32 fd delegation. */
+    if (VFS_FD_IS_FAT32(fd)) {
+        return fat32_shim_readdir(fd - 200, entry);
     }
 
     int idx = fd - 3;
@@ -814,6 +906,14 @@ off_t vfs_lseek(int fd, off_t offset, int whence) {
             return (off_t)(sz + offset);
         }
         /* SEEK_SET/SEEK_CUR for ext2 — shim doesn't expose offset. */
+        return -1;
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        if (whence == 2) {
+            int sz = fat32_shim_file_size(fd - 200);
+            if (sz < 0) return -1;
+            return (off_t)(sz + offset);
+        }
         return -1;
     }
     /* memfs */

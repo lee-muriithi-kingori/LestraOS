@@ -23,6 +23,7 @@ typedef int64_t off_t;
 /* Filesystem type identifiers for mount table */
 #define FS_TYPE_MEMFS   0
 #define FS_TYPE_EXT2    1
+#define FS_TYPE_FAT32   2
 
 /* File types */
 #define FT_REGULAR   1

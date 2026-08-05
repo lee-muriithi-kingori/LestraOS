@@ -425,7 +425,15 @@ void kernel_main(void* mb2_info) {
         extern int virtio_blk_is_present(void);
         if (virtio_blk_is_present()) {
             extern int virtio_blk_read_sectors(uint64_t, uint32_t, void*);
+            extern int virtio_blk_write_sectors(uint64_t, uint32_t, const void*);
             if (fat32_init((fat32_read_fn)virtio_blk_read_sectors) == 0) {
+                /* Enable write support */
+                fat32_set_write_fn((fat32_write_fn)virtio_blk_write_sectors);
+
+                /* Mount FAT32 at /fat32 via VFS */
+                extern int vfs_mount(const char*, const char*, const char*);
+                vfs_mount("virtio0", "/fat32", "fat32");
+
                 /* List root directory as a boot-time demo. */
                 struct fat32_dirent entries[16];
                 int n = fat32_list_root(entries, 16);
@@ -437,7 +445,7 @@ void kernel_main(void* mb2_info) {
                                 entries[i].file_size,
                                 entries[i].is_dir ? "<DIR>" : "");
                     }
-                    /* Read and print first file (hello.txt) as a demo. */
+                    /* Read and print first file as a demo. */
                     struct fat32_dirent *f = NULL;
                     for (int i = 0; i < n; i++) {
                         if (!entries[i].is_dir && entries[i].file_size > 0 && entries[i].file_size < 512) {
@@ -450,6 +458,25 @@ void kernel_main(void* mb2_info) {
                         if (rd > 0) {
                             buf[rd] = '\0';
                             pr_info("fat32: %s -> \"%s\"\n", f->name, buf);
+                        }
+                    }
+                    /* KE-24 demo: write a test file to prove persistence. */
+                    if (fat32_is_writable()) {
+                        struct fat32_dirent test_de;
+                        const char *test_name = "KE24TEST.TXT";
+                        if (fat32_lookup(test_name, NULL) != 0) {
+                            /* Create and write the test file */
+                            if (fat32_create_file(test_name, &test_de) == 0) {
+                                const char *msg = "lestraOS KE-24: FAT32 write works!";
+                                uint32_t wc = 0, ws = 0;
+                                fat32_write_file(test_de.first_cluster, 0,
+                                                 msg, strlen(msg), 0, &wc, &ws);
+                                /* Update both cluster and size in the dir entry */
+                                fat32_update_entry(test_name, wc, ws);
+                                pr_info("fat32: KE-24 test file written (%u bytes, cluster %u)\n", ws, wc);
+                            }
+                        } else {
+                            pr_info("fat32: KE-24 test file already exists (persistence confirmed!)\n");
                         }
                     }
                 }
