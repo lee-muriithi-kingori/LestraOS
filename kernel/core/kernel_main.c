@@ -42,6 +42,7 @@
 #include <lestra/ai.h>
 #include <lestra/net.h>
 #include <lestra/fb.h>
+#include <lestra/fat32.h>
 #include <lestra/input.h>
 #include <lestra/gui.h>
 #include <lestra/splash.h>
@@ -386,6 +387,46 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing disk subsystem...\n");
     extern int ahci_init(void);
     ahci_init();
+
+    /* Initialize VirtIO-blk driver (paravirtualized block device for KVM/QEMU).
+     * Non-fatal if no device found. */
+    extern int virtio_blk_init(void);
+    if (virtio_blk_init()) {
+        /* Try to mount FAT32 on the VirtIO-blk device. */
+        extern int virtio_blk_is_present(void);
+        if (virtio_blk_is_present()) {
+            extern int virtio_blk_read_sectors(uint64_t, uint32_t, void*);
+            if (fat32_init((fat32_read_fn)virtio_blk_read_sectors) == 0) {
+                /* List root directory as a boot-time demo. */
+                struct fat32_dirent entries[16];
+                int n = fat32_list_root(entries, 16);
+                if (n > 0) {
+                    pr_info("fat32: root directory (%d entries):\n", n);
+                    for (int i = 0; i < n; i++) {
+                        pr_info("  %s  cluster=%u  size=%u  %s\n",
+                                entries[i].name, entries[i].first_cluster,
+                                entries[i].file_size,
+                                entries[i].is_dir ? "<DIR>" : "");
+                    }
+                    /* Read and print first file (hello.txt) as a demo. */
+                    struct fat32_dirent *f = NULL;
+                    for (int i = 0; i < n; i++) {
+                        if (!entries[i].is_dir && entries[i].file_size > 0 && entries[i].file_size < 512) {
+                            f = &entries[i]; break;
+                        }
+                    }
+                    if (f) {
+                        char buf[256];
+                        int rd = fat32_read_file(f->first_cluster, f->file_size, buf, sizeof(buf)-1);
+                        if (rd > 0) {
+                            buf[rd] = '\0';
+                            pr_info("fat32: %s -> \"%s\"\n", f->name, buf);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* Initialize AC97 audio driver.
      * Non-fatal if no audio controller - kernel still runs. */
