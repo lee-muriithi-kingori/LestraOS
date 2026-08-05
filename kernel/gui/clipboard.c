@@ -43,9 +43,8 @@ struct cl_state {
 
 static struct cl_state cl_state;
 
-/* Weak: keyboard.c may not export this yet. */
-void keyboard_inject_char(char c) __attribute__((weak));
-void keyboard_inject_char(char c) { (void)c; }
+/* keyboard_inject_char() is declared in <lestra/keyboard.h> (included
+ * above) and implemented in kernel/drivers/char/keyboard.c. */
 
 /* ---------- helpers ---------- */
 static int cl_idx(struct cl_state* st, int n) {

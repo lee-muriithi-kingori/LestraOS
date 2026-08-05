@@ -444,6 +444,13 @@ void kernel_main(void* mb2_info) {
     extern int battery_init(void);
     battery_init();
 
+    /* Initialize ACPI table discovery (MADT/HPET/FACP)
+     * Must come after battery_init (which does its own PCI+ACPI
+     * scan) but before driver init that may use IOAPIC/HPET info. */
+    pr_info("Initializing ACPI table discovery...\n");
+    extern int acpi_init(void);
+    acpi_init();
+
     /* Initialize temperature sensors */
     extern int temp_init(void);
     temp_init();

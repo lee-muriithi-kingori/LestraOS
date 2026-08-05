@@ -92,6 +92,7 @@ CLOCK_SRCS := $(wildcard kernel/drivers/clock/*.c)
 SENSOR_SRCS := $(wildcard kernel/drivers/sensor/*.c)
 FS_SRCS := $(wildcard kernel/fs/*.c) $(wildcard kernel/fs/ext2/*.c)
 SPLASH_SRCS := kernel/splash.c
+ACPI_SRCS := $(wildcard kernel/acpi/*.c)
 
 # Object files
 BOOT_OBJS := $(patsubst boot/%.asm,$(BUILD_DIR)/boot/%.o,$(filter-out boot/stage1.asm,$(BOOT_SRCS)))
@@ -126,12 +127,13 @@ SENSOR_OBJS := $(patsubst kernel/drivers/sensor/%.c,$(BUILD_DIR)/drivers/sensor/
 FS_OBJS := $(patsubst kernel/fs/%.c,$(BUILD_DIR)/fs/%.o,$(filter-out kernel/fs/ext2/%.c,$(filter kernel/fs/%.c,$(FS_SRCS)))) \
                            $(patsubst kernel/fs/ext2/%.c,$(BUILD_DIR)/fs/ext2/%.o,$(filter kernel/fs/ext2/%.c,$(FS_SRCS)))
 SPLASH_OBJS := $(patsubst kernel/%.c,$(BUILD_DIR)/%.o,$(SPLASH_SRCS))
+ACPI_OBJS := $(patsubst kernel/acpi/%.c,$(BUILD_DIR)/acpi/%.o,$(ACPI_SRCS))
 
 ALL_KERNEL_OBJS := $(BOOT_OBJS) $(ARCH_OBJS) $(CORE_OBJS) $(MM_OBJS) \
                                    $(SCHED_OBJS) $(FS_OBJS) $(DRIVER_OBJS) $(SYSCALL_OBJS) $(UI_OBJS) \
                                    $(PKG_OBJS) $(DESKTOP_OBJS) $(AI_OBJS) $(NET_OBJS) \
                                    $(GUI_OBJS) $(INPUT_OBJS) $(SPLASH_OBJS) $(EXEC_OBJS) \
-                                   $(SYS_OBJS) $(POWER_OBJS) $(CLOCK_OBJS) $(SENSOR_OBJS) $(TTS_OBJS)
+                                   $(SYS_OBJS) $(POWER_OBJS) $(CLOCK_OBJS) $(SENSOR_OBJS) $(TTS_OBJS) $(ACPI_OBJS)
 
 # Phony targets
 .PHONY: all clean run run-debug iso kernel libc userspace initrd img install docs help
@@ -148,6 +150,7 @@ $(BUILD_DIR)/drivers/clock $(BUILD_DIR)/drivers/sensor \
 $(BUILD_DIR)/syscall $(BUILD_DIR)/libc $(BUILD_DIR)/user $(BUILD_DIR)/ui \
 $(BUILD_DIR)/pkg $(BUILD_DIR)/kpkg $(BUILD_DIR)/desktop $(BUILD_DIR)/ai \
 $(BUILD_DIR)/net $(BUILD_DIR)/audio $(BUILD_DIR)/gui $(BUILD_DIR)/exec \
+$(BUILD_DIR)/acpi \
 $(BUILD_DIR)/sys $(GRUB_DIR):
 	@mkdir -p $@
 
@@ -273,6 +276,11 @@ $(BUILD_DIR)/drivers/clock/%.o: kernel/drivers/clock/%.c | $(BUILD_DIR)/drivers/
 
 # Sensor driver (kernel/drivers/sensor/)
 $(BUILD_DIR)/drivers/sensor/%.o: kernel/drivers/sensor/%.c | $(BUILD_DIR)/drivers/sensor
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# ACPI (kernel/acpi/)
+$(BUILD_DIR)/acpi/%.o: kernel/acpi/%.c | $(BUILD_DIR)/acpi
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 

@@ -275,3 +275,24 @@ char keyboard_scancode_to_ascii(uint8_t scancode, bool shift) {
 void keyboard_set_handler(void (*handler)(uint8_t scancode, char ascii)) {
     key_handler = handler;
 }
+
+void keyboard_inject_char(char c) {
+    /* Push a single ASCII char into the keyboard ring buffer so that
+     * keyboard_getchar() / keyboard_has_key() see it, exactly as if
+     * the char had arrived from the PS/2 port. Used by the on-screen
+     * keyboard (osk.c) and clipboard paste (clipboard.c).
+     *
+     * The PS/2 IRQ1 handler also writes key_buffer_head / _tail, so we
+     * must disable interrupts around the index update to avoid losing
+     * a real keypress (or corrupting head/tail). We save RFLAGS first
+     * and only re-enable IF if it was set on entry — this way the
+     * function is safe even if a caller already holds interrupts off. */
+    uint64_t flags = read_flags();
+    cli();
+    uint8_t next = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+    if (next != key_buffer_tail) {
+        key_buffer[key_buffer_head] = c;
+        key_buffer_head = next;
+    }
+    if (flags & 0x200) sti();   /* restore RFLAGS.IF (bit 9) */
+}

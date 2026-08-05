@@ -8,9 +8,10 @@
  *   - Mute toggle button
  *   - Numeric value label
  *
- * Writes the chosen volume to the AC97 mixer via an extern hook. If
- * the AC97 driver isn't linked in, the writes are silent (we use a
- * weak symbol).
+ * Writes the chosen volume to the AC97 mixer via ac97_set_master_volume()
+ * (implemented in kernel/drivers/audio/ac97.c). If the AC97 controller
+ * was not initialised at boot, the function no-ops internally, so this
+ * UI remains safe on systems without AC97 audio.
  */
 
 #include <lestra/types.h>
@@ -38,10 +39,11 @@ struct vs_state {
 
 static struct vs_state vs_state;
 
-/* Weak hook: the AC97 driver can implement this to push the volume
- * to the actual mixer. If absent, we silently no-op. */
-void ac97_set_master_volume(int volume /* 0..100 */) __attribute__((weak));
-void ac97_set_master_volume(int volume) { (void)volume; }
+/* Real implementation lives in kernel/drivers/audio/ac97.c.
+ * Declared here as extern (NOT weak) so a missing AC97 driver is a
+ * link-time error rather than a silent no-op. The strong definition
+ * in ac97.c no-ops cleanly when the controller is absent. */
+extern void ac97_set_master_volume(int volume /* 0..100 */);
 
 /* ---------- public API ---------- */
 void volume_slider_show_at(int x, int y) {

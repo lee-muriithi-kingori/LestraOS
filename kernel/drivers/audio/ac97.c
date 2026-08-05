@@ -75,6 +75,7 @@ static int ac97_find(uint8_t* bus, uint8_t* dev, uint8_t* func) {
 int ac97_init(void);
 int ac97_is_present(void);
 int ac97_play(const void* buf, uint32_t len);
+void ac97_set_master_volume(int volume /* 0..100 */);
 
 int ac97_init(void) {
     uint8_t bus, dev, func;
@@ -121,6 +122,36 @@ int ac97_init(void) {
 }
 
 int ac97_is_present(void) { return ac97_present; }
+
+/* AC97 Master Volume register (NAM offset 0x02).
+ *
+ * Register layout (16-bit, stereo):
+ *   bits [15:8]  = right channel attenuation
+ *   bits [7:0]   = left channel attenuation
+ * Each channel field is 6 bits wide (bits [5:0] of each byte):
+ *   0x00 = 0 dB (maximum)
+ *   0x3F = -94.5 dB (effectively mute)
+ *   1.5 dB per step
+ *
+ * Caller passes a 0..100 user volume where 0 = mute and 100 = max.
+ * Conversion: ac97_att = (100 - vol) * 0x3F / 100
+ *   vol=100 -> att=0x00 (max), vol=0 -> att=0x3F (mute)
+ *
+ * Access is via PIO (index port nam_base+0x04, data port nam_base+0x06),
+ * NOT MMIO — the NAM BAR is an I/O port pair, established in ac97_init().
+ * Silently no-ops if the AC97 controller was not initialised (matches
+ * the previous weak-stub behaviour so callers in the GUI layer don't
+ * need to check ac97_is_present() themselves).
+ */
+void ac97_set_master_volume(int volume) {
+    if (!ac97_present) return;
+    if (volume < 0)   volume = 0;
+    if (volume > 100) volume = 100;
+    uint16_t att = (uint16_t)(((100 - volume) * 0x3F) / 100);
+    /* Same attenuation on both channels (stereo linked). */
+    uint16_t reg = (uint16_t)((att << 8) | att);
+    nam_write16(0x02, reg);
+}
 
 int ac97_play(const void* buf, uint32_t len) {
     if (!ac97_present || !buf || len == 0) return 0;

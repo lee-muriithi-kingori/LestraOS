@@ -35,13 +35,10 @@
 #define OSK_KEY_W 44
 #define OSK_KEY_H 36
 
-/* External: keyboard.c may expose an inject API. We push chars back into
- * the keyboard ring buffer so existing widgets that read with
- * keyboard_getchar() see them. Declared weak so the OSK still links
- * when keyboard.c doesn't yet expose this symbol — in that case the
- * chars are silently dropped. */
-void keyboard_inject_char(char c) __attribute__((weak));
-void keyboard_inject_char(char c) { (void)c; }
+/* keyboard_inject_char() is declared in <lestra/keyboard.h> (included
+ * above) and implemented in kernel/drivers/char/keyboard.c. It pushes
+ * the char into the keyboard ring buffer so existing widgets reading
+ * via keyboard_getchar() receive it. */
 
 struct osk_key {
     char label[4];

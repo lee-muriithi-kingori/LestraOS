@@ -96,4 +96,12 @@ char keyboard_getchar(void);
 char keyboard_scancode_to_ascii(uint8_t scancode, bool shift);
 void keyboard_set_handler(void (*handler)(uint8_t scancode, char ascii));
 
+/* Inject a single ASCII character into the keyboard ring buffer as if
+ * it had been typed on the physical keyboard. Used by the on-screen
+ * keyboard (osk.c) and clipboard paste (clipboard.c). The character
+ * becomes visible to the next keyboard_getchar() / keyboard_has_key()
+ * call. Safe to call from any context — disables IRQs around the
+ * buffer update to avoid racing the PS/2 IRQ handler. */
+void keyboard_inject_char(char c);
+
 #endif /* LESTRA_KEYBOARD_H */
