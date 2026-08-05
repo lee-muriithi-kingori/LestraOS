@@ -292,9 +292,26 @@ static inline void write_cr4(uint64_t val) {
 }
 
 /* stac/clac: enable/disable user-memory access from ring 0 (SMAP).
- * When CR4.SMAP=0 (current state), these are no-ops. */
-static inline void stac(void) { __asm__ volatile("stac" ::: "memory"); }
-static inline void clac(void) { __asm__ volatile("clac" ::: "memory"); }
+ *
+ * KE-25 FIX: stac/clac are #UD (Invalid Opcode) when CR4.SMAP=0 — they
+ * are NOT no-ops as the old comment claimed. The syscall path uses these
+ * unconditionally via the uaccess.h helpers, so on any CPU without SMAP
+ * (e.g. the default `qemu64` model), the first user→kernel transition
+ * that touches a user pointer would #UD and panic. This was the second
+ * root cause of the "/init crashes after entering userspace" bug.
+ *
+ * We guard both instructions with the runtime flag g_smap_enabled, which
+ * gdt_init() sets to 1 only after it successfully flips CR4.SMAP. When
+ * SMAP is off, ring 0 can already access user memory, so skipping the
+ * instruction is semantically correct. */
+extern uint8_t g_smap_enabled;
+
+static inline void stac(void) {
+    if (g_smap_enabled) __asm__ volatile("stac" ::: "memory");
+}
+static inline void clac(void) {
+    if (g_smap_enabled) __asm__ volatile("clac" ::: "memory");
+}
 
 /* Global security status — populated at boot, read by /proc/security. */
 struct security_status {

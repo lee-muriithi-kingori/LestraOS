@@ -33,6 +33,30 @@ extern int  ldso_load_and_run(const char* exe_path, int argc, char** argv, char*
 extern int  ldso_is_dynamic(const char* path);
 extern void sched_enable(void);
 
+/* KE-25: sched_start_first creates a proper struct process (with a fd
+ * table wired to stdin/stdout/stderr), sets `current` to it, switches
+ * CR3, and jumps to userspace. This is the correct PID-1 launch path —
+ * unlike elf_exec(), which jumped to ring 3 with NO process struct, so
+ * task_current() returned NULL and every syscall that needs a current
+ * process (write, read, brk, execve, ...) returned -EBADF. That's why
+ * /init's printf banner never appeared even though the binary ran. */
+extern void sched_start_first(const char* name, const void* elf_data, size_t elf_size);
+
+/* Read an entire VFS file into a caller-provided buffer.
+ * Returns the number of bytes read, or -1 on open/read failure. */
+static int read_file_into(const char* path, uint8_t* buf, size_t bufsize) {
+    int fd = vfs_open(path, 0);
+    if (fd < 0) return -1;
+    size_t total = 0;
+    while (total < bufsize) {
+        ssize_t n = vfs_read(fd, buf + total, bufsize - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    vfs_close(fd);
+    return (int)total;
+}
+
 /* Forward decls from kernel_main.c — fall-back paths. */
 extern void shell_run(void);
 extern void compositor_run(void);
@@ -84,13 +108,24 @@ static int try_exec_init(const char* path) {
         return 0;
     }
 
-    pr_info("userspace_boot: %s is static — elf_exec\n", path);
-    int rc = elf_exec(path);
-    if (rc < 0) {
-        pr_warn("userspace_boot: elf_exec(%s) failed\n", path);
+    pr_info("userspace_boot: %s is static — sched_start_first\n", path);
+
+    /* KE-25: Read the full ELF into a buffer and hand it to the
+     * scheduler's first-process launcher. sched_start_first creates a
+     * proper struct process (PID 1) with an fd table, sets `current`,
+     * and jumps to userspace — so syscalls like write() that need a
+     * current process actually work. It never returns. */
+    static uint8_t elf_buf[65536];
+    int sz = read_file_into(path, elf_buf, sizeof(elf_buf));
+    if (sz <= 0) {
+        pr_warn("userspace_boot: failed to read %s\n", path);
         return -1;
     }
-    return 0;
+    sched_start_first("init", elf_buf, (size_t)sz);
+
+    /* Should never reach here — sched_start_first jumps to ring 3. */
+    pr_warn("userspace_boot: sched_start_first returned (impossible)\n");
+    return -1;
 }
 
 void userspace_boot(void) {

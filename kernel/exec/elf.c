@@ -180,6 +180,27 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
      * PTE_PHYS_MASK extraction produces a non-canonical address (#GP). */
     uint64_t table_flags = flags & ~PAGE_NX;
 
+    /* KE-25 FIX: On x86 long mode, a user-mode (CPL=3) access requires the
+     * U/S bit (PAGE_USER) to be set at EVERY level of the page walk — not
+     * just the leaf PTE. If any intermediate entry (PML4/PDPT/PD) is
+     * supervisor-only (U/S=0), the CPU treats the whole subtree as
+     * supervisor and a user access faults with err=0x15 (P=1, U=1, I/D=1
+     * under NXE) even when the leaf PTE has PAGE_USER set.
+     *
+     * The boot page tables (and thus the deep-copied user page tables) map
+     * the low 4 GB with U/S=0 (supervisor) huge pages. Without this fix,
+     * every user page the ELF loader maps in the low 4 GB — including
+     * /init's .text at 0x401000 — is unreachable from ring 3, and the very
+     * first instruction fetch in userspace page-faults. This was the root
+     * cause of the long-standing "/init crashes immediately after jumping
+     * to userspace" bug.
+     *
+     * Setting PAGE_USER on an intermediate entry only makes the walk
+     * traversable by user mode; it does NOT grant access to the kernel
+     * pages it contains — those still have U/S=0 on their LEAF PTEs, so
+     * user access to them still faults. */
+    int is_user = (flags & PAGE_USER) != 0;
+
     uintptr_t* pml4_virt = pml4;
     if (!(pml4_virt[pml4_idx] & PAGE_PRESENT)) {
         phys_addr_t pdpt_phys = pmm_alloc_page();
@@ -187,6 +208,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
         memset((void*)pdpt_phys, 0, PAGE_SIZE);
         pml4_virt[pml4_idx] = pdpt_phys | table_flags | PAGE_PRESENT;
     }
+    if (is_user) pml4_virt[pml4_idx] |= PAGE_USER;
     uintptr_t* pdpt = (uintptr_t*)(pml4_virt[pml4_idx] & PTE_PHYS_MASK);
 
     if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
@@ -195,10 +217,11 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
         memset((void*)pd_phys, 0, PAGE_SIZE);
         pdpt[pdpt_idx] = pd_phys | table_flags | PAGE_PRESENT;
     }
+    if (is_user) pdpt[pdpt_idx] |= PAGE_USER;
 
     /* Check for 1GB huge page at PDPT level — cannot split, bail */
     if (pdpt[pdpt_idx] & PAGE_HUGE) {
-        pr_warn("elf: cannot map 0x%x — 1GB huge page in the way\n", (unsigned)vaddr);
+        pr_warn("elf: cannot map 0x%lx — 1GB huge page in the way\n", (unsigned long)vaddr);
         return;
     }
 
@@ -211,6 +234,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
     if (pd[pd_idx] & PAGE_HUGE) {
         uint64_t* pt = split_2mb_huge_page(pd, pd_idx, pd[pd_idx]);
         if (!pt) return;
+        if (is_user) pd[pd_idx] |= PAGE_USER;   /* KE-25: make PD entry user-traversable */
         pt[pt_idx] = phys | flags | PAGE_PRESENT;
         return;
     }
@@ -221,6 +245,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
         memset((void*)pt_phys, 0, PAGE_SIZE);
         pd[pd_idx] = pt_phys | table_flags | PAGE_PRESENT;
     }
+    if (is_user) pd[pd_idx] |= PAGE_USER;       /* KE-25: make PD entry user-traversable */
     uintptr_t* pt = (uintptr_t*)(pd[pd_idx] & PTE_PHYS_MASK);
 
     pt[pt_idx] = phys | flags | PAGE_PRESENT;

@@ -10,6 +10,11 @@
 
 extern struct security_status g_security;
 
+/* KE-25: Runtime SMAP-enabled flag. Declared extern in <lestra/types.h> and
+ * read on every stac()/clac() call. stac/clac are #UD unless CR4.SMAP=1, so
+ * we keep this 0 until gdt_init() successfully flips CR4.SMAP. */
+uint8_t g_smap_enabled = 0;
+
 /* GDT entries:
  * 0: Null descriptor
  * 1: Kernel code segment (64-bit)
@@ -162,6 +167,7 @@ void gdt_init(void) {
     if (cpu_has_smap()) {
         cr4 |= (1UL << 21);
         g_security.smap = 1;
+        g_smap_enabled = 1;     /* KE-25: arm stac()/clac() — they #UD unless CR4.SMAP=1 */
     }
     write_cr4(cr4);
 

@@ -676,14 +676,39 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
     current = &procs[pid - 1];
     current->state = PROC_RUNNING;
 
-    sched_enable();
+    /* KE-25: Preemption is intentionally NOT enabled here yet. The timer
+     * IRQ → sched_tick → schedule() → context_switch path currently
+     * triple-faults on the first preemption of PID 1 (the context-switch
+     * assembly corrupts the saved userspace frame / kernel stack).
+     * Running PID 1 cooperatively (no preemption) lets /init execute
+     * real syscalls — write() prints its banner, execve() can replace
+     * the image — proving the userspace + fd-table path works end to
+     * end. Re-enabling preemption is the next milestone (see worklog). */
+    /* sched_enable(); */
 
-    pr_info("sched: starting first process '%s' (pid %d)\n", name, pid);
+    pr_info("sched: starting first process '%s' (pid %d) [cooperative]\n", name, pid);
 
     uint64_t old_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
     __asm__ volatile("mov %0, %%cr3" : : "r"((uint64_t)current->pml4));
     save_kernel_cr3 = old_cr3;
+
+    /* KE-25: arm TSS.RSP0 with PID 1's kernel stack BEFORE jumping to
+     * ring 3. The first timer IRQ in userspace loads RSP from tss.rsp0;
+     * if it's 0/stale the CPU can't push the interrupt frame and
+     * triple-faults. elf_exec did this; sched_start_first must too.
+     *
+     * We use a static 16 KB BSS stack (like elf_exec) for PID 1 instead
+     * of the kmalloc'd current->kernel_stack: the kmalloc'd heap address
+     * caused the first timer IRQ to triple-fault (the heap block header
+     * misalignment / non-16-aligned RSP0 corrupts the interrupt frame
+     * push). The static buffer is 16-byte aligned and in the identity-
+     * mapped BSS, so the CPU can reliably push the IRQ frame. */
+    static uint8_t pid1_kstack[16384] __aligned(16);
+    current->kernel_stack = pid1_kstack;
+    current->kernel_stack_top = (uint64_t)pid1_kstack + sizeof(pid1_kstack);
+    extern void tss_set_rsp0(uint64_t);
+    tss_set_rsp0(current->kernel_stack_top);
 
     elf_jump_to_user(current->entry_point, current->user_stack_ptr,
                      (uintptr_t)current->pml4);

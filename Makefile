@@ -32,7 +32,7 @@ AS := nasm
 # Detect GRUB i386-pc modules directory so grub-mkrescue can find
 # boot.img, eltorito.img, etc. Without this, grub-mkrescue silently
 # produces a non-bootable ISO (no El Torito boot record).
-GRUB_MODULES_DIR ?= $(shell for d in /usr/lib/grub/i386-pc /usr/lib/grub2/i386-pc $(HOME)/opt/cross/lib/grub/i386-pc /usr/local/lib/grub/i386-pc /home/z/.local/qemu-prefix/usr/lib/grub/i386-pc ; do \
+GRUB_MODULES_DIR ?= $(shell for d in /usr/lib/grub/i386-pc /usr/lib/grub2/i386-pc $(HOME)/opt/cross/lib/grub/i386-pc /usr/local/lib/grub/i386-pc /home/z/.local/qemu-prefix/usr/lib/grub/i386-pc $(HOME)/.local/opt/devtools/usr/lib/grub/i386-pc ; do \
 	if [ -f "$$d/boot.img" ]; then echo $$d; break; fi; \
 done)
 
@@ -400,7 +400,7 @@ run-cloud: all
 
 smoke: all
 	@echo "  Running cloud-mode smoke test (30s)..."
-	@timeout 30 qemu-system-x86_64 -L /home/z/.local/qemu-prefix/usr/share/qemu \
+	@timeout 30 qemu-system-x86_64 -L $(HOME)/.local/opt/devtools/usr/share/qemu \
 		 -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64 \
 		 -nographic -boot d -no-reboot \
 		 -serial stdio -monitor none \
@@ -408,6 +408,7 @@ smoke: all
 		 -name "Lestra OS [smoke]" > /tmp/lestra-smoke.log 2>&1 || true
 	@echo "  Smoke log: /tmp/lestra-smoke.log"
 	@grep -q "kernel initialized successfully" /tmp/lestra-smoke.log && echo "  PASS: kernel reached init" || echo "  FAIL: kernel did not reach init"
+	@grep -q "lestramk.org - Lightweight" /tmp/lestra-smoke.log && echo "  PASS: userspace /init banner printed" || echo "  WARN: /init banner not seen"
 
 run-debug: all
 	@echo "  Starting QEMU with GDB server..."
