@@ -8,6 +8,7 @@
 #include <lestra/irq.h>
 #include <lestra/idt.h>
 #include <lestra/printk.h>
+#include <lestra/entropy.h>
 
 /* Keyboard ports */
 #define KB_DATA_PORT    0x60
@@ -86,7 +87,10 @@ static const char e0_scancode_to_ascii[] = {
 static void keyboard_irq_handler(struct interrupt_frame* frame) {
     (void)frame;
 
+    /* KE-16: Feed keyboard event timing into entropy pool */
     uint8_t scancode = inb(KB_DATA_PORT);
+    uint64_t now = rdtsc();
+    entropy_mix_irq(1, now);
 
     /* Notify the input subsystem (GUI hook) of ALL scancodes, including
      * modifier keys and release events. This must happen BEFORE the

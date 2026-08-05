@@ -32,6 +32,7 @@
 #include <lestra/idt.h>
 #include <lestra/printk.h>
 #include <lestra/fb.h>
+#include <lestra/entropy.h>
 
 /* ----- PS/2 controller I/O ports ----- */
 #define PS2_DATA_PORT    0x60   /* Data port (read/write) */
@@ -154,7 +155,10 @@ static int      mouse_pkt_idx = 0;  /* Current byte index in packet */
 static void mouse_irq_handler(struct interrupt_frame* frame) {
     (void)frame;
 
+    /* KE-16: Feed mouse packet event timing into entropy pool */
     uint8_t data = inb(PS2_DATA_PORT);
+    uint64_t now = rdtsc();
+    entropy_mix_irq(12, now);
 
     /* Synchronization: the first byte of a 3-byte packet must have
      * bit 3 set. If we're at byte 0 and bit 3 is clear, we lost

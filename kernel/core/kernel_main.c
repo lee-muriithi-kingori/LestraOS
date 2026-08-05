@@ -440,6 +440,7 @@ void kernel_main(void* mb2_info) {
             g_security.canaries ? "ENABLED" : "DISABLED");
     pr_info("  kptr_restrict:  %d\n", g_security.kptr_restrict);
     pr_info("  KASLR-lite:     ENABLED (heap+%d bits, TSC-early)\n", 8);
+    pr_info("  Entropy pool:   ACTIVE (16 slots, IRQ-mixed: timer/KB/mouse)\n");
     pr_info("======================\n");
 
     sti();

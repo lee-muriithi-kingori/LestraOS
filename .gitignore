@@ -27,3 +27,6 @@ secrets/
 # Logs (keep boot logs in logs/ for proof, ignore runtime debug)
 *.log
 !logs/*.log
+build/
+iso/
+logs/

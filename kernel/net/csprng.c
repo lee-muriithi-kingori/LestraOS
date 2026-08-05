@@ -81,19 +81,44 @@ static int initialized = 0;
 #define RESEED_BYTES  (1024 * 1024)
 #define RESEED_MS     60000
 
+/* KE-16: Added RDSEED + interrupt-mixed fast entropy pool.
+ * RDSEED (NIST SP 800-90B) provides true hardware entropy on
+ * Broadwell+ / Excavator+ CPUs. XOR into existing RDRAND
+ * data. CPUID-gated — no-op on CPUs that lack it.
+ * Fast pool: 16-slot lock-free XOR accumulator fed by timer/keyboard/mouse
+ * IRQs. Drained into DRBG reseed via entropy_drain(). */
+#include <lestra/entropy.h>
+
 static int collect_entropy(uint8_t out[48]) {
     uint32_t buf[12];
     int have_hw = 0;
+
+    /* Primary: RDRAND (12 × 32 bits = 384 bits hardware entropy) */
     for (int i = 0; i < 12; i++) {
         if (rdrand32(&buf[i])) have_hw++;
     }
-    if (have_hw < 6) {
-        uint64_t tsc = rdtsc();
-        uint64_t ms = timer_get_ms();
-        uint32_t sp = (uint32_t)(uintptr_t)&tsc;
-        for (int i = 0; i < 12; i++) {
-            buf[i] ^= (uint32_t)(tsc >> (i*5)) ^ (uint32_t)(ms << i) ^ sp ^ (i * 0x61C88647);
+
+    /* Secondary: RDSEED — true hardware entropy per NIST SP 800-90B.
+     * XOR into first 6 slots (192 bits) to supplement RDRAND.
+     * CPUID-gated: no-op on CPUs that lack it. */
+    if (cpu_has_rdseed()) {
+        uint32_t seed;
+        for (int i = 0; i < 6; i++) {
+            if (rdseed32(&seed)) buf[i] ^= seed;
         }
+    }
+
+    /* Tertiary: interrupt-mixed fast entropy pool.
+     * Timer IRQ (1 kHz) provides TSC jitter between fires — real hardware
+     * timing entropy. Keyboard/mouse IRQs provide event timing.
+     * Folded into 48 bytes via entropy_drain() and XOR-mixed with
+     * RDRAND/RDSEED data. */
+    uint8_t pool_bytes[48];
+    entropy_drain(pool_bytes, 48);
+    for (int i = 0; i < 12; i++)
+        buf[i] ^= ((uint32_t*)pool_bytes)[i];
+
+    if (have_hw < 6) {
         /* INSECURE: TSC-only entropy is predictable in deterministic VMs.
          * Do NOT use cloud/SSH mode as production without real RDRAND
          * or an interrupt-mixed entropy pool. */
@@ -102,6 +127,11 @@ static int collect_entropy(uint8_t out[48]) {
             printk("csprng: WARNING — RDRAND unavailable, using INSECURE TSC fallback\n");
             warned = 1;
         }
+        uint64_t tsc = rdtsc();
+        uint64_t ms = timer_get_ms();
+        uint32_t sp = (uint32_t)(uintptr_t)&tsc;
+        for (int i = 0; i < 12; i++)
+            buf[i] ^= (uint32_t)(tsc >> (i*5)) ^ (uint32_t)(ms << i) ^ sp ^ (i * 0x61C88647);
     }
     memcpy(out, buf, 48);
     return have_hw >= 6;

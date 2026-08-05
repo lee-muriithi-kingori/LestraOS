@@ -10,6 +10,7 @@
 #include <lestra/irq.h>
 #include <lestra/idt.h>
 #include <lestra/printk.h>
+#include <lestra/entropy.h>
 
 static volatile uint64_t ticks = 0;
 static uint32_t frequency = 0;
@@ -18,6 +19,16 @@ static void (*tick_handler)(void) = NULL;
 static void timer_irq_handler(struct interrupt_frame* frame) {
     (void)frame;
     ticks++;
+
+    /* KE-16: Feed TSC jitter into interrupt-mixed entropy pool.
+     * The TSC delta between timer fires contains real hardware
+     * timing entropy on real hardware (±microsecond jitter from
+     * interrupt latency). On QEMU the jitter is near-zero but still
+     * adds mixing diversity with the keyboard/mouse pool feeds. */
+    static uint64_t last_tsc = 0;
+    uint64_t now = rdtsc();
+    entropy_mix_irq(0, now - last_tsc);
+    last_tsc = now;
 
     if (tick_handler) {
         tick_handler();
