@@ -44,6 +44,18 @@ elf_jump_to_user:
     ; CS = 0x1B (USER_CS | RPL3 = 0x18 | 3)
     ; SS = 0x23 (USER_DS | RPL3 = 0x20 | 3)
 
+    ; KE-25: The pushes below are SUPERVISOR writes to the USER stack (a
+    ; user page). Under SMAP (CR4.SMAP=1) these would #PF with AC clear.
+    ; stac() sets AC so the supervisor may write the iret frame to the
+    ; user stack; clac() clears it before iretq (after iretq we are in
+    ; ring 3 where SMAP does not apply).
+    extern g_smap_enabled
+    mov rax, [g_smap_enabled]
+    test rax, rax
+    jz .no_stac
+    stac
+.no_stac:
+
     mov rsp, r14            ; switch to user stack
 
     ; Push SS (user data segment with RPL=3)
@@ -65,6 +77,13 @@ elf_jump_to_user:
 
     ; Push RIP (user entry point)
     push r15
+
+    ; Clear AC before leaving supervisor mode (ring 3 ignores SMAP).
+    mov rax, [g_smap_enabled]
+    test rax, rax
+    jz .no_clac
+    clac
+.no_clac:
 
     ; Set up segment registers for user mode
     mov ax, 0x23            ; USER_DS | RPL3
@@ -94,6 +113,7 @@ elf_jump_to_user:
     ; Jump to userspace!
     ; IRETQ pops RIP, CS, RFLAGS, RSP, SS from the stack and switches
     ; to the privilege level specified in CS (RPL=3 = user mode).
+
     iretq
 
 section .data
