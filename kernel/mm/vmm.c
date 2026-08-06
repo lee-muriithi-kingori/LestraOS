@@ -158,8 +158,28 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
      * With COW, the old physical page may be shared by other processes.
      * We only free it if this was the last PTE reference (refcount
      * drops to 0 after decrement). Otherwise, other processes still
-     * reference it and we must not free it. */
-    if (pt[pt_idx] & PAGE_PRESENT) {
+     * reference it and we must not free it.
+     *
+     * KE-35 CRITICAL FIX: Only free the old page if the old PTE had
+     * PAGE_USER set. When vmm_map_page splits a 2MB huge page (above),
+     * the new PT is filled with kernel identity-mapping PTEs (PAGE_USER
+     * clear) that point at the physical pages of the 2MB region. Some
+     * of those physical pages are the process's OWN page-table pages
+     * (PML4/PDPT/PD/PT) allocated by pmm — e.g. a child's PDPT at phys
+     * 0x436000 falls inside the 0x400000-0x600000 2MB region. If we
+     * "free" such a PTE's physical page when remapping it for a user
+     * page, pmm_free_page clears the bitmap bit for the child's PT page,
+     * and a later pmm_alloc_page returns it as "free" — the subsequent
+     * memset/memcpy overwrites the child's page tables, zeroing pd[0]
+     * (kernel text mapping) and triple-faulting on context_switch.
+     *
+     * Kernel identity-mapped PTEs (from the split) do NOT "own" the
+     * physical pages they describe — those pages belong to whoever
+     * pmm_alloc_page'd them (the kernel, the page-table allocator, or
+     * nobody for boot memory). Freeing them here is always wrong. Only
+     * user-allocated pages (PAGE_USER set, refcount-tracked) should be
+     * freed when their last PTE reference is replaced. */
+    if ((pt[pt_idx] & PAGE_PRESENT) && (pt[pt_idx] & PAGE_USER)) {
         phys_addr_t old_phys = pt[pt_idx] & PTE_PHYS_MASK;
         /* Decrement refcount of the old physical page. Only free if
          * no other PTEs reference it (refcount drops to 0). */

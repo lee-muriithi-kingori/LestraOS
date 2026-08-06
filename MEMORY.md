@@ -1405,3 +1405,86 @@ corruption.** Possible approaches:
 - kernel/include/lestra/mm.h: pmm_mark_used declaration
 - user/Makefile: FORK_TEST=1 support
 - user/init/init.c: updated comments, INIT_FORK_TEST guard
+
+## KE-35: PMM bitmap corruption root cause + context_switch ISR-swap fix
+
+### Root cause identified and fixed
+The KE-33 "PMM bitmap corruption cascade" was NOT caused by the bitmap
+being allocated and zeroed (the KE-33 hardcoded safety net already
+prevented that). The TRUE root cause was in `vmm_map_page()` (vmm.c):
+
+**The bug**: When `vmm_map_page()` splits a 2MB huge page (e.g. for the
+0x400000-0x600000 region containing init's user code), the new PT is
+filled with 512 kernel identity-mapping PTEs (PAGE_USER clear) pointing
+at the physical pages of the 2MB region. Some of those physical pages
+are the process's OWN page-table pages (PML4/PDPT/PD/PT) allocated by
+pmm — e.g. a child's PDPT at phys 0x436000 falls inside 0x400000-0x600000.
+
+When `vmm_map_page()` then maps a user page at a vaddr that overlaps one
+of these kernel PTEs, it finds the old PTE "present" and calls
+`pmm_refcount_dec(old_phys)` + `pmm_free_page(old_phys)`. This CLEARS
+the bitmap bit for the child's PT page. A later `pmm_alloc_page()` then
+returns that PT page as "free", and the caller's `memset`/`memcpy`
+overwrites the child's page tables — zeroing `pd[0]` (kernel text
+mapping) and triple-faulting on context_switch to the child.
+
+**The fix** (vmm.c): Only free the old physical page if the old PTE had
+`PAGE_USER` set. Kernel identity-mapped PTEs (from the split) do NOT
+"own" the physical pages they describe — those pages belong to whoever
+`pmm_alloc_page`'d them. Freeing them was always wrong.
+
+### Additional fixes in KE-35
+1. **pmm.c dynamic protection**: Replaced the KE-33 hardcoded safety net
+   (0x100000-0x382000) with dynamic protection. `pmm_init()` now records
+   the EXACT physical ranges of the kernel image, bitmap, and refcount
+   array. `pmm_alloc_page()`/`pmm_alloc_pages()` reject any allocation
+   falling within them via `pmm_is_protected()`. This is robust
+   regardless of kernel size.
+
+2. **context_switch.asm ISR-swap mode**: Removed the callee-saved
+   register restoration (rbx/rbp/r12-r15/rax) from ISR-swap mode. In
+   ISR-swap mode, the child's GPRs are written to the ISR frame, and
+   `isr_common`'s pop-all + iretq restores them. Restoring callee-saved
+   regs here CLOBBERED the kernel's own callee-saved registers (which
+   `schedule()` and the timer ISR handler rely on). The bug manifested
+   as an SMAP #PF: context_switch restored rbx from
+   `child->saved_state->rbx` (= a USER address like 0x402e60), and
+   `schedule()` then dereferenced rbx as a process pointer → SMAP fault.
+
+### Verification (FORK_TEST=1, -cpu max, SMEP+SMAP)
+- fork() syscall SUCCEEDS: 327 pages deep-copied, child PID 2 allocated
+- Child's pd[0] = 0xe3 (kernel text mapping INTACT — no longer zeroed!)
+- No PMM bitmap corruption (collision check never triggers)
+- No SMAP fault on context_switch return (callee-saved regs preserved)
+- Default boot (no FORK_TEST): unchanged, reaches "Starting Lestra Shell..."
+
+### Remaining issue (KE-36): #GP during context_switch ISR-swap `ret`
+After the KE-35 fixes, the triple-fault is GONE and the child's page
+tables are intact. But context_switch's `ret` (ISR-swap mode) pops a
+corrupted return address (0xf000ff53f000ff53 — non-canonical → #GP).
+The return address at RSP=0x1eb740 (init's kernel stack) was overwritten
+by an unknown mechanism. context_switch does NOT write to that stack
+location (it writes to the ISR frame at 0x1eb7a0+, which is ABOVE the
+return address). The C handler stack frame (interrupt_dispatch → timer
+handler → schedule) sits between the ISR frame and the return address.
+
+**KE-36 next steps**: Investigate what overwrites the return address.
+Possible approaches:
+- Add a C helper called from context_switch.asm right before `ret` to
+  dump [rsp] (the return address) and surrounding stack bytes.
+- Check if the CR3 switch causes a TLB/stack aliasing issue.
+- Verify the child's pd[1] (0x200000-0x400000, kernel BSS + child_kstack)
+  is intact — if it's zeroed, reads from child->saved_state would return
+  garbage, but that would #PF not #GP.
+- Consider whether the static child_kstack buffer (KE-34 TODO) interacts
+  badly with the ISR-swap stack layout.
+
+### Files changed (KE-35)
+- kernel/mm/vmm.c: KE-35 fix — only free user pages (PAGE_USER set),
+  never kernel identity-mapped PTEs from huge-page splits
+- kernel/mm/pmm.c: dynamic pmm_is_protected() replacing hardcoded range;
+  pmm_alloc_pages() also protected; protected-ranges boot diagnostic
+- kernel/sched/context_switch.asm: ISR-swap mode no longer restores
+  callee-saved regs (prevents SMAP fault on kernel return)
+- kernel/sched/scheduler.c: KE-35 collision safety net in deep_copy
+  (detects if pmm returns child's PML4 page — should never trigger now)

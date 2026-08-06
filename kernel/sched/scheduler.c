@@ -234,6 +234,16 @@ static void deep_copy_user_pages(struct process* parent, struct process* child) 
                             new_phys = 0;
                             continue;
                         }
+                        /* KE-35 DIAG: detect if pmm returns the child's
+                         * own PML4 or current PDPT/PD page — that would
+                         * mean the bitmap lost track of it. */
+                        if (new_phys == (phys_addr_t)(uintptr_t)child->pml4) {
+                            pr_err("KE-35: pmm returned child PML4 (0x%x) as user copy! bitmap corrupt.\n",
+                                   (unsigned)new_phys);
+                            pmm_mark_used(new_phys);
+                            new_phys = 0;
+                            continue;
+                        }
                         break;
                     }
                     if (!new_phys) {
@@ -262,7 +272,6 @@ static void deep_copy_user_pages(struct process* parent, struct process* child) 
 
     pr_info("fork: copied %d user pages\n", pages_copied);
     pages_copied_last = pages_copied;
-
 
     /* Switch back to parent's CR3 and flush TLB */
     write_cr3(saved_cr3);

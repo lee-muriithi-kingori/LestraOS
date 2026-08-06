@@ -297,22 +297,24 @@ context_switch:
     mov     edx, [r11 + CS_FSBASE + 4]
     wrmsr
 
-    ;; Restore callee-saved regs from new_state (r11).
-    ;; Order matters: read all values BEFORE overwriting the
-    ;; register that holds the new_state pointer.
-    ;; r11 holds new_state. We must NOT overwrite r11 until last.
-    ;; The callee-saved regs are: rbx, rbp, r12, r13, r14, r15.
-    ;; r11 is caller-saved, so isr_common will restore it from the
-    ;; ISR frame (which we just wrote). We don't need to restore r11.
-    mov     rbx, [r11 + CS_RBX]
-    mov     rbp, [r11 + CS_RBP]
-    mov     r12, [r11 + CS_R12]
-    mov     r13, [r11 + CS_R13]
-    mov     r14, [r11 + CS_R14]
-    mov     r15, [r11 + CS_R15]
-
-    ;; rax is the syscall return value. Restore it too.
-    mov     rax, [r11 + CS_RAX]
+    ;; KE-35 FIX: Do NOT restore callee-saved regs (rbx/rbp/r12-r15) or
+    ;; rax from new_state here. In ISR-swap mode, we already wrote the
+    ;; child's GPRs into the ISR frame (above), and isr_common will pop
+    ;; them during iretq. Restoring them here would CLOBBER the kernel's
+    ;; own callee-saved registers — which schedule() and the timer ISR
+    ;; handler (compiled C code) rely on after context_switch returns.
+    ;;
+    ;; The bug manifested as: context_switch restored rbx from
+    ;; child->saved_state->rbx (= g_syscall_user_rbx = a USER address
+    ;; like 0x402e60). When context_switch returned to schedule(), the
+    ;; C code dereferenced rbx as a process pointer → SMAP #PF on the
+    ;; user address → panic.
+    ;;
+    ;; The callee-saved regs must stay as the KERNEL's values (whatever
+    ;; gcc's code had in them before calling context_switch) until
+    ;; isr_common's pop-all-GPRs sequence replaces them with the child's
+    ;; values just before iretq. rax is caller-saved, so gcc already
+    ;; saved it if needed; we must not overwrite the kernel's rax either.
 
     ;; Return to interrupt_dispatch -> isr_common.
     ;; isr_common will pop all 15 GPRs (now the new process's values)
