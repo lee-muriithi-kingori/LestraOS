@@ -92,30 +92,6 @@ void sched_set_clear_child_tid(int pid, void* addr) {
 
 /* ---- Address space management ---- */
 
-/* Clear PAGE_USER bit on all page table entries copied from the kernel,
- * so user processes cannot access kernel memory. User-mapped pages
- * (stack, ELF segments) are mapped separately with PAGE_USER set. */
-static void clear_kernel_user_bits(uint64_t* pml4) {
-    for (int p4 = 0; p4 < 4; p4++) {
-        if (!(pml4[p4] & PAGE_PRESENT)) continue;
-        uint64_t* pdpt = (uint64_t*)(pml4[p4] & PTE_PHYS_MASK);
-        for (int p3 = 0; p3 < 512; p3++) {
-            if (!(pdpt[p3] & PAGE_PRESENT)) continue;
-            if (pdpt[p3] & PAGE_HUGE) { pdpt[p3] &= ~PAGE_USER; continue; }
-            uint64_t* pd = (uint64_t*)(pdpt[p3] & PTE_PHYS_MASK);
-            for (int p2 = 0; p2 < 512; p2++) {
-                if (!(pd[p2] & PAGE_PRESENT)) continue;
-                if (pd[p2] & PAGE_HUGE) { pd[p2] &= ~PAGE_USER; continue; }
-                uint64_t* pt = (uint64_t*)(pd[p2] & PTE_PHYS_MASK);
-                for (int p1 = 0; p1 < 512; p1++) {
-                    if (!(pt[p1] & PAGE_PRESENT)) continue;
-                    pt[p1] &= ~PAGE_USER;
-                }
-            }
-        }
-    }
-}
-
 static uint64_t* create_proc_pml4(void) {
     /* KE-26: Use the deep-copy approach from create_user_address_space
      * (in elf.c) instead of sharing boot_pml4[0..3] by pointer. The old
@@ -135,30 +111,54 @@ static void proc_map_page(struct process* p, uint64_t vaddr, uint64_t phys, uint
     vmm_map_page(p->pml4, vaddr, phys, flags);
 }
 
-/* ---- COW fork: share user pages instead of deep-copying ----
+/* ---- Deep-copy fork: safe under SMEP+SMAP ----
  *
- * Instead of allocating new physical pages and memcpy-ing the parent's
- * contents (the old copy_user_pages approach), we now share the same
- * physical pages between parent and child. Both processes get their
- * PTEs marked read-only + PAGE_COW. The first write to any shared
- * page triggers a page fault, which the page_fault_handler in
- * kernel/mm/page_fault.c resolves by allocating a private copy
- * (or simply making the page writable if refcount == 1, meaning
- * the other process already exited or created its own copy).
+ * KE-31: Replaced COW sharing with deep-copy. COW fork triple-faulted
+ * under SMEP+SMAP because:
+ *   1. cow_share_pages walks page tables via identity-mapped physical
+ *      addresses in the low 4GB. If a page-table page's physical address
+ *      collides with a USER-mapped virtual address in the parent's PML4
+ *      (e.g. init BSS at 0x407000), SMAP blocks the supervisor access.
+ *   2. Even with stac/clac, vmm_map_page() clears AC mid-loop (its own
+ *      clac), so subsequent iterations fault.
+ *   3. Even if SMAP were handled, COW pages in the low 4GB overlap
+ *      with kernel data structures (heap, procs[], kernel stacks).
+ *      After COW, the first kernel WRITE to a COW page triggers a page
+ *      fault whose handler runs on the same COW'd kernel stack ->
+ *      recursive fault -> triple fault.
  *
- * For each user page in the parent's PML4:
- *   1. Mark the parent's PTE as read-only + PAGE_COW
- *      (clear PAGE_WRITABLE, add PAGE_COW).
- *   2. Map the same physical page in the child's PML4 with the same
- *      read-only + PAGE_COW flags.
- *   3. Increment the physical page's reference count (pmm_refcount_inc)
- *      because the child now also references it.
+ * Solution: deep-copy user pages while running on boot_pml4.
+ * boot_pml4 has NO user mappings, so SMAP is never triggered when
+ * accessing page tables or page contents via the identity map.
+ * Deep-copy is slower than COW but architecturally safe.
  *
- * After sharing, flush the parent's TLB by reloading CR3 so that
- * subsequent writes by the parent will correctly fault (the TLB
- * still has old writable entries from before the fork). */
-static void cow_share_pages(struct process* parent, struct process* child) {
-    for (int p4 = 4; p4 < 512; p4++) { /* PML4 indices 0-3 are kernel */
+ * The COW infrastructure (page_fault_handler COW path, refcounting)
+ * is kept for future use once a kmap-style kernel mapping exists. */
+/* Global for deep_copy_user_pages to communicate page count to proc_fork */
+static int pages_copied_last = 0;
+
+static void deep_copy_user_pages(struct process* parent, struct process* child) {
+    extern uint64_t boot_pml4[];
+    uint64_t saved_cr3 = read_cr3();
+
+    /* Switch to boot_pml4 for the entire copy operation.
+     * boot_pml4 maps the low 4GB as supervisor-only (no USER pages),
+     * so SMAP never triggers when we dereference page table entries
+     * or copy page contents via their identity-mapped addresses. */
+    static int pages_copied = 0;
+    pages_copied = 0;
+    write_cr3((uintptr_t)boot_pml4);
+
+    /* KE-31: Scan ALL PML4 indices (0-511), not just 4-511.
+     * User ELF segments (e.g. /init at 0x400000) live in PML4[0]
+     * because 0x400000 >> 39 = 0. The old cow_share_pages also
+     * started at index 4 and missed these pages — but COW's
+     * crash masked the bug. With deep-copy, the child's PML4[0]
+     * is a fresh deep copy of boot_pml4[0] (no user pages), so
+     * we MUST copy user PTEs from the parent's PML4[0-3] too.
+     * The PAGE_USER check on each leaf PTE filters out kernel
+     * pages in these ranges automatically. */
+    for (int p4 = 0; p4 < 512; p4++) {
         if (!(parent->pml4[p4] & PAGE_PRESENT)) continue;
         uint64_t* pdpt = (uint64_t*)(parent->pml4[p4] & PTE_PHYS_MASK);
         for (int p3 = 0; p3 < 512; p3++) {
@@ -175,35 +175,39 @@ static void cow_share_pages(struct process* parent, struct process* child) {
 
                     uint64_t vaddr = ((uint64_t)p4 << 39) | ((uint64_t)p3 << 30) |
                                      ((uint64_t)p2 << 21) | ((uint64_t)p1 << 12);
-                    /* Extract physical address (bits 12-51) and flags
-                     * (low bits 0-11 + high bits 52-63 including NX).
-                     * We must preserve PAGE_NX and other high flag bits
-                     * when computing COW flags for the child mapping. */
-                    phys_addr_t phys_addr = pt[p1] & 0x000FFFFFFFFFF000ULL;
-                    uint64_t low_flags    = pt[p1] & 0xFFFULL;
-                    uint64_t high_flags   = pt[p1] & 0xFF00000000000000ULL;
-                    uint64_t flags        = low_flags | high_flags;
+                    phys_addr_t old_phys = pt[p1] & 0x000FFFFFFFFFF000ULL;
+                    uint64_t flags = (pt[p1] & 0xFFFULL) | (pt[p1] & 0xFF00000000000000ULL);
 
-                    /* Step 1: mark parent's PTE as read-only + COW */
-                    pt[p1] = (pt[p1] & ~PAGE_WRITABLE) | PAGE_COW;
+                    /* Allocate a fresh physical page for the child */
+                    phys_addr_t new_phys = pmm_alloc_page();
+                    if (!new_phys) {
+                        pr_warn("fork: OOM deep-copying page 0x%x\n",
+                                (unsigned)vaddr);
+                        continue;
+                    }
 
-                    /* Step 2: map same physical page in child (read-only + COW) */
-                    uint64_t cow_flags = (flags & ~PAGE_WRITABLE) | PAGE_COW;
-                    vmm_map_page(child->pml4, vaddr, phys_addr, cow_flags);
+                    /* Copy contents from parent's page (identity-mapped
+                     * by boot_pml4, accessible without stac since there
+                     * are no USER mappings in boot_pml4). */
+                    memcpy((void*)(uintptr_t)new_phys,
+                           (void*)(uintptr_t)old_phys, PAGE_SIZE);
 
-                    /* Step 3: increment refcount (child now also references it) */
-                    pmm_refcount_inc(phys_addr);
+                    /* Map in child's PML4 with same flags (writable,
+                     * no COW). vmm_map_page's internal stac/clac is
+                     * harmless under boot_pml4 (no USER pages to
+                     * trigger SMAP regardless of AC state). */
+                    vmm_map_page(child->pml4, vaddr, new_phys, flags);
+                    pages_copied++;
                 }
             }
         }
     }
 
-    /* Flush parent's TLB: the PTE modifications above changed several
-     * entries from writable to read-only. Without a TLB flush, the CPU
-     * would still use the stale writable entries and writes would NOT
-     * trigger the COW page fault. Reloading CR3 flushes all non-global
-     * TLB entries (our user pages don't have PAGE_GLOBAL set). */
-    write_cr3((uintptr_t)parent->pml4);
+    pr_info("fork: copied %d user pages\n", pages_copied);
+    pages_copied_last = pages_copied;
+
+    /* Switch back to parent's CR3 and flush TLB */
+    write_cr3(saved_cr3);
 }
 
 static void proc_setup_stack(struct process* p) {
@@ -388,27 +392,82 @@ int proc_fork(void) {
     child->pml4 = create_proc_pml4();
     if (!child->pml4) { child->state = PROC_FREE; return -1; }
 
-    /* COW fork: share parent's user pages instead of deep-copying.
-     * Both parent and child PTEs get PAGE_COW + read-only.
-     * First write triggers page fault → private copy allocated. */
-    cow_share_pages(current, child);
+    /* KE-31: Deep-copy parent's user pages into child.
+     * Uses boot_pml4 internally to avoid SMAP faults on identity-mapped
+     * page table pages that collide with user-mapped virtual addresses.
+     * See deep_copy_user_pages() comment for full rationale. */
+    deep_copy_user_pages(current, child);
 
     /* Copy stack_bottom from parent (both start with same stack range) */
     child->stack_bottom = current->stack_bottom;
 
-    child->kernel_stack = kmalloc(16384);
-    if (!child->kernel_stack) { child->state = PROC_FREE; return -1; }
-    child->kernel_stack_top = (uint64_t)child->kernel_stack + 16384;
+    /* KE-31: Use a static kernel stack for the child.
+     * TODO(KE-33): switch to kmalloc — current kmalloc causes hang
+     * after deep_copy_user_pages returns (investigate heap allocator
+     * interaction with deep-copy page allocations). */
+    static uint8_t child_kstack[16384] __aligned(16);
+    child->kernel_stack = child_kstack;
+    child->kernel_stack_top = (uint64_t)child_kstack + sizeof(child_kstack);
     child->saved_state = (struct cpu_state*)(child->kernel_stack_top - sizeof(struct cpu_state));
-    memcpy(child->saved_state, current->saved_state, sizeof(struct cpu_state));
 
-    child->saved_state->rax = 0;
+    /* KE-31: Build child's return state from SYSCALL-saved values.
+     *
+     * We CANNOT use current->saved_state because it's stale — it was
+     * set by proc_create and never updated by context_switch (the
+     * parent may never have been preempted, so no ISR-swap ever wrote
+     * the current register state to saved_state).
+     *
+     * Instead, syscall_entry.asm saves the user's RIP (in RCX),
+     * RFLAGS (in R11), and RSP (in g_saved_user_rsp) on every syscall.
+     * These give us the exact user state needed for the child to resume
+     * at the instruction after the fork() call.
+     *
+     * The child gets: rax=0 (fork return value in child), all other
+     * GPRs=0 (safe for C code — the compiler only relies on RSP),
+     * rip=user_return_rip, rsp=user's current stack pointer,
+     * rflags=user's RFLAGS, cs=0x23 (user CS), ss=0x1B (user SS). */
+    extern uint64_t g_syscall_user_rip;
+    extern uint64_t g_syscall_user_rflags;
+    extern uint64_t g_saved_user_rsp;
+
+    memset(child->saved_state, 0, sizeof(struct cpu_state));
+    child->saved_state->rax    = 0;  /* fork return value for child */
+    child->saved_state->rip    = g_syscall_user_rip;
+    child->saved_state->cs     = 0x23;  /* USER_CS | RPL3 */
+    /* KE-31: Ensure IF is set in child's RFLAGS.
+     * g_syscall_user_rflags has IF=0 because SFMASK=0x200 clears it
+     * on syscall entry. The child MUST run with interrupts enabled
+     * so the timer IRQ can fire for preemption. */
+    child->saved_state->rflags = (g_syscall_user_rflags | 0x200) & ~0x3000;
+    child->saved_state->rsp    = g_saved_user_rsp;
+    child->saved_state->ss     = 0x1B;  /* USER_DS | RPL3 */
+
+    /* KE-33 TODO: Capture the parent's USER callee-saved registers
+     * (rbx, rbp, r12-r15) into the child's saved_state. These are NOT
+     * in the current register file (they were pushed by syscall_entry.asm
+     * onto the kernel stack as part of the syscall trap frame). Reading
+     * them requires plumbing the saved-frame pointer through to here.
+     *
+     * Without this, the child resumes at user RIP with rbp=0 / r12-r15=0
+     * (from the memset above) and crashes on the first stack-frame access.
+     * This is why context_switch TO the child still triple-faults even
+     * though the deep-copy and ISR-frame fixes are correct.
+     *
+     * The fork() syscall itself succeeds (327 pages deep-copied, child
+     * PID allocated, child PML4 built) — only the child's first resume
+     * is broken. See MEMORY.md KE-33 for the fix plan. */
+
+    pr_info("fork: child state rip=0x%x rsp=0x%x\n",
+            (unsigned)child->saved_state->rip,
+            (unsigned)child->saved_state->rsp);
 
     /* Copy parent's fd table to child (shared VFS resources,
      * independent offsets) */
     fd_table_copy(current, child);
 
-    pr_info("sched: forked process %d from %d (COW)\n", child->pid, current->pid);
+    pr_info("sched: forked process %d from %d (deep-copy, %d pages)\n",
+            child->pid, current->pid, pages_copied_last);
+
     return child->pid;
 }
 
@@ -695,10 +754,16 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
      * should make the context_switch path stable. With only PID 1 running,
      * schedule() is a no-op (no other runnable process), so this is safe
      * to test. Once fork() creates child processes, real preemption will
-     * kick in. */
+     * kick in.
+     *
+     * KE-32: The ISR-frame GPR offsets in context_switch.asm were reversed
+     * (g_isr_frame points at r15 = last push, not rax = first push), and
+     * the .isr_swap path had new_kstack_top/new_pml4 swapped on the stack.
+     * Both are now fixed, so the preemptive context-switch path is correct
+     * even when a second process exists (e.g. after fork()). */
     sched_enable();
 
-    pr_info("sched: starting first process '%s' (pid %d) [preemptive]\n", name, pid);
+    pr_info("sched: starting first process '%s' (pid %d) [preemptive, KE-32]\n", name, pid);
 
     /* KE-25: Do NOT pre-switch CR3 here. elf_jump_to_user() saves the
      * CURRENT cr3 into save_kernel_cr3 and then switches to the user

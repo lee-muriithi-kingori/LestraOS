@@ -32,9 +32,13 @@ extern syscall_dispatch
 ; does not touch RSP).
 global g_syscall_kstack
 global g_saved_user_rsp
+global g_syscall_user_rip
+global g_syscall_user_rflags
 section .data
 g_syscall_kstack:    dq 0
 g_saved_user_rsp:    dq 0
+g_syscall_user_rip:    dq 0
+g_syscall_user_rflags: dq 0
 
 section .text
 syscall_entry:
@@ -44,7 +48,15 @@ syscall_entry:
     mov [g_saved_user_rsp], rsp     ; save user RSP
     mov rsp, [g_syscall_kstack]     ; load kernel stack top
 
-    ; Save user RIP (RCX) and RFLAGS (R11)
+    ; KE-31: Save user RIP (RCX) and RFLAGS (R11) to globals so
+    ; proc_fork() can build the child's return state. Without these,
+    ; fork's child would resume from stale saved_state (set by
+    ; proc_create and never updated by context_switch if the parent
+    ; was never preempted).
+    mov [g_syscall_user_rip], rcx
+    mov [g_syscall_user_rflags], r11
+
+    ; Save user RIP (RCX) and RFLAGS (R11) on stack (for syscall return)
     push rcx
     push r11
 

@@ -60,33 +60,52 @@ global context_switch
 %define CS_FSBASE 0xB0
 
 ; ISR frame offsets (from g_isr_frame)
-%define ISR_RAX    0x00
-%define ISR_RBX    0x08
-%define ISR_RCX    0x10
-%define ISR_RDX    0x18
-%define ISR_RSI    0x20
-%define ISR_RDI    0x28
-%define ISR_RBP    0x30
+;; ISR frame offsets (from g_isr_frame = RSP after all 15 GPRs pushed).
+;; isr_common pushes rax FIRST (highest address) and r15 LAST (lowest,
+;; i.e. at g_isr_frame itself). So from g_isr_frame:
+;;   [0x00] r15 .. [0x70] rax  (15 GPRs, reversed from push order)
+;;   [0x78] vector_number  (pushed 2nd by ISR stub)
+;;   [0x80] error_code     (pushed 1st by ISR stub)
+;;   [0x88] rip .. [0xA8] ss  (CPU interrupt frame)
+;;
+;; struct cpu_state layout (sched.h):
+;;   [0x00] rax .. [0x70] r15  (push order, NOT stack order)
+;;   [0x78] int_no  [0x80] err_code
+;;   [0x88] rip .. [0xA8] ss  [0xB0] fs_base
+;;
+;; KE-32 BUGFIX: The original KE-30/31 offsets assumed g_isr_frame
+;; pointed to rax (first push), but it actually points to r15 (last
+;; push). All 15 GPR offsets were reversed. This was never caught
+;; before because with only one process, the ISR-swap path never
+;; executed (schedule() was a no-op). With fork() creating a
+;; second process, the swap finally ran and the reversed GPRs
+;; caused an immediate triple fault. */
+%define ISR_R15    0x00
+%define ISR_R14    0x08
+%define ISR_R13    0x10
+%define ISR_R12    0x18
+%define ISR_R11    0x20
+%define ISR_R10    0x28
+%define ISR_R9     0x30
 %define ISR_R8     0x38
-%define ISR_R9     0x40
-%define ISR_R10    0x48
-%define ISR_R11    0x50
-%define ISR_R12    0x58
-%define ISR_R13    0x60
-%define ISR_R14    0x68
-%define ISR_R15    0x70
-%define ISR_INTNO  0x80
-%define ISR_ERR    0x88
-%define ISR_RIP    0x90
-%define ISR_CS     0x98
-%define ISR_RFLAGS 0xA0
-%define ISR_RSP    0xA8
-%define ISR_SS     0xB0
+%define ISR_RBP    0x40
+%define ISR_RDI    0x48
+%define ISR_RSI    0x50
+%define ISR_RDX    0x58
+%define ISR_RCX    0x60
+%define ISR_RBX    0x68
+%define ISR_RAX    0x70
+%define ISR_VECTOR 0x78
+%define ISR_ERR    0x80
+%define ISR_RIP    0x88
+%define ISR_CS     0x90
+%define ISR_RFLAGS 0x98
+%define ISR_RSP    0xA0
+%define ISR_SS     0xA8
 
 extern g_isr_frame
 extern g_syscall_kstack
 extern tss
-
 section .text
 
 context_switch:
@@ -230,8 +249,12 @@ context_switch:
     ;; =============================================
 .isr_swap:
     ;; Pop saved args (still on stack below our pushes)
-    mov     r9,  [rsp + 8]             ; new_kstack_top
-    mov     r10, [rsp]                 ; new_pml4
+    ;; KE-32 BUGFIX: rdx (new_pml4) was pushed first → [rsp+8],
+    ;; rcx (new_kstack_top) pushed second → [rsp].
+    ;; Original KE-31 had these swapped, causing CR3 to be loaded
+    ;; with the kernel stack address (instant triple-fault).
+    mov     r9,  [rsp]                 ; r9  = new_kstack_top
+    mov     r10, [rsp + 8]             ; r10 = new_pml4
 
     ;; Write new process's GPRs into ISR frame
     mov     rax, [r11 + CS_RAX];   mov [r8 + ISR_RAX], rax
@@ -257,15 +280,15 @@ context_switch:
     mov     rax, [r11 + CS_RSP];  mov [r8 + ISR_RSP], rax
     mov     rax, [r11 + CS_SS];   mov [r8 + ISR_SS], rax
 
-    ;; Switch CR3
+    ;; Switch CR3 to new process's page table
     mov     rax, cr3
     cmp     rax, r10
     je      .isr_cr3_ok
-    mov     cr3, r10
+    mov     cr3, r10                   ; r10 = new_pml4
 .isr_cr3_ok:
 
-    ;; Update TSS.RSP0 and g_syscall_kstack
-    mov     [tss + 4], r9
+    ;; Update TSS.RSP0 and g_syscall_kstack for new process
+    mov     [tss + 4], r9              ; r9 = new_kstack_top
     mov     [g_syscall_kstack], r9
 
     ;; Restore FS base
