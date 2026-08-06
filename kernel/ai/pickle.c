@@ -40,13 +40,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>   /* munmap for mmap-backed models */
 #define pr_info   printf
 #define kmalloc   malloc
 #define kfree     free
 #define kmemset   memset
 #define kmemcpy   memcpy
 #endif
+#ifdef PICKLE_KERNEL
 #include <lestra/pickle.h>
+#else
+#include "pickle.h"
+#endif
 
 /* ================================================================== */
 /* Default allocator                                                  */
@@ -147,9 +152,12 @@ static uint32_t f16_to_f32_bits(uint16_t h) {
     if (exp == 0) {
         if (mant == 0) f = sign;
         else {
-            mant <<= 1;
+            /* Subnormal: normalise. The f16 subnormal exponent is
+             * effectively 1 (giving 2^(1-15) = 2^(-14)). Shift the
+             * mantissa left until the hidden bit (0x0400) is set,
+             * decrementing the exponent for each shift. */
+            exp = 1;
             while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
-            exp += 1;
             mant &= 0x03FF;
             f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
         }
@@ -205,6 +213,20 @@ struct pickle_model {
     pickle_kv_t*   kv;
     pickle_tensor_info_t* tensors;
     uint32_t       alignment;
+    /* On-demand dequant support: when loaded via pickle_load_meta(),
+     * io and data_section_start are stored so individual tensors can
+     * be dequantized later via pickle_dequant_tensor(). For full
+     * pickle_load(), io remains NULL (all tensors already dequantized). */
+    pickle_io_t*   io;
+    int64_t        data_section_start;
+#ifndef PICKLE_KERNEL
+    /* mmap backend (host only): when non-NULL, every tensor's data pointer
+     * points into this mmap region and must NOT be individually freed.
+     * pickle_free() will munmap() the whole region instead of calling
+     * pfree() on each tensor. Set by pickle_attach_mmap(). */
+    void*  mmap_base;
+    size_t mmap_size;
+#endif
 };
 
 /* ================================================================== */
@@ -260,7 +282,15 @@ static int parse_metadata_value(pickle_io_t* io, uint32_t type, pickle_kv_t* kv)
     }
 }
 
-int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
+/* Parse GGUF header + metadata + tensor table. Does NOT read or
+ * dequantize tensor data. Stores io + data_section_start in the model
+ * for later use by pickle_dequant_tensor().
+ *
+ * This is the fast path for `pickle info` and `pickle dequant <tensor>`
+ * — loading only metadata from a 638MB Q4_K_M model takes milliseconds
+ * instead of hours (full dequant of every tensor with the software-float
+ * layer is O(billions of F32 ops)). */
+int pickle_load_meta(pickle_io_t* io, pickle_model_t** out_model) {
     if (!io || !out_model) return PICKLE_ERR_ARG;
     if (!g_alloc.alloc) pickle_set_alloc(0);
 
@@ -269,6 +299,8 @@ int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
 
     pickle_model_t* m = (pickle_model_t*)palloc(sizeof(pickle_model_t));
     if (!m) return PICKLE_ERR_MEMORY;
+    m->io = NULL;
+    m->data_section_start = 0;
     m->version = read_u32(io);
     if (m->version != 3 && m->version != 2) {
         pfree(m, sizeof(*m));
@@ -332,31 +364,151 @@ int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
         }
     }
 
-    for (uint64_t i = 0; i < m->tensor_count; i++) {
-        pickle_tensor_info_t* t = &m->tensors[i];
-        io->seek(io->ctx, data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
-        size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
-        bytes = (bytes + 15u) & ~15u;
-        t->data = palloc(bytes);
-        if (!t->data) return PICKLE_ERR_MEMORY;
-        int rc = pickle_dequant_stream(io, t->type, t->n_elements, (float*)t->data);
-        if (rc != PICKLE_OK) {
-            pr_info("pickle: dequant failed for tensor %s (type %u): rc=%d\n",
-                    t->name, t->type, rc);
-            return rc;
-        }
-    }
+    /* Store io + data_section_start for on-demand dequant. The caller
+     * must keep the io (and its underlying FILE*) alive until
+     * pickle_free() is called. */
+    m->io = io;
+    m->data_section_start = data_section_start;
 
     *out_model = m;
     return PICKLE_OK;
 }
 
+/* Dequantize a single tensor on demand. The model must have been loaded
+ * via pickle_load_meta() (which stores the io). The tensor's dequantized
+ * F32 data is stored in t->data (allocated here). If already dequantized,
+ * this is a no-op. */
+int pickle_dequant_tensor(pickle_model_t* m, size_t idx) {
+    if (!m || idx >= m->tensor_count) return PICKLE_ERR_ARG;
+    pickle_tensor_info_t* t = &m->tensors[idx];
+    if (t->data) return PICKLE_OK;  /* already loaded (mmap, raw, or dequant) */
+    if (!m->io) return PICKLE_ERR_ARG;  /* no io to read from */
+
+    m->io->seek(m->io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
+    size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
+    bytes = (bytes + 15u) & ~15u;
+    t->data = palloc(bytes);
+    if (!t->data) return PICKLE_ERR_MEMORY;
+    int rc = pickle_dequant_stream(m->io, t->type, t->n_elements, (float*)t->data);
+    if (rc != PICKLE_OK) {
+        pr_info("pickle: dequant failed for tensor %s (type %u): rc=%d\n",
+                t->name, t->type, rc);
+        pfree(t->data, bytes);
+        t->data = 0;
+    }
+    return rc;
+}
+
+/* Load a tensor's raw on-disk bytes into t->data WITHOUT dequantizing.
+ * Used by the fast-path inference engine: the quantized matmul kernels
+ * (pickle_fast_matmul_q4_k etc.) read the raw Q4_K/Q6_K/... byte buffer
+ * directly and dequantize block-by-block inside the dot product, which
+ * is far more cache-friendly than materialising the full F32 weight
+ * matrix. For F32 and F16 tensors, the raw bytes ARE the native format
+ * the fast-path matmul expects.
+ *
+ * No-op if t->data is already non-NULL (whether from a previous raw
+ * load or a full dequant). */
+int pickle_load_tensor_raw(pickle_model_t* m, size_t idx) {
+    if (!m || idx >= m->tensor_count) return PICKLE_ERR_ARG;
+    pickle_tensor_info_t* t = &m->tensors[idx];
+    if (t->data) return PICKLE_OK;  /* already loaded (mmap, raw, or dequant) */
+    if (!m->io) return PICKLE_ERR_ARG;  /* no io to read from */
+
+    m->io->seek(m->io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
+    size_t bytes = t->data_size;
+    bytes = (bytes + 15u) & ~15u;
+    t->data = palloc(bytes);
+    if (!t->data) return PICKLE_ERR_MEMORY;
+    if (io_read(m->io, t->data, t->data_size)) {
+        pr_info("pickle: raw load failed for tensor %s: io error\n", t->name);
+        pfree(t->data, bytes);
+        t->data = 0;
+        return PICKLE_ERR_IO;
+    }
+    return PICKLE_OK;
+}
+
+#ifndef PICKLE_KERNEL
+/* Attach an mmap'd file region to a meta-loaded model. Patches every
+ * tensor's data pointer to point directly into the mmap at the correct
+ * offset (zero-copy: no malloc, no fread). Stores the mmap base/size so
+ * pickle_free() can munmap() the region.
+ *
+ * After this call the model no longer needs its io (pickle_free won't
+ * touch it — the caller is responsible for closing/freeing the io).
+ *
+ * This is the preferred load path for host inference: instant startup
+ * (no multi-second fread of 600+ MB), zero copy, and the OS page cache
+ * manages demand paging. Use pickle_load_from_file_mmap() in the host
+ * shim which does the mmap + meta parse + attach in one call. */
+int pickle_attach_mmap(pickle_model_t* m, void* mmap_base, size_t mmap_size) {
+    if (!m || !mmap_base || mmap_size == 0) return PICKLE_ERR_ARG;
+    m->mmap_base = mmap_base;
+    m->mmap_size = mmap_size;
+    /* Patch every tensor's data pointer into the mmap. The data_offset
+     * field (set by pickle_load_meta) is the byte offset of the tensor's
+     * data within the GGUF data section; data_section_start is where the
+     * data section begins in the file. */
+    unsigned char* base = (unsigned char*)mmap_base;
+    for (uint64_t i = 0; i < m->tensor_count; i++) {
+        pickle_tensor_info_t* t = &m->tensors[i];
+        t->data = base + m->data_section_start + (size_t)t->data_offset;
+    }
+    /* Detach the io — the caller owns it and will close/free it. */
+    m->io = NULL;
+    return PICKLE_OK;
+}
+#endif
+
+int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
+    int rc = pickle_load_meta(io, out_model);
+    if (rc != PICKLE_OK) return rc;
+    pickle_model_t* m = *out_model;
+
+    /* Full load: dequantize all tensors now. io is NOT retained (caller
+     * can close it after this returns). */
+    pickle_io_t* saved_io = m->io;
+    m->io = NULL;  /* detach so pickle_free won't touch it */
+
+    for (uint64_t i = 0; i < m->tensor_count; i++) {
+        pickle_tensor_info_t* t = &m->tensors[i];
+        saved_io->seek(saved_io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
+        size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
+        bytes = (bytes + 15u) & ~15u;
+        t->data = palloc(bytes);
+        if (!t->data) return PICKLE_ERR_MEMORY;
+        int drc = pickle_dequant_stream(saved_io, t->type, t->n_elements, (float*)t->data);
+        if (drc != PICKLE_OK) {
+            pr_info("pickle: dequant failed for tensor %s (type %u): rc=%d\n",
+                    t->name, t->type, drc);
+            return drc;
+        }
+    }
+
+    return PICKLE_OK;
+}
+
 void pickle_free(pickle_model_t* m) {
     if (!m) return;
+#ifndef PICKLE_KERNEL
+    if (m->mmap_base) {
+        /* mmap'd model: all tensor data pointers point into the mmap.
+         * Don't pfree them individually — just munmap the whole region. */
+        munmap(m->mmap_base, m->mmap_size);
+        m->mmap_base = NULL;
+    } else {
+        for (uint64_t i = 0; i < m->tensor_count; i++) {
+            if (m->tensors[i].data) pfree(m->tensors[i].data,
+                                          (size_t)m->tensors[i].n_elements * sizeof(sfp_t));
+        }
+    }
+#else
     for (uint64_t i = 0; i < m->tensor_count; i++) {
         if (m->tensors[i].data) pfree(m->tensors[i].data,
                                       (size_t)m->tensors[i].n_elements * sizeof(sfp_t));
     }
+#endif
     pfree(m->tensors, (size_t)m->tensor_count * sizeof(pickle_tensor_info_t));
     for (uint64_t i = 0; i < m->kv_count; i++) {
         if (m->kv[i].key) pfree(m->kv[i].key, strlen(m->kv[i].key) + 1);
@@ -364,6 +516,17 @@ void pickle_free(pickle_model_t* m) {
             pfree(m->kv[i].v.str, strlen(m->kv[i].v.str) + 1);
     }
     pfree(m->kv, (size_t)m->kv_count * sizeof(pickle_kv_t));
+    /* If the model owns an io (from pickle_load_meta), close + free it. */
+    if (m->io) {
+        if (m->io->close) m->io->close(m->io->ctx);
+        /* The io struct itself was heap-allocated by the host shim
+         * (pickle_load_from_file_meta). Free it with the C library free()
+         * since it was allocated with calloc, not the pickle allocator. */
+#ifndef PICKLE_KERNEL
+        free(m->io);
+#endif
+        m->io = NULL;
+    }
     pfree(m, sizeof(*m));
 }
 
@@ -431,6 +594,39 @@ sfp_t pickle_meta_float_bits(const pickle_model_t* m, const char* key, sfp_t def
         if (m->kv[i].type == GGUF_FLOAT32) return m->kv[i].v.f32_bits;
     }
     return def_bits;
+}
+
+/* Expose a GGUF_ARRAY metadata value as a read-only view. Returns
+ * PICKLE_OK and fills *out, or PICKLE_ERR_ARG if the key is absent or
+ * not an array. Used by the host BPE tokenizer (pickle_tokenizer.c)
+ * to read tokenizer.ggml.tokens / .scores / .token_type without
+ * needing access to pickle_kv_t (which is private to this file).
+ *
+ * Layout conventions:
+ *   - For numeric element types (UINT8/INT32/FLOAT32/etc.): out->data
+ *     points at the n*elem_sz raw bytes, out->n is the element count.
+ *   - For GGUF_STRING: out->data points at a (char**) array of n
+ *     NUL-terminated string pointers (each separately allocated by
+ *     the parser). out->n is the element count. Callers iterate
+ *     ((char**)out->data)[i].
+ */
+typedef struct {
+    uint32_t type;     /* GGUF value type of element */
+    uint64_t n;        /* element count */
+    const void* data;  /* raw bytes (numeric) or char** (string) */
+} pickle_array_view_t;
+
+int pickle_meta_array(const pickle_model_t* m, const char* key, pickle_array_view_t* out) {
+    if (!m || !key || !out) return PICKLE_ERR_ARG;
+    for (uint64_t i = 0; i < m->kv_count; i++) {
+        if (strcmp(m->kv[i].key, key) != 0) continue;
+        if (m->kv[i].type != GGUF_ARRAY) return PICKLE_ERR_ARG;
+        out->type = m->kv[i].v.arr.type;
+        out->n    = m->kv[i].v.arr.n;
+        out->data = m->kv[i].v.arr.data;
+        return PICKLE_OK;
+    }
+    return PICKLE_ERR_ARG;
 }
 
 /* ================================================================== */
@@ -575,7 +771,13 @@ int pickle_dequant_stream(pickle_io_t* io, uint32_t type, uint64_t n, float* out
  * Block sizes: Q2_K=84, Q3_K=110, Q4_K=144, Q5_K=176, Q6_K=210, Q8_K=292.
  * For the kernel self-test we always use F32. */
         case GGML_Q6_K: {
-            /* 210 bytes: ql[128] + qh[64] + scales[16] + d(f16,2) */
+            /* 210 bytes: ql[128] + qh[64] + scales[16] (int8) + d(f16,2)
+             * GGML non-interleaved packing (matches ggml-quants.c):
+             *   2 chunks of 128 elements. Within a chunk, 4 sub-blocks of 32 (sub=0..3):
+             *   ql[chunk*64 + (sub%2)*32 + l]: low nibble if sub in {0,1}, high if sub in {2,3}
+             *   qh[chunk*32 + l] bits [2*sub, 2*sub+1]: the high 2 bits
+             *   Scale: scales[i/16]
+             *   Formula: dq = d * scales[i/16] * (q - 32) */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
                 unsigned char ql[128], qh[64];
@@ -585,25 +787,28 @@ int pickle_dequant_stream(pickle_io_t* io, uint32_t type, uint64_t n, float* out
                 if (read_block(io, (unsigned char*)scales, 16)) return PICKLE_ERR_IO;
                 sfp_t d = read_f16_bits(io);
                 for (int i = 0; i < 256; i++) {
-                    int q = (ql[i/2] >> (4*(i & 1))) & 0x0F;
-                    int h;
-                    if (i < 128) {
-                        h = (qh[i/4] >> (2*(i & 3))) & 3;
-                    } else {
-                        int j = i - 128;
-                        h = (qh[32 + j/4] >> (2*(j & 3))) & 3;
-                    }
-                    q |= (h << 4);
-                    if (q & 0x20) q -= 64;
+                    int chunk  = i >> 7;
+                    int within = i & 127;
+                    int sub    = within >> 5;
+                    int l      = within & 31;
+                    int ql_byte = chunk*64 + (sub & 1)*32 + l;
+                    int q_lo = (ql[ql_byte] >> (4 * (sub >> 1))) & 0x0F;
+                    int qh_byte = chunk*32 + l;
+                    int q_hi = (qh[qh_byte] >> (2 * sub)) & 0x03;
+                    int q = q_lo | (q_hi << 4);
+                    q -= 32;
                     out[b*256 + i] = sfp_mul(d, sfp_mul(
-                        sfp_from_int((int32_t)q),
-                        sfp_from_int((int32_t)scales[i / 16])));
+                        sfp_from_int((int32_t)scales[i / 16]),
+                        sfp_from_int((int32_t)q)));
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q5_K: {
-            /* 176 bytes: d(f16,2) + dmin(f16,2) + sc(12) + qh(32) + qs(128) */
+            /* 176 bytes: d(f16,2) + dmin(f16,2) + scales[12] + qh[32] + qs[128]
+             * GGML non-interleaved: 4 chunks of 64. qs advances 32/chunk.
+             * qh is REUSED (not advanced) — each byte covers 8 elements at
+             * bit positions 2*chunk+half. */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
                 sfp_t d    = read_f16_bits(io);
@@ -612,32 +817,44 @@ int pickle_dequant_stream(pickle_io_t* io, uint32_t type, uint64_t n, float* out
                 if (read_block(io, sc, 12))     return PICKLE_ERR_IO;
                 if (read_block(io, qh, 32))     return PICKLE_ERR_IO;
                 if (read_block(io, qs, 128))    return PICKLE_ERR_IO;
-                int ks[8];
-                for (int i = 0; i < 8; i++) {
-                    int v = sc[i] & 0x3F;
-                    if (v & 0x20) v -= 64;
-                    ks[i] = v;
-                }
-                int mns[4];
-                for (int i = 0; i < 4; i++) {
-                    int v = sc[8 + i] & 0x3F;
-                    if (v & 0x20) v -= 64;
-                    mns[i] = v;
-                }
-                for (int i = 0; i < 256; i++) {
-                    int sub = i / 32;
-                    int lo = (qs[i/2] >> (4*(i & 1))) & 0x0F;
-                    int hi = (qh[i/8] >> (i % 8)) & 1;
-                    int qv = lo | (hi << 4);
-                    sfp_t sv = sfp_mul(d, sfp_from_int(ks[sub]));
-                    sfp_t mv = sfp_mul(dmin, sfp_from_int(mns[sub / 2]));
-                    out[b*256 + i] = sfp_sub(sfp_mul(sv, sfp_from_int(qv)), mv);
+                int is = 0;
+                const unsigned char* ql_p = qs;
+                uint8_t u1 = 1, u2 = 2;
+                for (int j = 0; j < 256; j += 64) {
+                    int sc0, m0, sc1, m1;
+                    if (is + 0 < 4) {
+                        sc0 = sc[is+0] & 0x3F; m0 = sc[is+0 + 4] & 0x3F;
+                    } else {
+                        sc0 = ((sc[is+0+4] & 0x0F) | ((sc[is+0-4] >> 6) << 4)) & 0x3F;
+                        m0 = ((sc[is+0+4] >>  4) | ((sc[is+0-0] >> 6) << 4)) & 0x3F;
+                    }
+                    if (is + 1 < 4) {
+                        sc1 = sc[is+1] & 0x3F; m1 = sc[is+1 + 4] & 0x3F;
+                    } else {
+                        sc1 = ((sc[is+1+4] & 0x0F) | ((sc[is+1-4] >> 6) << 4)) & 0x3F;
+                        m1 = ((sc[is+1+4] >>  4) | ((sc[is+1-0] >> 6) << 4)) & 0x3F;
+                    }
+                    sfp_t d1 = sfp_mul(d, sfp_from_int(sc0));
+                    sfp_t m1f = sfp_mul(dmin, sfp_from_int(m0));
+                    sfp_t d2 = sfp_mul(d, sfp_from_int(sc1));
+                    sfp_t m2f = sfp_mul(dmin, sfp_from_int(m1));
+                    for (int l = 0; l < 32; l++) {
+                        int q0 = (ql_p[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0);
+                        int q1 = (ql_p[l] >> 4)   + ((qh[l] & u2) ? 16 : 0);
+                        out[b*256 + j + l]      = sfp_sub(sfp_mul(d1, sfp_from_int(q0)), m1f);
+                        out[b*256 + j + l + 32] = sfp_sub(sfp_mul(d2, sfp_from_int(q1)), m2f);
+                    }
+                    ql_p += 32; is += 2;
+                    u1 <<= 2; u2 <<= 2;
                 }
             }
             return PICKLE_OK;
         }
         case GGML_Q4_K: {
-            /* 144 bytes: d(f16,2) + dmin(f16,2) + sc(12) + qs(128) */
+            /* 144 bytes: d(f16,2) + dmin(f16,2) + scales[12] + qs[128]
+             * GGML non-interleaved: 4 chunks of 64. qs advances 32/chunk.
+             * Within a chunk, qs[l] low nibble = elem chunk*64+l,
+             * high nibble = elem chunk*64+l+32. 8 scales via get_scale_min_k4. */
             uint64_t blocks = n / 256;
             for (uint64_t b = 0; b < blocks; b++) {
                 sfp_t d    = read_f16_bits(io);
@@ -645,22 +862,33 @@ int pickle_dequant_stream(pickle_io_t* io, uint32_t type, uint64_t n, float* out
                 unsigned char sc[12], qs[128];
                 if (read_block(io, sc, 12))     return PICKLE_ERR_IO;
                 if (read_block(io, qs, 128))    return PICKLE_ERR_IO;
-                int ks[8];
-                for (int i = 0; i < 8; i++) {
-                    int v = sc[i] & 0x3F;
-                    if (v & 0x20) v -= 64;
-                    ks[i] = v;
-                }
-                int mns[4];
-                for (int i = 0; i < 4; i++) {
-                    mns[i] = sc[8 + i] & 0x0F;
-                }
-                for (int i = 0; i < 256; i++) {
-                    int sub = i / 32;
-                    int qv = (qs[i/2] >> (4*(i & 1))) & 0x0F;
-                    sfp_t sv = sfp_mul(d, sfp_from_int(ks[sub]));
-                    sfp_t mv = sfp_mul(dmin, sfp_from_int(mns[sub / 2]));
-                    out[b*256 + i] = sfp_sub(sfp_mul(sv, sfp_from_int(qv)), mv);
+                int is = 0;
+                const unsigned char* q = qs;
+                for (int j = 0; j < 256; j += 64) {
+                    int sc0, m0, sc1, m1;
+                    if (is + 0 < 4) {
+                        sc0 = sc[is+0] & 0x3F; m0 = sc[is+0 + 4] & 0x3F;
+                    } else {
+                        sc0 = ((sc[is+0+4] & 0x0F) | ((sc[is+0-4] >> 6) << 4)) & 0x3F;
+                        m0 = ((sc[is+0+4] >>  4) | ((sc[is+0-0] >> 6) << 4)) & 0x3F;
+                    }
+                    if (is + 1 < 4) {
+                        sc1 = sc[is+1] & 0x3F; m1 = sc[is+1 + 4] & 0x3F;
+                    } else {
+                        sc1 = ((sc[is+1+4] & 0x0F) | ((sc[is+1-4] >> 6) << 4)) & 0x3F;
+                        m1 = ((sc[is+1+4] >>  4) | ((sc[is+1-0] >> 6) << 4)) & 0x3F;
+                    }
+                    sfp_t d1 = sfp_mul(d, sfp_from_int(sc0));
+                    sfp_t m1f = sfp_mul(dmin, sfp_from_int(m0));
+                    sfp_t d2 = sfp_mul(d, sfp_from_int(sc1));
+                    sfp_t m2f = sfp_mul(dmin, sfp_from_int(m1));
+                    for (int l = 0; l < 32; l++) {
+                        int q0 = q[l] & 0x0F;
+                        int q1 = q[l] >> 4;
+                        out[b*256 + j + l]      = sfp_sub(sfp_mul(d1, sfp_from_int(q0)), m1f);
+                        out[b*256 + j + l + 32] = sfp_sub(sfp_mul(d2, sfp_from_int(q1)), m2f);
+                    }
+                    q += 32; is += 2;
                 }
             }
             return PICKLE_OK;
@@ -781,9 +1009,15 @@ int pickle_arch_detect(const pickle_model_t* m, pickle_arch_t* arch) {
 
     int64_t vs = pickle_meta_int(m, "llama.vocab_size", -1);
     if (vs <= 0) {
+        /* Fallback: derive from token_embd.weight shape. In GGUF the
+         * embedding tensor is stored as [hidden_dim, vocab_size] with
+         * hidden_dim being ne[0] (the fast/contiguous dimension). So
+         * vocab_size is the LAST dim, not dims[0]. */
         int ti = pickle_tensor_find(m, "token_embd.weight");
         if (ti < 0) return PICKLE_ERR_ARCH;
-        vs = (int64_t)m->tensors[ti].dims[0];
+        uint32_t nd = m->tensors[ti].n_dims;
+        if (nd == 0) return PICKLE_ERR_ARCH;
+        vs = (int64_t)m->tensors[ti].dims[nd - 1];
     }
     arch->vocab_size = (int)vs;
 
@@ -1226,7 +1460,7 @@ int pickle_selftest(int32_t* out_token) {
     rc = pickle_kv_alloc(&arch, &kv);
     if (rc != PICKLE_OK) { pickle_free(m); return rc; }
 
-    int32_t prompt[3] = { 1, 5, 10 };
+    int32_t prompt[3] = { 1, 5, 3 };
     float* logits = (float*)palloc((size_t)arch.vocab_size * sizeof(sfp_t));
     if (!logits) { pickle_kv_free(&kv); pickle_free(m); return PICKLE_ERR_MEMORY; }
 

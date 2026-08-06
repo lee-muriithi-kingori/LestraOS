@@ -23,7 +23,11 @@
 #include <stdio.h>
 #define pr_info(...)  do {} while (0)
 #endif
+#ifdef PICKLE_KERNEL
 #include <lestra/pickle.h>
+#else
+#include "pickle.h"
+#endif
 
 /* ---- bit layout helpers ------------------------------------------- */
 #define SFP_SIGN_BITS  0x80000000u
@@ -198,18 +202,20 @@ sfp_t sfp_mul(sfp_t a, sfp_t b) {
     sfp_unpack(b, &sb, &eb, &mb);
     if (ma == 0 || mb == 0) return 0;
     int sign = sa ^ sb;
-    /* ma, mb in [2^23, 2^24). Product in [2^46, 2^48). */
+    /* ma, mb in [2^23, 2^24) (with hidden bit).
+     * Product in [2^46, 2^48).
+     * Result exponent: ea + eb - BIAS (before normalization adjustment). */
     uint64_t prod = (uint64_t)ma * (uint64_t)mb;
-    /* prod has 48 significant bits; we need 24. Shift right by 23. */
-    int eout = ea + eb - SFP_EXP_BIAS - SFP_MANT_BITS;
-    /* Normalize: prod should now be in [2^47, 2^48). */
-    while (prod < (1ULL << 47) && eout > 1) { prod <<= 1; eout--; }
-    while (prod >= (1ULL << 48)) { prod >>= 1; eout++; }
-    /* Keep top 24 bits (with hidden bit). Drop low 24. */
-    uint32_t mant = (uint32_t)(prod >> 24);
-    /* round-to-nearest-even with the dropped bits */
-    uint32_t rem = (uint32_t)(prod & 0x00FFFFFFu);
-    if (rem > 0x00800000u || (rem == 0x00800000u && (mant & 1))) {
+    int eout = ea + eb - SFP_EXP_BIAS;
+    /* Normalize: shift prod into [2^46, 2^47) so that after
+     * right-shifting by 23 we get the 24-bit mantissa (1 hidden + 23 explicit). */
+    while (prod < (1ULL << 46) && eout > 1) { prod <<= 1; eout--; }
+    while (prod >= (1ULL << 47)) { prod >>= 1; eout++; }
+    /* Extract 23-bit explicit mantissa (drop the hidden bit). */
+    uint32_t mant = (uint32_t)(prod >> 23);
+    /* round-to-nearest-even with the dropped 23 bits */
+    uint32_t rem = (uint32_t)(prod & 0x007FFFFFu);
+    if (rem > 0x00400000u || (rem == 0x00400000u && (mant & 1))) {
         mant++;
     }
     return sfp_pack(sign, eout, mant);

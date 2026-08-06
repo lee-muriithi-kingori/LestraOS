@@ -46,6 +46,12 @@ This is not a toy. It's a working OS.
 # Prerequisites (Ubuntu/Debian)
 sudo apt install build-essential nasm qemu-system-x86 grub-pc-bin xorriso
 
+# Clone with the lestramanika submodule (in-kernel AI engine)
+git clone --recurse-submodules https://github.com/lee-muriithi-kingori/LestraOS.git
+cd LestraOS
+# Already cloned? initialise the submodule:
+git submodule update --init --recursive
+
 # Build everything (kernel, libc, userspace, initrd, ISO)
 make all
 
@@ -61,6 +67,8 @@ make clean
 
 > **No sudo?** This repo's CI boots on a toolchain installed entirely in `~/.local` (NASM, QEMU, grub-mkrescue, xorriso all extracted from .debs without root). See [`docs/BUILD.md`](docs/BUILD.md).
 
+> **Submodules:** this repo vendors [`lestramanika`](https://github.com/lee-muriithi-kingori/lestramanika) — the from-scratch GGUF inference engine that powers the in-kernel AI selftest — at `third_party/lestramanika`. The kernel-compatible core is synced into `kernel/ai/` via `./scripts/sync_lestramanika.sh`. See [`docs/LESTRAMANIKA.md`](docs/LESTRAMANIKA.md) for the full integration guide.
+
 ## 📸 Boot Proof
 
 | Cloud/VPS boot (serial console) |
@@ -69,7 +77,7 @@ make clean
 
 Full serial log: [`logs/boot-cloud-mode-after-fix.log`](./logs/boot-cloud-mode-after-fix.log)
 
-The kernel initializes: GDT, IDT, PIC, PMM/VMM, heap, scheduler, syscalls, VFS + initrd, PIT timer, keyboard, package manager (110 packages), AI subsystem (7 tools), E1000 NIC + DHCP + IPv6, firewall, RTC, power management, thermal sensors, WiFi framework, cron daemon, service manager, sandbox subsystem — **then enters cloud mode, starts the SSH server, and acquires an IP via DHCP.** No crash. 🟢
+The kernel initializes: GDT, IDT, PIC, PMM/VMM, heap, scheduler, syscalls, VFS + initrd, PIT timer, keyboard, package manager (110 packages), AI subsystem (7 tools + in-kernel `pickle` GGUF selftest), E1000 NIC + DHCP + IPv6, firewall, RTC, power management, thermal sensors, WiFi framework, cron daemon, service manager, sandbox subsystem — **then enters cloud mode, starts the SSH server, and acquires an IP via DHCP.** No crash. 🟢
 
 ## 🧱 Architecture
 
@@ -92,7 +100,7 @@ The kernel initializes: GDT, IDT, PIC, PMM/VMM, heap, scheduler, syscalls, VFS +
 │  [VFS][ext2][initrd][procfs][devfs]                     │
 │  [CSPRNG][TLS 1.2][P-256 ECDH][AES-GCM][X.509][RSA]     │
 │  [SSH-2.0 server][HTTP mgmt API][compositor][UI themes] │
-│  [Package manager][AI agentic tools][sandbox][cron]      │
+│  [Package manager][AI agentic tools][pickle GGUF selftest][sandbox][cron] │
 ├─────────────────────────────────────────────────────────┤
 │  Hardware: CPU, RAM, Keyboard, Serial, PIT, NIC, RTC     │
 └─────────────────────────────────────────────────────────┘
@@ -115,13 +123,14 @@ LestraOS/
 │   ├── sys/          # SSH-2.0 server, service manager
 │   ├── gui/          # Framebuffer compositor (widgets, app grid, terminal)
 │   ├── ui/           # Cyberpunk text-mode UI (3 themes)
-│   ├── ai/           # Multi-provider AI with agentic tools
-│   └── include/      # Kernel headers
+│   ├── ai/           # Multi-provider AI + in-kernel pickle GGUF selftest
+│   └── include/      # Kernel headers (incl. lestra/pickle.h)
 ├── libc/           # Custom C library
 ├── user/           # Userspace (init, shell, sysinfo, bin/*)
+├── third_party/    # Submodules — lestramanika (GGUF inference engine)
 ├── installer/      # Host-side installer
-├── docs/           # Architecture, build, boot, AI, networking docs
-├── scripts/        # mkinitrd, mkext2, cross-compiler
+├── docs/           # Architecture, build, boot, AI, networking, LESTRAMANIKA.md
+├── scripts/        # mkinitrd, mkext2, cross-compiler, sync_lestramanika.sh
 ├── screenshots/    # Boot proof screenshots
 ├── logs/           # Captured boot logs
 └── Makefile
@@ -140,7 +149,7 @@ LestraOS/
 - [x] HTTP/HTTPS management API (/status, /metrics, /reboot, /shutdown)
 - [x] Cloud/VPS headless boot mode (serial console)
 - [x] Package manager (110 packages, 5 repos)
-- [x] AI subsystem (7 agentic tools, multi-provider)
+- [x] AI subsystem (7 agentic tools, multi-provider) + in-kernel `pickle` GGUF selftest (KE-28, synced from lestramanika `3e671ec`)
 - [x] CSPRNG with RDRAND + TSC fallback (CPUID-gated — see changelog)
 - [x] Cyberpunk UI (3 themes: cyan, amber, green)
 - [x] Framebuffer compositor
@@ -150,6 +159,44 @@ LestraOS/
 - [ ] Real package ELF execution runtime
 - [ ] USB host controller driver
 - [ ] WiFi driver (ath9k/rtl) — currently framework-only
+
+## 🧠 AI / lestramanika
+
+LestraOS ships a **from-scratch, in-kernel GGUF inference engine** called [`pickle`](https://github.com/lee-muriethi-kingori/lestramanika) — **no llama.cpp, no ollama, no ggml**. It is a separate repository ([lestramanika](https://github.com/lee-muriethi-kingori/lestramanika)) tracked here as a git submodule at `third_party/lestramanika`.
+
+### What runs in the kernel
+
+At boot, the kernel calls `pickle_selftest()` from `kernel/ai/ai.c`. This parses an embedded 4 KB demo GGUF (`kernel/ai/pickle_demo_gguf.c`) and runs one Llama-family forward pass — RMSNorm → GQA attention with RoPE → SwiGLU FFN → output projection → argmax — entirely through an **integer-only software float32 layer** (`kernel/ai/pickle_softfp.c`), because the kernel is built with `-mno-sse` and has no x87 init. The console prints:
+
+```
+pickle: selftest arch=llama L=1 H=2 HK=1 D=4 HD=8 VS=8
+pickle: selftest OK, next token = 6
+```
+
+This shipped as **KE-28** (commit `8d3300c`) and was the first from-scratch transformer forward pass to run inside a hobbyist x86_64 kernel.
+
+### What runs on the host
+
+The lestramanika repo also builds a **host fast path** (`pickle_fast.c`) that layers on top of the same core: native SSE/AVX/AVX-512 math, an `mmap` zero-copy loader, OpenMP-threaded quantized matmul with hand-tuned AVX-512 VNNI kernels for Q4_K / Q6_K, and a real Llama BPE tokenizer. On a 2-core AVX-512 VNNI host with TinyLlama-1.1B Q4_K_M (640 MB) it delivers **~11.5 tok/s decode (49% faster than the v0.3 baseline)** with instant `<0.1 s` startup. The host fast path is **not** built inside lestraOS (it needs POSIX + SSE + `mmap`) — build it from the submodule:
+
+```sh
+cd third_party/lestramanika && make
+./pickle selftest                              # embedded selftest
+./pickle infer model.gguf "hello" 20          # generate 20 tokens
+./pickle chat  model.gguf                     # interactive REPL
+./pickle bench model.gguf "prompt" 32         # tok/s report
+```
+
+### Keeping the kernel in sync
+
+The kernel-compatible core (4 files: `pickle.c`, `pickle_softfp.c`, `pickle.h`, `pickle_demo_gguf.c`) is vendored from the submodule into `kernel/ai/` + `kernel/include/lestra/`. The same source compiles both ways via a single `-DPICKLE_KERNEL` toggle — no glue, no `sed` rewriting. To sync after bumping the submodule:
+
+```sh
+./scripts/sync_lestramanika.sh            # vendor core into kernel/ai
+./scripts/sync_lestramanika.sh --check    # CI: exit 1 on drift
+```
+
+Full design, split, and version table: [`docs/LESTRAMANIKA.md`](docs/LESTRAMANIKA.md).
 
 ## 🤝 Contributing
 
@@ -176,6 +223,10 @@ Ideas, questions, bug reports that don't fit an issue, roadmap thoughts, cool ex
 
 > Dated, brief, honest. Newest first.
 
+- **6 Aug 2026** — 🧠 **lestramanika wired in as a git submodule + kernel/ai synced to `3e671ec`.** Added [`lestramanika`](https://github.com/lee-muriethi-kingori/lestramanika) (the from-scratch GGUF inference engine, no llama.cpp/ollama/ggml) as a git submodule at `third_party/lestramanika`, pinned to `3e671ec`. New `scripts/sync_lestramanika.sh` vendors the kernel-compatible core (pickle.c / pickle_softfp.c / pickle.h / pickle_demo_gguf.c) into `kernel/ai/` + `kernel/include/lestra/` verbatim — the lestramanika source now uses a conditional `#ifdef PICKLE_KERNEL` include for `pickle.h`, so the sync is a plain copy with no post-processing. Ran the sync: brought the in-kernel pickle up from the KE-28 vendoring to the latest core (adds metadata-only `pickle_load_meta`, on-demand `pickle_dequant_tensor`, raw `pickle_load_tensor_raw`, optional `io->close`, and the conditional include fix). Verified the synced sources compile cleanly under the kernel CFLAGS (`-mno-sse -mno-sse2 -ffreestanding -DPICKLE_KERNEL`); `pickle_selftest()` symbol and declaration unchanged, so the boot-time selftest still prints `next token = 6`. New `docs/LESTRAMANIKA.md` documents the kernel/host split, the submodule, the sync workflow, and the current version table. README updated with a Quick Start submodule step, an AI/lestramanika section, and the architecture diagram now shows `[pickle GGUF selftest]`. The host fast path (AVX-512 VNNI matmul, mmap zero-copy loader, BPE tokenizer, +49% decode) lives exclusively in the lestramanika repo and is built from the submodule.
+- **6 Aug 2026** — 🐛 **KE-36: return-address corruption diagnostics in context_switch ISR-swap.** Added diagnostics to the `context_switch` ISR-swap path to catch return-address corruption (the residue from the KE-33/KE-35 fork callee-saved plumbing work).
+- **5 Aug 2026** — 🐛 **KE-35: PMM bitmap corruption root cause + context_switch ISR-swap fix.**
+- **5 Aug 2026** — 🔧 **KE-33: fork callee-saved register plumbing + create_user_address_space boot_pml4 fix.** `proc_fork()` now receives the syscall trap-frame pointer so the child's `saved_state` carries the parent's user callee-saved registers (rbx/rbp/r12-r15), not the kernel's.
 - **5 Aug 2026** — ⚡ **KE-23: enable Local APIC + IOAPIC interrupt controller.** Replaced the legacy 8259 PIC with LAPIC+IOAPIC as the system interrupt controller. New `kernel/drivers/apic/` subsystem: `lapic.c` (xAPIC enable via IA32_APIC_BASE MSR, spurious vector 0xFF, LVT mask, EOI, IPI support), `ioapic.c` (24-entry redirection table, GSI routing with polarity/trigger from ACPI MADT IntSrcOverride), `apic.c` (orchestrator with PIC fallback). Updated `irq.c`: `register_irq_handler`/`irq_enable`/`irq_disable`/`pic_send_eoi` transparently switch between PIC and IOAPIC backends. ISA IRQs routed through IOAPIC using ACPI MADT mappings. Fixed missing `idt_reload()` after installing spurious vector gate (would #GP on first spurious APIC interrupt). Removed duplicate dead `acpi_init()` call. Unlocks MSI/MSI-X, USB XHCI, LAPIC timer, SMP. Boot-verified 2x: LAPIC id=0 at 0xFEE00000, IOAPIC 24 entries at 0xFEC00000, DHCP 10.0.2.15, all 7 security features active, zero faults.
 - **5 Aug 2026** — 🐛 **KE-22: UI bug squash + git hygiene + sti;hlt hang fix + ACPI table discovery + overlay wiring.** Fixed top bar slide-in animation inversion, editor Enter-key data loss, editor backspace-merge buffer overflow, task_sleep() hang (bare hlt with IF=0). Wired 8 dead overlay subsystems into compositor (right-click context menu, volume/brightness popups, keyboard shortcuts). Wired EV_MOUSE_SCROLL into terminal (256-line scrollback), editor, file_explorer. New kernel/acpi/ subsystem: RSDP discovery, RSDT/XSDT walking, FACP parser (SCI=9, PM1a_CNT=0x604), MADT parser (LAPIC=0xfee00000, IOAPIC=0xfec00000, 5 ISA overrides), HPET parser (base=0xfed00000, 2 comparators). acpi_isa_irq_to_gsi() API. Unlocks IOAPIC setup, HPET timer, USB XHCI interrupt routing. Fixed top bar slide-in animation inversion (bar was sliding OFF screen instead of ON — `bar_y = TB_MARGIN_TOP - TB_HEIGHT + tb_visible` now correctly starts above screen and slides down). Fixed editor.c Enter-key data loss bug (tail after cursor was dropped instead of moved to new line — now properly splits the line via `memcpy`). Fixed editor.c backspace-merge buffer overflow (`line_lens[prev_row]` was set to `prev_len + cur_len` with no clamp — now clamped to `MAX_LINE_LEN-1`, overflow chars dropped). Fixed `task_sleep()` hang: used bare `hlt()` but SYSCALL clears RFLAGS.IF (SFMASK=0x200), so `hlt` with IF=0 halts forever — replaced with `sti; hlt` idiom (sti has a one-instruction delay before interrupts are taken, eliminating the race). Wired 8 dead overlay subsystems into the compositor: lock_screen, power_menu, screenshot, clipboard, shortcuts, context_menu, brightness, volume_slider — all were fully implemented but never rendered or dispatched events. Added right-click desktop context menu, Ctrl+Alt+L (lock), Ctrl+Alt+P (power), Ctrl+Alt+B (brightness) shortcuts. Wired `EV_MOUSE_SCROLL` into terminal (256-line scrollback ring buffer), editor (scroll_row), file_explorer (list_scroll + scrollbar thumb). Git hygiene: stopped tracking 151 files (132 build .o files, iso/ outputs, logs/, qemu-data symlink, MEMORY.md/AUDIT_FIXES.md/WIRING_NOTES.md dev notes, scripts/smoke_cloud.sh + fix_smap_compat.py that leaked /home/z/ paths). Updated .gitignore to prevent re-tracking. Boot-verified: all 7 security features active, Intellimouse scroll wheel detected, zero faults.
 - **5 Aug 2026** — 🔐 **KE-21: SMAP-harden signals + wire Linux compat signals + futex + task_sleep.** Replaced all bare user-pointer dereferences in `signals.c` with SMAP-safe `access_ok` + `copy_from_user`/`copy_to_user` wrappers — the signal subsystem was the last major handler without SMAP protection (on real hardware with CR4.SMAP=1, any `sigaction()` call would triple-fault). Wired Linux compat layer (`LINUX_SYS_RT_SIGACTION/PROCMASK/RETURN/KILL`) to forward to the native signal implementation (were no-ops returning 0). Connected the orphaned `futex_dispatch()` (136-line hash-table + wait-queue implementation) to `sys_futex`, replacing the no-op stub — `FUTEX_WAIT` now actually blocks via `task_block()` and `FUTEX_WAKE` unblocks waiters. SMAP-fixed `futex.c` (replaced bare `*uaddr` with `get_user()`). Implemented real `task_sleep()` with timer-based wake deadlines via `wake_tick` field + `sched_check_wakeups()` — `poll()`/`select()` callers no longer busy-loop at 100% CPU. Fixed `task_block()` stuck-in-BLOCKED bug for single-process callers. GUI scroll wheel wired into compositor dispatch, editor, terminal, and file explorer.
