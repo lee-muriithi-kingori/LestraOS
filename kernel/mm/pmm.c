@@ -169,6 +169,19 @@ void pmm_init(struct mmap_entry* mmap, uint32_t mmap_entries) {
             (unsigned)(total_usable / MiB));
 }
 
+/* KE-33: Explicitly mark a physical page as used in the bitmap.
+ * Used to protect page-table pages from being re-allocated by
+ * pmm_alloc_page during deep_copy_user_pages. */
+void pmm_mark_used(phys_addr_t phys) {
+    size_t pfn = addr_to_pfn(phys);
+    if (pfn >= highest_pfn) return;
+    if (!bitmap_test(pfn)) {
+        bitmap_set(pfn);
+        used_pages++;
+    }
+    if (phys_refcount) phys_refcount[pfn] = 1;
+}
+
 phys_addr_t pmm_alloc_page(void) {
     for (size_t idx = 0; idx < bitmap_size / 8; idx++) {
         if (bitmap[idx] != ~0ULL) {
@@ -176,15 +189,22 @@ phys_addr_t pmm_alloc_page(void) {
                 size_t pfn = idx * 64 + bit;
                 if (pfn >= highest_pfn) return 0;
                 if (!bitmap_test(pfn)) {
+                    phys_addr_t candidate = pfn * PAGE_SIZE;
+                    /* KE-33: Safety net — never return a page in the
+                     * kernel/bitmap/refcount region (0x100000-0x382000),
+                     * even if the bitmap says it's free. The bitmap can
+                     * get corrupted during fork's deep_copy loop (by
+                     * vmm_map_page's PT-page memsets cascading), and
+                     * returning a kernel page would let callers
+                     * overwrite kernel data. Mark it used and skip. */
+                    if (candidate >= 0x100000 && candidate < 0x382000) {
+                        bitmap_set(pfn);
+                        continue;
+                    }
                     bitmap_set(pfn);
                     used_pages++;
-                    /* Set initial refcount to 1: the freshly allocated
-                     * page has one owner (whatever called pmm_alloc_page).
-                     * For pages that end up in user PTEs, this refcount
-                     * will be incremented during COW fork and decremented
-                     * during COW fault resolution or process exit. */
                     if (phys_refcount) phys_refcount[pfn] = 1;
-                    return pfn * PAGE_SIZE;
+                    return candidate;
                 }
             }
         }

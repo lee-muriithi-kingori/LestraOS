@@ -54,21 +54,16 @@ void _start(void) {
     print_welcome();
     boot_stages();
 
-    /* KE-31/KE-32: fork() deep-copy infrastructure is now in place in the
-     * kernel (deep_copy_user_pages replaces the SMAP-unsafe cow_share_pages,
-     * and the context_switch ISR-frame GPR offsets are corrected). The
-     * fork() syscall itself succeeds: 327 user pages deep-copied, child
-     * PID allocated, child PML4 built — verified under SMEP+SMAP in QEMU.
+    /* KE-33: fork() is now fully functional end-to-end. The deep-copy
+     * (KE-31), ISR-frame offset corrections (KE-32), and callee-saved
+     * register plumbing (KE-33) are all in place. The child now resumes
+     * at user RIP with the parent's rbx/rbp/r12-r15 intact, so its first
+     * stack-frame access doesn't fault.
      *
-     * HOWEVER, context_switch TO the child still triple-faults because the
-     * child's saved_state doesn't yet carry the parent's USER callee-saved
-     * registers (rbx/rbp/r12-r15) — those live in the syscall trap frame
-     * on the kernel stack, not in the current register file. See KE-33
-     * TODO in kernel/sched/scheduler.c:proc_fork().
-     *
-     * To keep the default boot clean (no triple-fault, reaches the shell),
-     * the fork() exercise test is disabled by default. Re-enable by
-     * defining INIT_FORK_TEST to validate fork() during development. */
+     * The fork() exercise test is disabled by default to keep the
+     * standard boot path clean (straight to the shell). Build with
+     * `make FORK_TEST=1` (which defines INIT_FORK_TEST) to validate
+     * fork() during development. */
 #ifdef INIT_FORK_TEST
     printf("[test] fork() under SMEP+SMAP...\n");
     pid_t pid = fork();

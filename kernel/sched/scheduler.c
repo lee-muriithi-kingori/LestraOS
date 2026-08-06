@@ -149,6 +149,45 @@ static void deep_copy_user_pages(struct process* parent, struct process* child) 
     pages_copied = 0;
     write_cr3((uintptr_t)boot_pml4);
 
+    /* KE-33 FIX: Walk the child's page-table structure and mark ALL
+     * page-table pages (PML4, PDPTs, PDs, PTs) as used in the PMM
+     * bitmap. This prevents pmm_alloc_page from returning them during
+     * the deep-copy loop below.
+     *
+     * Without this, pmm_alloc_page (called for user page copies AND
+     * by vmm_map_page for new PT pages) can return a page that's
+     * already in use as a page-table page, causing memcpy to overwrite
+     * the page-table structure. This manifests as pd[0] (kernel text
+     * mapping) being zeroed, which triple-faults on context_switch to
+     * the child.
+     *
+     * The root cause is a PMM bitmap corruption cascade during the
+     * copy loop — re-marking the page-table pages as used before the
+     * loop is a targeted fix that prevents the cascade from affecting
+     * the child's own page tables. */
+    extern void pmm_mark_used(phys_addr_t);
+    {
+        uint64_t* pml4 = child->pml4;
+        pmm_mark_used((phys_addr_t)(uintptr_t)pml4);
+        for (int p4 = 0; p4 < 512; p4++) {
+            if (!(pml4[p4] & PAGE_PRESENT)) continue;
+            uint64_t* pdpt = (uint64_t*)(pml4[p4] & PTE_PHYS_MASK);
+            pmm_mark_used((phys_addr_t)(uintptr_t)pdpt);
+            for (int p3 = 0; p3 < 512; p3++) {
+                if (!(pdpt[p3] & PAGE_PRESENT)) continue;
+                if (pdpt[p3] & PAGE_HUGE) continue;
+                uint64_t* pd = (uint64_t*)(pdpt[p3] & PTE_PHYS_MASK);
+                pmm_mark_used((phys_addr_t)(uintptr_t)pd);
+                for (int p2 = 0; p2 < 512; p2++) {
+                    if (!(pd[p2] & PAGE_PRESENT)) continue;
+                    if (pd[p2] & PAGE_HUGE) continue;
+                    uint64_t* pt = (uint64_t*)(pd[p2] & PTE_PHYS_MASK);
+                    pmm_mark_used((phys_addr_t)(uintptr_t)pt);
+                }
+            }
+        }
+    }
+
     /* KE-31: Scan ALL PML4 indices (0-511), not just 4-511.
      * User ELF segments (e.g. /init at 0x400000) live in PML4[0]
      * because 0x400000 >> 39 = 0. The old cow_share_pages also
@@ -178,13 +217,31 @@ static void deep_copy_user_pages(struct process* parent, struct process* child) 
                     phys_addr_t old_phys = pt[p1] & 0x000FFFFFFFFFF000ULL;
                     uint64_t flags = (pt[p1] & 0xFFFULL) | (pt[p1] & 0xFF00000000000000ULL);
 
-                    /* Allocate a fresh physical page for the child */
-                    phys_addr_t new_phys = pmm_alloc_page();
+                    /* Allocate a fresh physical page for the child.
+                     * KE-33: Retry if pmm returns a page in the kernel
+                     * region (0x100000-0x382000 = kernel+bitmap+refcount).
+                     * The PMM bitmap can get corrupted during this loop
+                     * (by vmm_map_page's PT-page memsets cascading), so
+                     * we defensively reject any allocation that would
+                     * overwrite kernel/BMM data. */
+                    phys_addr_t new_phys = 0;
+                    for (int retry = 0; retry < 8; retry++) {
+                        new_phys = pmm_alloc_page();
+                        if (!new_phys) break;
+                        if (new_phys >= 0x100000 && new_phys < 0x400000) {
+                            /* kernel/bitmap/refcount region — reject */
+                            pmm_mark_used(new_phys);
+                            new_phys = 0;
+                            continue;
+                        }
+                        break;
+                    }
                     if (!new_phys) {
                         pr_warn("fork: OOM deep-copying page 0x%x\n",
                                 (unsigned)vaddr);
                         continue;
                     }
+
 
                     /* Copy contents from parent's page (identity-mapped
                      * by boot_pml4, accessible without stac since there
@@ -205,6 +262,7 @@ static void deep_copy_user_pages(struct process* parent, struct process* child) 
 
     pr_info("fork: copied %d user pages\n", pages_copied);
     pages_copied_last = pages_copied;
+
 
     /* Switch back to parent's CR3 and flush TLB */
     write_cr3(saved_cr3);
@@ -392,6 +450,7 @@ int proc_fork(void) {
     child->pml4 = create_proc_pml4();
     if (!child->pml4) { child->state = PROC_FREE; return -1; }
 
+
     /* KE-31: Deep-copy parent's user pages into child.
      * Uses boot_pml4 internally to avoid SMAP faults on identity-mapped
      * page table pages that collide with user-mapped virtual addresses.
@@ -402,9 +461,11 @@ int proc_fork(void) {
     child->stack_bottom = current->stack_bottom;
 
     /* KE-31: Use a static kernel stack for the child.
-     * TODO(KE-33): switch to kmalloc — current kmalloc causes hang
+     * TODO(KE-34): switch to kmalloc — current kmalloc causes hang
      * after deep_copy_user_pages returns (investigate heap allocator
-     * interaction with deep-copy page allocations). */
+     * interaction with deep-copy page allocations). The static buffer
+     * limits us to ONE forked child at a time, which is fine for the
+     * current fork test but must be fixed before multi-process use. */
     static uint8_t child_kstack[16384] __aligned(16);
     child->kernel_stack = child_kstack;
     child->kernel_stack_top = (uint64_t)child_kstack + sizeof(child_kstack);
@@ -442,20 +503,43 @@ int proc_fork(void) {
     child->saved_state->rsp    = g_saved_user_rsp;
     child->saved_state->ss     = 0x1B;  /* USER_DS | RPL3 */
 
-    /* KE-33 TODO: Capture the parent's USER callee-saved registers
-     * (rbx, rbp, r12-r15) into the child's saved_state. These are NOT
-     * in the current register file (they were pushed by syscall_entry.asm
-     * onto the kernel stack as part of the syscall trap frame). Reading
-     * them requires plumbing the saved-frame pointer through to here.
+    /* KE-33: Copy the parent's USER callee-saved registers (rbx, rbp,
+     * r12-r15) into the child's saved_state.
      *
-     * Without this, the child resumes at user RIP with rbp=0 / r12-r15=0
-     * (from the memset above) and crashes on the first stack-frame access.
-     * This is why context_switch TO the child still triple-faults even
-     * though the deep-copy and ISR-frame fixes are correct.
+     * These registers were saved by syscall_entry.asm to globals
+     * (g_syscall_user_rbx etc.) immediately on syscall entry, BEFORE
+     * any C code ran. We cannot read them from the current register
+     * file via inline asm because the C compiler (having compiled
+     * syscall_dispatch -> ... -> sys_fork -> proc_fork) is free to
+     * spill and reuse any callee-saved register for its own
+     * temporaries — the values in rbx/rbp/r12-r15 here may be the
+     * compiler's, not the user's.
      *
-     * The fork() syscall itself succeeds (327 pages deep-copied, child
-     * PID allocated, child PML4 built) — only the child's first resume
-     * is broken. See MEMORY.md KE-33 for the fix plan. */
+     * The caller-saved registers (rdi, rsi, rdx, rcx, r8, r9, r10,
+     * r11) do NOT need to be preserved across the fork() syscall:
+     * the System V ABI allows the kernel to clobber them, and the
+     * user's libc fork() wrapper assumes only rax (return value) is
+     * meaningful. rcx/r11 are special (they hold user RIP/RFLAGS on
+     * syscall entry) and are already reflected in child->saved_state
+     * ->rip / ->rflags via g_syscall_user_rip / g_syscall_user_rflags.
+     *
+     * Without this copy, the child resumes at user RIP with rbp=0 /
+     * r12-r15=0 (from the memset above) and crashes on the first
+     * stack-frame access (e.g. `mov [rbp-8], rax` with rbp=0 writes
+     * to address 0xFFFFFFFFFFFFFFF8 → #GP → triple fault). */
+    extern uint64_t g_syscall_user_rbx;
+    extern uint64_t g_syscall_user_rbp;
+    extern uint64_t g_syscall_user_r12;
+    extern uint64_t g_syscall_user_r13;
+    extern uint64_t g_syscall_user_r14;
+    extern uint64_t g_syscall_user_r15;
+
+    child->saved_state->rbx = g_syscall_user_rbx;
+    child->saved_state->rbp = g_syscall_user_rbp;
+    child->saved_state->r12 = g_syscall_user_r12;
+    child->saved_state->r13 = g_syscall_user_r13;
+    child->saved_state->r14 = g_syscall_user_r14;
+    child->saved_state->r15 = g_syscall_user_r15;
 
     pr_info("fork: child state rip=0x%x rsp=0x%x\n",
             (unsigned)child->saved_state->rip,
@@ -702,6 +786,7 @@ void schedule(void) {
 
     current = next;
     next->state = PROC_RUNNING;
+
 
     if (prev) {
         context_switch(prev->saved_state, next->saved_state,

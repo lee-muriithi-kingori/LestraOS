@@ -34,11 +34,29 @@ global g_syscall_kstack
 global g_saved_user_rsp
 global g_syscall_user_rip
 global g_syscall_user_rflags
+; KE-33: User callee-saved registers, saved here so proc_fork() can
+; copy them into the forked child's saved_state. The C compiler may
+; spill and reuse rbx/rbp/r12-r15 between syscall_entry's `call` and
+; proc_fork(), so we cannot read them from the register file in C.
+; Saving them to globals here (before any C code runs) captures the
+; exact user values at the syscall instruction.
+global g_syscall_user_rbx
+global g_syscall_user_rbp
+global g_syscall_user_r12
+global g_syscall_user_r13
+global g_syscall_user_r14
+global g_syscall_user_r15
 section .data
 g_syscall_kstack:    dq 0
 g_saved_user_rsp:    dq 0
 g_syscall_user_rip:    dq 0
 g_syscall_user_rflags: dq 0
+g_syscall_user_rbx:    dq 0
+g_syscall_user_rbp:    dq 0
+g_syscall_user_r12:    dq 0
+g_syscall_user_r13:    dq 0
+g_syscall_user_r14:    dq 0
+g_syscall_user_r15:    dq 0
 
 section .text
 syscall_entry:
@@ -55,6 +73,23 @@ syscall_entry:
     ; was never preempted).
     mov [g_syscall_user_rip], rcx
     mov [g_syscall_user_rflags], r11
+
+    ; KE-33: Save user callee-saved registers (rbx, rbp, r12-r15) to
+    ; globals so proc_fork() can copy them into the child's saved_state.
+    ; These registers are NOT modified by the `syscall` instruction or
+    ; by anything above this point, so their values here are the user's
+    ; values. We must save them BEFORE the register-shuffle below (which
+    ; clobbers r8-r11 but not rbx/rbp/r12-r15) and before `call
+    ; syscall_dispatch` (after which the C compiler is free to spill and
+    ; reuse any callee-saved register). Reading them via inline asm from
+    ; C code would be unsafe — the compiler may have already repurposed
+    ; them for its own temporaries.
+    mov [g_syscall_user_rbx], rbx
+    mov [g_syscall_user_rbp], rbp
+    mov [g_syscall_user_r12], r12
+    mov [g_syscall_user_r13], r13
+    mov [g_syscall_user_r14], r14
+    mov [g_syscall_user_r15], r15
 
     ; Save user RIP (RCX) and RFLAGS (R11) on stack (for syscall return)
     push rcx

@@ -107,6 +107,7 @@ struct mmap_entry {
 /* Physical page allocator */
 void pmm_init(struct mmap_entry* mmap, uint32_t mmap_entries);
 phys_addr_t pmm_alloc_page(void);
+void pmm_mark_used(phys_addr_t phys);
 phys_addr_t pmm_alloc_pages(size_t count);
 void pmm_free_page(phys_addr_t addr);
 void pmm_free_pages(phys_addr_t addr, size_t count);

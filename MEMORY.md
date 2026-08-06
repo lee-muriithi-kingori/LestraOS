@@ -1339,3 +1339,69 @@ Stage Summary:
   2. kmap: proper kernel-only temporary physical-page mapping to replace identity-map stac/clac pattern
   3. Shell I/O: add serial console write path so smoke can verify shell execution interactively
   4. More drivers: HPET timer, USB XHCI, APIC timer
+
+---
+## KE-33: Fork callee-saved register plumbing + create_user_address_space boot_pml4 fix
+
+### What was done
+1. **KE-33 (callee-saved registers)**: syscall_entry.asm now saves the user's
+   rbx/rbp/r12-r15 to 6 new globals (g_syscall_user_rbx etc.) immediately on
+   syscall entry, BEFORE any C code runs. proc_fork() reads these globals
+   and copies them into child->saved_state. Without this, the child resumed
+   with rbp=0/r12-r15=0 (from memset) and crashed on the first stack-frame
+   access.
+
+2. **create_user_address_space boot_pml4 fix**: The function now switches
+   to boot_pml4 (identity-mapped) for the entire PML4/PDPT/PD construction.
+   Previously, it ran on the caller's PML4, where virtual addresses for
+   newly-allocated page-table pages could map to DIFFERENT physical pages
+   (e.g. virtual 0x433000 → init BSS at phys 0x500000, not phys 0x433000).
+   Writing pml4[0] via virtual 0x433000 corrupted init's BSS instead of
+   filling the child's PML4. This was the root cause of the child's PML4
+   having pd[0]=0 (kernel text unmapped).
+
+3. **PMM safety net**: pmm_alloc_page now rejects pages in the
+   kernel/bitmap/refcount region (0x100000-0x382000) even if the bitmap
+   says they're free. pmm_mark_used() added to explicitly mark pages as
+   used. deep_copy_user_pages walks the child's page tables and calls
+   pmm_mark_used on all page-table pages before the copy loop.
+
+4. **FORK_TEST=1**: user/Makefile supports `make FORK_TEST=1` to enable
+   the fork() exercise test in init.c (defines INIT_FORK_TEST).
+
+### Remaining issue (KE-35): PMM bitmap corruption during deep_copy
+Even with the above fixes, the fork test still triple-faults. The root
+cause is a PMM bitmap corruption cascade during deep_copy_user_pages:
+- vmm_map_page allocates new PT pages via pmm_alloc_page
+- If a PT page's memset targets the bitmap page (0x2fd000), the bitmap
+  is corrupted, clearing used-bits for the child's page-table pages
+- pmm then returns the child's page-table pages (0x433000-0x435000)
+- memcpy overwrites them with user data, zeroing pd[0] (kernel text)
+- CR3 switch to child faults (kernel text unmapped)
+
+The safety net (0x100000-0x382000 rejection) should prevent this, but
+the corruption persists — suggesting the bitmap is corrupted at a
+different point, or vmm_map_page's PT allocation bypasses the check.
+
+**This is the NEXT priority (KE-35): investigate and fix the PMM bitmap
+corruption.** Possible approaches:
+- Add the kernel-region check in ALL pmm allocation paths
+- Use a dedicated allocator for page-table pages (separate from user pages)
+- Debug the exact memcpy/memset that first corrupts the bitmap
+
+### Verification
+- Build: clean (FORK_TEST=1 and default)
+- QEMU smoke test (-cpu max, SMEP+SMAP): fork() syscall succeeds (327
+  pages deep-copied, child PID 2 allocated), but context_switch TO the
+  child still triple-faults due to KE-35 (PMM bitmap corruption)
+- Default boot (no FORK_TEST): unchanged, reaches /init banner
+
+### Files changed
+- kernel/syscall/syscall_entry.asm: 6 new globals for user callee-saved regs
+- kernel/sched/scheduler.c: KE-33 reg copy in proc_fork, pmm_mark_used walk,
+  retry loop for kernel-region allocations, create_user_address_space fix
+- kernel/exec/elf.c: create_user_address_space switches to boot_pml4
+- kernel/mm/pmm.c: pmm_mark_used(), kernel-region safety net in pmm_alloc_page
+- kernel/include/lestra/mm.h: pmm_mark_used declaration
+- user/Makefile: FORK_TEST=1 support
+- user/init/init.c: updated comments, INIT_FORK_TEST guard

@@ -116,46 +116,33 @@ uintptr_t* create_user_address_space(void) {
     phys_addr_t pml4_phys = pmm_alloc_page();
     if (!pml4_phys) return NULL;
     uintptr_t* pml4 = (uintptr_t*)pml4_phys;
-    stac();  /* KE-26: SMAP-safe write to phys page */
-    memset(pml4, 0, PAGE_SIZE);
-    clac();
 
-    /* KE-13 FIX: Deep-copy the kernel's boot page tables instead of
-     * sharing PML4[0..3] by pointer. The old code did:
-     *   pml4[0] = boot_pml4[0];  // shares boot PDPT+PD
-     * which meant user_map_page() encountered 2MB huge pages in the
-     * shared boot PD. It would then write PTEs to the huge page's
-     * physical address (misinterpreted as a PT pointer), corrupting
-     * kernel BSS/data and causing a delayed #GP.
+    /* KE-33 FIX: Switch to boot_pml4 for the entire PML4/PDPT/PD
+     * construction. Under the caller's PML4 (which may have USER
+     * mappings), virtual addresses for newly-allocated page-table
+     * pages may map to DIFFERENT physical pages (e.g. virtual 0x433000
+     * might map to init's BSS at a different phys, not phys 0x433000).
+     * Writing pml4[0] via virtual 0x433000 would then corrupt init's
+     * BSS instead of filling the child's PML4.
      *
-     * The deep copy gives us private PDPTs and PDs. user_map_page()
-     * can now safely split 2MB huge pages in the private PD copy
-     * without affecting the kernel's own mappings.
-     *
-     * PAGE_USER is cleared on all copied entries so the user process
-     * cannot access kernel memory through the identity mapping.
-     * Only ELF segments and the user stack get PAGE_USER set by
-     * user_map_page(). */
+     * boot_pml4 identity-maps the first 4GB (virtual = physical), so
+     * writes via physical addresses hit the correct pages. SMAP is
+     * also a non-issue under boot_pml4 (no USER mappings). */
     extern uint64_t boot_pml4[];
+    uint64_t saved_cr3 = read_cr3();
+    write_cr3((uintptr_t)boot_pml4);
+
+    memset(pml4, 0, PAGE_SIZE);
+
     for (int i = 0; i < 4; i++) {
         if (!(boot_pml4[i] & PAGE_PRESENT)) continue;
         uint64_t* boot_pdpt = (uint64_t*)(uintptr_t)(boot_pml4[i] & PTE_PHYS_MASK);
         uint64_t* new_pdpt = deep_copy_pdpt(boot_pdpt);
         if (!new_pdpt) continue;
-        /* KE-27: Re-arm AC here. deep_copy_pdpt() does its own stac()/clac()
-         * around its internal page-table writes, so by the time it returns AC
-         * has been cleared. The pml4[i] store below writes to the freshly-
-         * allocated PML4 physical page via the identity map of the CURRENT
-         * (caller's) PML4. If that physical address identity-maps onto a page
-         * the caller has mapped USER (e.g. init's BSS at 0x407000-0x507000
-         * when execve(/shell) runs in init's context), the supervisor store
-         * #PFs under SMAP. This was the root cause of the execve(/shell)
-         * SMAP-violation panic that blocked the shell from booting. */
-        stac();
         pml4[i] = ((uint64_t)(uintptr_t)new_pdpt) | (boot_pml4[i] & ~PAGE_USER & ~PTE_PHYS_MASK) | PAGE_PRESENT;
-        clac();
     }
 
+    write_cr3(saved_cr3);
     return pml4;
 }
 

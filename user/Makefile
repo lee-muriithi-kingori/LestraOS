@@ -11,6 +11,15 @@ CFLAGS ?= -ffreestanding -O2 -Wall -Wextra \
           -fno-pie -fno-stack-protector \
           -mno-red-zone -mcmodel=large \
           -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer
+
+# KE-33: Build with `make FORK_TEST=1` to enable the fork() exercise
+# test in user/init/init.c (defines INIT_FORK_TEST). Off by default so
+# the default boot reaches the shell cleanly even if fork is broken.
+# `override` is needed because the top-level Makefile passes CFLAGS
+# explicitly on the command line, which would otherwise defeat += .
+ifeq ($(FORK_TEST),1)
+  override CFLAGS += -DINIT_FORK_TEST
+endif
 # FIX: Add -static and --no-dynamic-linker to ensure user ELFs are
 # truly static. Without these, gcc on modern Linux defaults to producing
 # PIE executables with PT_INTERP pointing to the host's ld-linux.so,
