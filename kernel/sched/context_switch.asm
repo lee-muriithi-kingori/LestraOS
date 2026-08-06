@@ -281,11 +281,17 @@ context_switch:
     mov     rax, [r11 + CS_SS];   mov [r8 + ISR_SS], rax
 
     ;; Switch CR3 to new process's page table
+    ;; KE-36 DIAG: capture return address ([rsp+16]) before CR3 switch
+    mov     rax, [rsp + 16]
+    mov     [rel g_ke36_ret_before_cr3], rax
     mov     rax, cr3
     cmp     rax, r10
     je      .isr_cr3_ok
     mov     cr3, r10                   ; r10 = new_pml4
 .isr_cr3_ok:
+    ;; KE-36 DIAG: capture return address ([rsp+16]) after CR3 switch
+    mov     rax, [rsp + 16]
+    mov     [rel g_ke36_ret_after_cr3], rax
 
     ;; Update TSS.RSP0 and g_syscall_kstack for new process
     mov     [tss + 4], r9              ; r9 = new_kstack_top
@@ -298,26 +304,27 @@ context_switch:
     wrmsr
 
     ;; KE-35 FIX: Do NOT restore callee-saved regs (rbx/rbp/r12-r15) or
-    ;; rax from new_state here. In ISR-swap mode, we already wrote the
-    ;; child's GPRs into the ISR frame (above), and isr_common will pop
-    ;; them during iretq. Restoring them here would CLOBBER the kernel's
-    ;; own callee-saved registers — which schedule() and the timer ISR
-    ;; handler (compiled C code) rely on after context_switch returns.
+    ;; rax from new_state here. (See comment block below for rationale.)
     ;;
-    ;; The bug manifested as: context_switch restored rbx from
-    ;; child->saved_state->rbx (= g_syscall_user_rbx = a USER address
-    ;; like 0x402e60). When context_switch returned to schedule(), the
-    ;; C code dereferenced rbx as a process pointer → SMAP #PF on the
-    ;; user address → panic.
-    ;;
-    ;; The callee-saved regs must stay as the KERNEL's values (whatever
-    ;; gcc's code had in them before calling context_switch) until
+    ;; The callee-saved regs must stay as the KERNEL's values until
     ;; isr_common's pop-all-GPRs sequence replaces them with the child's
-    ;; values just before iretq. rax is caller-saved, so gcc already
-    ;; saved it if needed; we must not overwrite the kernel's rax either.
+    ;; values just before iretq.
 
     ;; Return to interrupt_dispatch -> isr_common.
     ;; isr_common will pop all 15 GPRs (now the new process's values)
     ;; and iretq using the updated interrupt frame.
     add     rsp, 16                   ; clean up our two saved args
+    ;; KE-36 DIAG: capture [rsp] right before ret (after add rsp, 16)
+    mov     rax, [rsp]
+    mov     [rel g_ke36_ret_at_ret], rax
     ret
+
+;; KE-36 DIAG globals: capture the return address before/after CR3 switch
+;; and right before ret, to determine where the return address gets corrupted.
+section .data
+global g_ke36_ret_before_cr3
+global g_ke36_ret_after_cr3
+global g_ke36_ret_at_ret
+g_ke36_ret_before_cr3: dq 0
+g_ke36_ret_after_cr3:  dq 0
+g_ke36_ret_at_ret:     dq 0

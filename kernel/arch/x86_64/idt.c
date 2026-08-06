@@ -95,7 +95,18 @@ static void default_exception_handler(struct interrupt_frame* frame) {
            (void*)frame->rdx, (void*)frame->rsi, (void*)frame->rdi);
     printk("  RBP: 0x%p  RSP: 0x%p  ERR: 0x%x\n",
            (void*)frame->rbp, (void*)frame->rsp, frame->err_code);
-    
+
+    /* KE-36 DIAG: print the captured return address before/after CR3
+     * switch (set by context_switch.asm ISR-swap mode). This helps
+     * diagnose the #GP where context_switch's ret pops a corrupted
+     * return address. */
+    {
+        extern uint64_t g_ke36_ret_before_cr3, g_ke36_ret_after_cr3, g_ke36_ret_at_ret;
+        printk("  KE-36: ret_before_cr3=0x%p ret_after_cr3=0x%p ret_at_ret=0x%p\n",
+               (void*)g_ke36_ret_before_cr3, (void*)g_ke36_ret_after_cr3,
+               (void*)g_ke36_ret_at_ret);
+    }
+
     if (vector == ISR_PAGE_FAULT) {
         /* Read faulting address from CR2 before any other operation
          * can clobber it. Then delegate to the comprehensive
