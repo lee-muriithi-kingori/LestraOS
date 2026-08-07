@@ -1,6 +1,6 @@
 ;;
 ;; Lestra OS - Jump to userspace (ring 3)
-;; Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+;; Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
 ;;
 ;; This switches CR3 to the user's PML4, sets up an IRETQ frame with
 ;; RPL=3 (user mode), and jumps to the user program's entry point.

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - TCP state machine with multi-connection support
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Supports up to TCP_MAX_CONNS concurrent connections (client + server).
  * conn[0] is the default client connection used by the legacy API

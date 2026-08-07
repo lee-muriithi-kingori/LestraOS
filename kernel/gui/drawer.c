@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Drawer (bottom-sheet app launcher)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Slides up from the bottom when the FAB is clicked. Contains an app
  * grid that opens cards (Terminal, AI Lab, About, Help) or triggers

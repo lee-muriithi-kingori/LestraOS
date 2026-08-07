@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Professional Desktop Dock
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A floating bar centered at the bottom of the screen with app icons.
  * This is the "Windows/Linux-like" dock the user requested — a

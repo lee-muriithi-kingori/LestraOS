@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Collapsible Left App Drawer
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A vertical panel on the left side of the screen that contains the app
  * icons. It can be expanded (showing icons + labels) or collapsed

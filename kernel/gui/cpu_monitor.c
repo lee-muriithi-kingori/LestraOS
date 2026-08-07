@@ -1,6 +1,6 @@
 /*
  * Lestra OS - CPU Monitor
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small widget that graphs CPU load over time. Uses CPUID to detect
  * the core count and reads the TSC frequency (via CPUID 0x15 when

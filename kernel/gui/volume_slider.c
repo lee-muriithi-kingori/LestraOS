@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Volume Slider flyout
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small vertical slider popup that appears when the user clicks the
  * volume icon in the top bar. It includes:

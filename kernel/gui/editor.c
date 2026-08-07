@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Text Editor card
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A basic text editor card. Not VS Code (that needs Electron + V8 +
  * Chromium — millions of lines, not feasible in a kernel). This is a

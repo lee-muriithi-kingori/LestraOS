@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Desktop Icons
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Clickable app icons rendered on the desktop background. Each icon is
  * a 64×64 glyph + label. Clicking launches the corresponding app card.

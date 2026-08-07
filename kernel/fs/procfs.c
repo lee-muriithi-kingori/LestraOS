@@ -1,6 +1,6 @@
 /*
  * Lestra OS - /proc filesystem
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Synthetic process-information filesystem modeled on Linux's /proc.
  * All files are generated on demand at read time so they always
@@ -265,7 +265,7 @@ static size_t gen_cpuinfo(struct procfs_open* o) {
 static size_t gen_version(struct procfs_open* o) {
     int n = ksnprintf(o->buf, sizeof(o->buf),
         "LestraOS 1.0.0-alpha #1 (gcc) %s\n"
-        "  Lee Muriihi Kingori\n"
+        "  Lee Muriithi Kingori\n"
         "  lestramk.org (c) 2026\n"
         "  Built on a freestanding x86_64 kernel.\n",
         __DATE__);

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Core TCP/IP stack (Ethernet + ARP + IP + ICMP + UDP + DHCP + DNS)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This file implements everything below TCP. TCP itself is in tcp.c
  * because it's a stateful beast. HTTP is in http.c.

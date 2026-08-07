@@ -84,10 +84,11 @@ static uint8_t ui_row = 0;
 
 static void put_cell(uint8_t c, uint8_t a, uint8_t row, uint8_t col) {
     /* FIX: was using 0xB8000 + offset (correct, identity-mapped), keep it. */
-    volatile uint16_t* vga = (volatile uint16_t*)(0xB8000 + (row * COLS + col) * 2);
+    volatile uint16_t* vga = (volatile uint16_t*)(uintptr_t)(0xB8000 + (row * COLS + col) * 2);
     *vga = ((uint16_t)a << 8) | c;
 }
 
+__attribute__((unused))
 static void put_char_at(uint8_t c, uint8_t row, uint8_t col) {
     put_cell(c, 0x0F, row, col);
     ui_col = col + 1;
@@ -196,7 +197,7 @@ void ui_statusbar(const char* msg) {
 /* ----- splash --------------------------------------------------------- */
 void ui_boot_splash(void) {
     ui_clear();
-    ui_titlebar(" Lestra OS - by Lee Muriihi Kingori ");
+    ui_titlebar(" Lestra OS - by Lee Muriithi Kingori ");
 
     /* ASCII art logo - cyberpunk style */
     write_str_at("  _                    _           ____   _____ ", 2, 1, themes[current_theme].accent);
@@ -207,13 +208,13 @@ void ui_boot_splash(void) {
     write_str_at(" |_____\\___|\\__,_|\\___|\\__\\___/   \\____/|_____/ ", 7, 1, themes[current_theme].accent);
 
     /* Author attribution line - prominent */
-    write_str_at("              by  Lee Muriihi Kingori              ", 9, 1, themes[current_theme].prompt);
+    write_str_at("              by  Lee Muriithi Kingori              ", 9, 1, themes[current_theme].prompt);
     write_str_at("                lestramk.org  (c) 2026              ", 10, 1, themes[current_theme].body);
 
     /* Status panel */
     ui_panel(12, 2, 10, 76, "Boot Status",
         "Kernel:     Lestra OS 1.0.0-alpha (x86_64 long mode)\n"
-        "Author:     Lee Muriihi Kingori (lestramk.org)\n"
+        "Author:     Lee Muriithi Kingori (lestramk.org)\n"
         "Bootloader: GRUB/multiboot2 -> boot.asm (32->64 transition)\n"
         "Memory:     PMM online  VMM online  Heap ready\n"
         "Drivers:    VGA  PS/2 kbd  Serial  PIT  E1000 NIC\n"
@@ -261,7 +262,7 @@ void ui_menu_loop(void) {
         if (c == '3') {
             ui_panel(2, 22, 12, 54, "About Lestra OS",
                 "Lestra OS\n"
-                "by Lee Muriihi Kingori\n"
+                "by Lee Muriithi Kingori\n"
                 "lestramk.org  (c) 2026\n"
                 "Version 1.0.0-alpha\n"
                 "\nA hobbyist x86_64 operating system.\n"

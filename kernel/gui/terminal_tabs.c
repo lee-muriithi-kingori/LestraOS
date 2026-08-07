@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Terminal with tabs
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A multi-tab terminal card. Up to 8 tabs (TTYTABS_MAX_TABS). Each tab
  * has its own scrollback + input buffer and shares the same shell

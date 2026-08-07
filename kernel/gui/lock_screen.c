@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Lock Screen
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Full-screen overlay shown when the user locks the session. Renders a
  * dimmed/blurred snapshot of the desktop behind it (we approximate the

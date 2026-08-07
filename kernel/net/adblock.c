@@ -1,6 +1,6 @@
 /*
  * Lestra OS - DNS-based Adblocker
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Intercepts DNS lookups for known ad/tracking domains and returns
  * 0.0.0.0 (NXDOMAIN-style block). The blocklist is a hardcoded array

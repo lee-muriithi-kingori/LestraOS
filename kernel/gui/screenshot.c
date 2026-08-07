@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Screenshot Tool
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Win+Shift+S enters "region select" mode: the screen dims and the
  * user drags a rectangle. On mouse-up, the pixels inside that

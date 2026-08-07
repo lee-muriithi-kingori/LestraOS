@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Pre-installed Apps Catalog
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * HONEST STATUS:
  *   The user asked LestraOS to "come pre-installed with LibreOffice,

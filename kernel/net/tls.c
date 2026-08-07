@@ -1,6 +1,6 @@
 /*
  * Lestra OS - TLS 1.2 Client (Production)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Complete TLS 1.2 implementation with:
  *   - AES-128-GCM AEAD (encrypt + decrypt + auth tag)

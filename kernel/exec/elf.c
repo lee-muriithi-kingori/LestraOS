@@ -1,6 +1,6 @@
 /*
  * Lestra OS - ELF64 loader and userspace process execution
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This is the foundation for running REAL programs in userspace (ring 3).
  * It parses an ELF64 binary, maps its segments into a fresh user address

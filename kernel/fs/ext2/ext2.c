@@ -1,6 +1,6 @@
 /*
  * Lestra OS - ext2 filesystem driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A minimal ext2 filesystem driver. It can:
  *   - Mount an ext2 filesystem on a block device (AHCI SATA drive)

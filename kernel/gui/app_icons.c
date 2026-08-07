@@ -1,6 +1,6 @@
 /*
  * Lestra OS - App Icons (Material Design-inspired)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * These bitmaps are 32x32 pixel-art renderings of standard app icons
  * (LibreOffice Writer/Calc/Impress, video editor, browser, mail,

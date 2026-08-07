@@ -1,6 +1,6 @@
 /*
  * Lestra OS - /tmp filesystem
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Volatile in-memory filesystem at /tmp. Supports up to TMPFS_MAX_FILES
  * files, each up to TMPFS_MAX_FILE_SIZE bytes. Data is held in plain

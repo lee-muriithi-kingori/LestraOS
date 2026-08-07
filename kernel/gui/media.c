@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Media Player card (with WAV/PCM codec + tone generator)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Implements:
  *   - WAV/PCM codec: parses RIFF header, "fmt " chunk, "data" chunk

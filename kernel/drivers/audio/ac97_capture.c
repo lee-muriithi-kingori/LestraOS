@@ -1,6 +1,6 @@
 /*
  * Lestra OS - AC97 Microphone Capture (PCM-in)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Real AC97 PCM-in capture driver. The existing ac97.c only handles
  * PCM-out (playback); this file adds PCM-in (recording) so the STT

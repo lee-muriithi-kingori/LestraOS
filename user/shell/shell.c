@@ -100,6 +100,7 @@ static int last_bg_pid = 0;
  * time we print the prompt. */
 static char cwd_buf[256] = "/";
 
+__attribute__((unused))
 static void parse_args(char* line) {
     argc = 0;
     while (*line && argc < ARG_MAX_NUM) {
@@ -504,6 +505,7 @@ static void print_prompt(void) {
 
 /* Execute a single command (not a pipeline stage).
  * Returns the PID of the child process, or -1 on error. */
+__attribute__((unused))
 static int exec_single(char** cmd_argv) {
     if (!cmd_argv || !cmd_argv[0]) return -1;
     if (is_builtin(cmd_argv[0])) {

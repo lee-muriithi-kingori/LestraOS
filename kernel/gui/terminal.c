@@ -1,6 +1,6 @@
 /*
  * Lestra OS - GUI Terminal card
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A floating card that embeds the in-kernel shell (lsh). The shell's
  * input/output is redirected to the card's text buffer instead of VGA.
@@ -337,7 +337,7 @@ struct widget* terminal_create(int x, int y) {
     term_state.active = 1;
 
     /* Welcome message */
-    term_puts("Lestra Shell (lsh) 1.0 - by Lee Muriihi Kingori\n");
+    term_puts("Lestra Shell (lsh) 1.0 - by Lee Muriithi Kingori\n");
     term_puts("Type 'help' for available commands.\n\n");
     term_draw_prompt();
 

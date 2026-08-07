@@ -1,6 +1,6 @@
 /*
  * Lestra OS - /proc filesystem
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Synthetic process-information filesystem modeled on Linux's /proc.
  * Provides:

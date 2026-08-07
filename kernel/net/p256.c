@@ -1,6 +1,6 @@
 /*
  * Lestra OS - P-256 Elliptic Curve (REAL implementation)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Full NIST P-256 (secp256r1) elliptic curve arithmetic in 8×32-byte
  * big-endian representation. Supports:

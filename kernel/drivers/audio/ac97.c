@@ -1,6 +1,6 @@
 /*
  * Lestra OS - AC97 Audio Driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Intel AC97 audio controller (PCI class 04:01:00). Supports PCM
  * playback (mono/stereo, 16-bit, 44100 Hz).

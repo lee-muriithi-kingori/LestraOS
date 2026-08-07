@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Package Manager with Multi-Repository Support
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Supports multiple package repositories:
  *   - core:      main LestraOS packages (languages, editors, utils)

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - GUI public API
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  */
 
 #ifndef LESTRA_GUI_H

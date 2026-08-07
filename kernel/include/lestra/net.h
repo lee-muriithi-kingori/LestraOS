@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Networking Stack
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small but real TCP/IP stack for the Lestra kernel, sufficient for
  * DHCP auto-configuration, ICMP ping, DNS lookups, and one-shot HTTP

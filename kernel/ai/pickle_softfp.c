@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle soft-float32 (IEEE 754 single-precision, integer-only).
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Implements the subset of IEEE-754 binary32 arithmetic needed for
  * transformer inference: add/sub/mul/div, comparisons, int<->float

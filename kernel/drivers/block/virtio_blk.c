@@ -1,6 +1,6 @@
 /*
  * Lestra OS - VirtIO-blk Block Device Driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * VirtIO-blk is the standard paravirtualized block device for KVM/QEMU.
  * This driver supports both legacy (0.9.5, IO port) and modern (1.0, MMIO

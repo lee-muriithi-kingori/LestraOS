@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Animated Top Floating Bar with Speech-to-Text
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Replaces the old static "status pill" in compositor.c with a real
  * top floating bar that has:

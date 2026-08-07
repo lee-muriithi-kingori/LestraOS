@@ -1,6 +1,6 @@
 /*
  * Lestra OS - TLS 1.2 Server (for sandbox HTTP server)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Self-contained TLS 1.2 server with:
  *   - Duplicated crypto from tls.c (AES-128-GCM, SHA-256, HMAC, P-256 ECDHE)

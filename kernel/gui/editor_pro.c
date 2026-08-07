@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Pro Editor with syntax highlighting
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small text editor that knows about C syntax. It reuses the line-
  * buffer layout from editor.c but adds:

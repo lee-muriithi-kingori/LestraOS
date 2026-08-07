@@ -1,6 +1,6 @@
 /*
  * Lestra OS - System Info Widget
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A read-only panel that summarises the running system:
  *   - OS name + version

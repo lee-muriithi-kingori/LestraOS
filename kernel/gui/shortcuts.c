@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Global keyboard shortcuts
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Handled before the compositor dispatches key events to the focused
  * widget. Returns 1 if the shortcut was consumed (the focused widget

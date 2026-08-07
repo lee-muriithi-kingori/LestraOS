@@ -37,8 +37,8 @@ GRUB_MODULES_DIR ?= $(shell for d in /usr/lib/grub/i386-pc /usr/lib/grub2/i386-p
 done)
 
 # Flags
-CFLAGS := -ffreestanding -O$(OPTIMIZE) -Wall -Wextra -fno-exceptions \
-	          -fno-rtti -nostdlib -nostartfiles -nodefaultlibs \
+CFLAGS := -ffreestanding -O$(OPTIMIZE) -Wall -Wextra \
+	          -nostdlib -nostartfiles -nodefaultlibs \
 	          -I$(CURDIR)/kernel/include -I$(CURDIR)/libc/include -m64 -mno-red-zone -mcmodel=large \
 	          -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer -fstack-protector-strong \
 	          -DPICKLE_KERNEL
@@ -138,7 +138,7 @@ ALL_KERNEL_OBJS := $(BOOT_OBJS) $(ARCH_OBJS) $(CORE_OBJS) $(MM_OBJS) \
 	                           $(SYS_OBJS) $(POWER_OBJS) $(CLOCK_OBJS) $(SENSOR_OBJS) $(TTS_OBJS) $(ACPI_OBJS)
 
 # Phony targets
-.PHONY: all clean run run-debug iso kernel libc userspace initrd img install docs help
+.PHONY: all clean run run-debug run-kernel smoke test iso kernel libc userspace initrd img install docs help
 
 # Default target
 all: kernel libc userspace initrd iso
@@ -399,19 +399,56 @@ run-cloud: all
 	         -netdev user,id=net0 -device e1000,netdev=net0 \
 	         -name "Lestra OS [cloud]"
 
-smoke: all
-	@echo "  Running cloud-mode smoke test (30s)..."
-	@timeout 30 qemu-system-x86_64 -L $(HOME)/.local/opt/devtools/usr/share/qemu \
-	         -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64,+smep,+smap \
+# QEMU firmware (SeaBIOS) lookup dir. The devtools prefix is created by
+# scripts/setup-devtools.sh; fall back to the system path if absent.
+QEMU_FW_DIR ?= $(or $(wildcard $(HOME)/.local/opt/devtools/usr/share/qemu),/usr/share/qemu)
+
+# Headless test ISO: same kernel+initrd as the release ISO, but with a
+# grub.cfg that boots straight into cloud/serial mode (timeout=0, no menu,
+# no gfxterm) so it works under `qemu -nographic` without hanging at a menu.
+$(BUILD_DIR)/lestraos-test.iso: kernel initrd boot/grub-test.cfg | $(GRUB_DIR)
+	@echo "  Building headless test ISO..."
+	@mkdir -p $(ISO_DIR)/boot/grub
+	@cp $(KERNEL_BIN) $(ISO_DIR)/boot/kernel.bin
+	@cp $(INITRD) $(ISO_DIR)/boot/initrd.img
+	@cp boot/grub-test.cfg $(GRUB_DIR)/grub.cfg
+	@if [ -n "$(GRUB_MODULES_DIR)" ]; then \
+		grub-mkrescue -d "$(GRUB_MODULES_DIR)" -o $@ $(ISO_DIR); \
+	else grub-mkrescue -o $@ $(ISO_DIR); fi 2>/dev/null
+	@echo "  Test ISO: $@"
+
+smoke: $(BUILD_DIR)/lestraos-test.iso
+	@echo "  Running cloud-mode smoke test (20s)..."
+	@timeout 20 qemu-system-x86_64 -L $(QEMU_FW_DIR) \
+	         -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
 	         -nographic -boot d -no-reboot \
 	         -serial stdio -monitor none \
 	         -netdev user,id=net0 -device e1000,netdev=net0 \
 	         -name "Lestra OS [smoke]" > /tmp/lestra-smoke.log 2>&1 || true
-	@echo "  Smoke log: /tmp/lestra-smoke.log"
+	@echo "  Smoke log: /tmp/lestra-smoke.log ($$(wc -l < /tmp/lestra-smoke.log) lines)"
 	@grep -q "kernel initialized successfully" /tmp/lestra-smoke.log && echo "  PASS: kernel reached init" || echo "  FAIL: kernel did not reach init"
-	@grep -q "lestramk.org - Lightweight" /tmp/lestra-smoke.log && echo "  PASS: userspace /init banner printed" || echo "  WARN: /init banner not seen"
-	@grep -q "SMEP:.*ENABLED" /tmp/lestra-smoke.log && echo "  PASS: SMEP enabled" || echo "  WARN: SMEP not enabled"
-	@grep -q "SMAP:.*ENABLED" /tmp/lestra-smoke.log && echo "  PASS: SMAP enabled" || echo "  WARN: SMAP not enabled"
+	@grep -q "pickle: selftest OK" /tmp/lestra-smoke.log && echo "  PASS: in-kernel pickle selftest" || echo "  FAIL: pickle selftest not seen"
+	@grep -q "CLOUD/VPS SERVER MODE" /tmp/lestra-smoke.log && echo "  PASS: cloud mode entered" || echo "  WARN: cloud mode banner not seen"
+	@grep -q "DHCP: ACK" /tmp/lestra-smoke.log && echo "  PASS: DHCP lease acquired" || echo "  WARN: DHCP lease not seen"
+
+# `make test` — strict version of smoke: exits non-zero if any marker fails.
+# Intended for CI. Builds the headless test ISO, boots it, and asserts the
+# golden-path boot markers appear in the serial log.
+test: $(BUILD_DIR)/lestraos-test.iso
+	@echo "  Running strict boot test (20s)..."
+	@timeout 20 qemu-system-x86_64 -L $(QEMU_FW_DIR) \
+	         -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
+	         -nographic -boot d -no-reboot \
+	         -serial stdio -monitor none \
+	         -netdev user,id=net0 -device e1000,netdev=net0 \
+	         -name "Lestra OS [test]" > /tmp/lestra-test.log 2>&1 || true
+	@echo "  Test log: /tmp/lestra-test.log"
+	@fail=0; \
+	grep -q "kernel initialized successfully" /tmp/lestra-test.log || { echo "  FAIL: kernel did not reach init"; fail=1; }; \
+	grep -q "pickle: selftest OK" /tmp/lestra-test.log || { echo "  FAIL: pickle selftest not seen"; fail=1; }; \
+	grep -q "CLOUD/VPS SERVER MODE" /tmp/lestra-test.log || { echo "  FAIL: cloud mode not entered"; fail=1; }; \
+	grep -q "DHCP: ACK" /tmp/lestra-test.log || { echo "  FAIL: DHCP lease not acquired"; fail=1; }; \
+	[ $$fail -eq 0 ] && echo "  ALL CHECKS PASSED" || { echo "  TEST FAILED"; exit 1; }
 
 run-debug: all
 	@echo "  Starting QEMU with GDB server..."

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Professional UI Redesign
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This file contains the redesigned UI components with a professional
  * dark theme inspired by modern desktop environments.

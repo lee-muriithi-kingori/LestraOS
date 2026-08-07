@@ -1,10 +1,10 @@
 /*
  * Lestra OS - Boot Splash Animation
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Three-frame splash sequence rendered to the VESA framebuffer:
  *   Frame A (250 ms): black screen, "lestraOS" types in left-to-right,
- *                     subtitle "by Lee Muriihi Kingori"
+ *                     subtitle "by Lee Muriithi Kingori"
  *   Frame B (init):   branding stays, status lines slide in from right,
  *                     progress bar fills 0->100%
  *   Frame C (400 ms): branding brightens, status slides out, fade to black
@@ -51,7 +51,7 @@ static void draw_wordmark(int cx, int y, int bright) {
 }
 
 static void draw_subtitle(int cx, int y) {
-    const char* sub = "by Lee Muriihi Kingori  -  lestramk.org";
+    const char* sub = "by Lee Muriithi Kingori  -  lestramk.org";
     int w = fb_text_width(sub);
     fb_draw_string(cx - w / 2, y, sub, UI_TEXT_MUTED);
 }

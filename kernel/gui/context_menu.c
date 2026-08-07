@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Right-click context menus
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small floating menu that appears at the cursor when the user
  * right-clicks on the desktop or on an icon. Items are arranged

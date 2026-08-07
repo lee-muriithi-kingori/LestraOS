@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Text-to-Speech Engine (Formant Synthesis)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A REAL text-to-speech engine using formant synthesis. Converts text
  * to phonemes, synthesizes each as sum of formant sine waves, outputs

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Intel 82540EM (E1000) NIC driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * QEMU's default NIC (`-device e1000`) is the Intel 82540EM, which is
  * well-documented and straightforward to drive. This is a polling-based

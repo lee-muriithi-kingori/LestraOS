@@ -81,6 +81,10 @@ struct dirent {
 };
 
 /* File operations */
+/* Forward declaration so file_ops can reference vnode* before vnode is
+ * defined below. Without this, gcc warns "struct vnode declared inside
+ * parameter list will not be visible outside of this definition". */
+struct vnode;
 struct file_ops {
     int (*open)(struct vnode* node, int flags);
     int (*close)(struct vnode* node);

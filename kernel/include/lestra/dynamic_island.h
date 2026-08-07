@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Dynamic Island public API
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * The Dynamic Island is a morphing pill at the top-center of the screen
  * that displays the current foreground activity: idle clock, music

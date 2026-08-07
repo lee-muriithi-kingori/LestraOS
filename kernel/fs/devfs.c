@@ -1,6 +1,6 @@
 /*
  * Lestra OS - /dev filesystem
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Minimal /dev with the four device files every Unix user expects:
  *

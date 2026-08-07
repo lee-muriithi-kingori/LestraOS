@@ -1,6 +1,6 @@
 ;;
 ;; Lestra OS - Signal trampoline
-;; Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+;; Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
 ;;
 ;; This code is copied into each user process's address space at a
 ;; fixed virtual address (signal_trampoline_addr) by the kernel when

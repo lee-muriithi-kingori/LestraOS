@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Framebuffer / VESA draw API implementation
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * The linear framebuffer address, width, height, pitch, and BPP come
  * from the multiboot2 info struct. GRUB sets VESA mode 1024×768×32

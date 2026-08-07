@@ -1,6 +1,6 @@
 /*
  * Lestra OS - App Store
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small application store UI. It does NOT actually download packages
  * yet (the underlying kpkg/lestra-pkg.c would need to be wired in),

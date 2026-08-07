@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Offline AI Assistant
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * IMPORTANT: This is NOT a neural language model. It is a rule-based
  * pattern-matching assistant that gives canned responses based on
@@ -142,7 +142,7 @@ int offline_ai_respond(const char* prompt, char* response, size_t response_size)
     if (contains_kw(prompt, "who made you") || contains_kw(prompt, "who created you") ||
         contains_kw(prompt, "who are you")) {
         APPEND("I'm the Lestra OS offline assistant.\n");
-        APPEND("Lestra OS was created by Lee Muriihi Kingori (lestramk.org).\n");
+        APPEND("Lestra OS was created by Lee Muriithi Kingori (lestramk.org).\n");
         APPEND("I'm a rule-based assistant, not a neural model — for real AI,\n");
         APPEND("configure a cloud API key with 'ai setkey'.\n");
         response[n] = '\0';
@@ -157,7 +157,7 @@ int offline_ai_respond(const char* prompt, char* response, size_t response_size)
         APPEND("  - AI client (GLM 5.2 / Claude / Gemini / OpenAI)\n");
         APPEND("  - Package manager (65 packages)\n");
         APPEND("  - AHCI disk driver + ext2 filesystem\n");
-        APPEND("  - Built by Lee Muriihi Kingori\n");
+        APPEND("  - Built by Lee Muriithi Kingori\n");
         response[n] = '\0';
         return 1;
     }

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Wallpaper picker
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Six gradient presets the user can pick from. The choice is
  * persisted to /etc/wallpaper as a single byte (0..5). The compositor

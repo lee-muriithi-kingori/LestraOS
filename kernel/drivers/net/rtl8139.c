@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Realtek RTL8139 10/100 Fast Ethernet Driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * First real-hardware (non-virtio) NIC driver for lestraOS.
  * Uses the shared PCI API from KE-9 (pci_find_device).

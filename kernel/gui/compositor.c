@@ -1,6 +1,6 @@
 /*
  * Lestra OS - GUI Compositor
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A cooperative compositor that runs at ~60 Hz. It:
  *   - Pumps input events and dispatches them to widgets (z-ordered)

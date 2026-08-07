@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Input subsystem (mouse + keyboard event queue)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * The PS/2 mouse driver is in drivers/char/mouse.c (handles aux port,
  * IRQ12, packet parsing). The keyboard is handled by keyboard.c.

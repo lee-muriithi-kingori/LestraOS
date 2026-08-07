@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Toast notification system
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Slide-in toast notifications that appear at the top-right of the
  * screen, stack vertically, auto-dismiss after a timeout, and can be

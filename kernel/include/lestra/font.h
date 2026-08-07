@@ -1,6 +1,6 @@
 /*
  * Lestra OS - 8x16 bitmap font (printable ASCII 0x20-0x7E)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Each character is 16 rows of 8 bits (1 byte per row, MSB = leftmost pixel).
  * Only printable ASCII (space through tilde) is defined; everything else

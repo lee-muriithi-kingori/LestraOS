@@ -1,6 +1,6 @@
 /*
  * Lestra OS - ext2 fd-shim layer (enhanced with directory support)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * The existing ext2 driver in kernel/fs/ext2/ext2.c is path-based:
  *   ext2_read_file(path, buf, bufsize)  -- one-shot, reads the whole file

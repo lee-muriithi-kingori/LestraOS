@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Weather widget
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Fetches weather from the plain-text wttr.in service. Falls back to
  * synthesised sample data when the network is down so the UI is always

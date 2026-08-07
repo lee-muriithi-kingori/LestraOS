@@ -1,6 +1,6 @@
 /*
  * Lestra OS — NIC Driver Abstraction Layer
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Provides a unified vtable (struct nic_ops) for all NIC drivers.
  * Each driver exports a single 'const struct nic_ops' instance.

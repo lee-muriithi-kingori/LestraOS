@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Network Monitor
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A real-time network info widget. Shows:
  *   - IP / MAC / Gateway / DNS values from net.h

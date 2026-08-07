@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Theme system
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Centralised design-token table with two variants (dark + light) and
  * a per-user accent color. The chosen theme is persisted to /etc/theme

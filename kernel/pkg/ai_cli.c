@@ -1,6 +1,6 @@
 /*
  * Lestra OS - AI CLI packages (claude, glm, gemini, openai, uai)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Five shell commands that wrap the existing AI subsystem (kernel/ai/ai.c)
  * with provider-specific defaults and convenient subcommands. These are

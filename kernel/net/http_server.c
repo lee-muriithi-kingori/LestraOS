@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Built-in HTTP/1.0 server + Cloud/VPS Management API (HTTPS)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Serves files from the VFS root over plain HTTP. Designed for
  * embedded web UIs, status pages, and local tooling.

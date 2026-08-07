@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Socket layer (BSD sockets API)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Thin kernel-side socket API that wraps the existing net/tcp + pipe
  * infrastructure. Supports:

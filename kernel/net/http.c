@@ -1,6 +1,6 @@
 /*
  * Lestra OS - HTTP/1.0 client (plain HTTP only, no TLS)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * One-shot GET/POST over the in-kernel TCP stack. Suitable for:
  *   - Downloading packages from a package mirror

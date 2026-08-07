@@ -37,36 +37,92 @@
 #include <lestra/uaccess.h>
 #include <string.h>
 
-/* errno constants used by syscalls. Mirror libc/include/errno.h if
- * one existed; we declare inline here. */
+/* errno constants used by syscalls. The libc errno.h may already define
+ * some of these, so guard each with #ifndef to avoid -Wmacro-redefined. */
+#ifndef EPERM
 #define EPERM           1
+#endif
+#ifndef ENOENT
 #define ENOENT          2
+#endif
+#ifndef EIO
 #define EIO             5
+#endif
+#ifndef EBADF
 #define EBADF           9
+#endif
+#ifndef ENOMEM
 #define ENOMEM         12
+#endif
+#ifndef EACCES
 #define EACCES         13
+#endif
+#ifndef EFAULT
 #define EFAULT         14
+#endif
+#ifndef EBUSY
 #define EBUSY          16
+#endif
+#ifndef EEXIST
 #define EEXIST         17
+#endif
+#ifndef EINVAL
 #define EINVAL         22
+#endif
+#ifndef ENOSYS
 #define ENOSYS         38
+#endif
+#ifndef ERANGE
 #define ERANGE         34
+#endif
+#ifndef ENAMETOOLONG
 #define ENAMETOOLONG   36
+#endif
+#ifndef EROFS
 #define EROFS          30
+#endif
+#ifndef ECHILD
 #define ECHILD         10
+#endif
+#ifndef EAGAIN
 #define EAGAIN         11
+#endif
+#ifndef ESPIPE
 #define ESPIPE         29   /* Illegal seek (on pipe/terminal) */
+#endif
+#ifndef EMFILE
 #define EMFILE         24   /* Too many open files */
+#endif
+#ifndef ENOTTY
 #define ENOTTY         25   /* Inappropriate ioctl for device */
+#endif
+#ifndef ENOTEMPTY
 #define ENOTEMPTY      39   /* Directory not empty */
+#endif
+#ifndef EPROTONOSUPPORT
 #define EPROTONOSUPPORT 93  /* Protocol not supported */
+#endif
+#ifndef EAFNOSUPPORT
 #define EAFNOSUPPORT    97  /* Address family not supported */
+#endif
+#ifndef ENOTSOCK
 #define ENOTSOCK        88  /* Socket operation on non-socket */
+#endif
+#ifndef EOPNOTSUPP
 #define EOPNOTSUPP     102  /* Operation not supported */
+#endif
+#ifndef EADDRINUSE
 #define EADDRINUSE      98  /* Address already in use */
+#endif
+#ifndef EISCONN
 #define EISCONN        106  /* Transport endpoint already connected */
+#endif
+#ifndef ENOTCONN
 #define ENOTCONN       107  /* Transport endpoint not connected */
+#endif
+#ifndef ECONNREFUSED
 #define ECONNREFUSED   111  /* Connection refused */
+#endif
 
 /* Extra stat mode type bits not in vfs.h */
 #define S_IFCHR   0020000   /* character device */

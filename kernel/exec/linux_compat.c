@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Linux ABI Compatibility Shim
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Lets LestraOS execute Linux ELF binaries by translating Linux
  * syscalls to LestraOS syscalls. This is the same approach used by:

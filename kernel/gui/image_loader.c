@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Image Loader for Embedded Assets
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Loads raw RGB image data (wallpapers, icons) that are embedded in
  * the kernel binary as C arrays. The images are generated at build

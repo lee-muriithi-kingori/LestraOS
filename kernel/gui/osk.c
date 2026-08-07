@@ -1,6 +1,6 @@
 /*
  * Lestra OS - On-Screen Keyboard
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A QWERTY soft keyboard that pops up at the bottom of the screen.
  * Supports:

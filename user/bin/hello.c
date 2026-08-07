@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Userspace test program
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This is a REAL userspace program that runs in ring 3. It tests the
  * syscall interface by writing "Hello from userspace!" to stdout (fd 1),

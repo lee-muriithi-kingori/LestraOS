@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle GGUF engine core.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Implements:
  *   - GGUF v3 header / metadata / tensor-info parsing (pickle_io_t callbacks)

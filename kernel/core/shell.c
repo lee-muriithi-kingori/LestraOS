@@ -2204,7 +2204,7 @@ static void execute_command(void) {
     else if (strcmp(cmd, "sysinfo") == 0) {
         printk("\n=== System Information ===\n");
         printk("OS:        Lestra OS 1.0.0-alpha\n");
-        printk("Author:    Lee Muriihi Kingori\n");
+        printk("Author:    Lee Muriithi Kingori\n");
         printk("Kernel:    x86_64 long-mode\n");
         printk("Uptime:    %u seconds\n", (unsigned)(timer_get_ms() / 1000));
         /* Time */
@@ -2344,7 +2344,7 @@ static void print_prompt_serial(void) {
 /* ----- shell entry ---------------------------------------------------- */
 void shell_run(void) {
     printk("\n");
-    printk("Lestra Shell (lsh) 1.0 - by Lee Muriihi Kingori\n");
+    printk("Lestra Shell (lsh) 1.0 - by Lee Muriithi Kingori\n");
     printk("Type 'help' for available commands.\n");
     printk("\n");
 

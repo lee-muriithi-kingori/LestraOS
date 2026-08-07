@@ -1,6 +1,6 @@
 /*
  * Lestra OS - GUI AI Lab card
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A floating card with a chat interface for talking to AI providers.
  * Shows message bubbles (user right-aligned, assistant left-aligned),

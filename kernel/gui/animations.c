@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Animation engine
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Integer-only fixed-point animation engine. 24 slots, no FPU/SSE.
  * See include/lestra/animations.h for the API contract.

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - File Explorer
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A two-pane file manager:
  *   - Left sidebar: quick locations (Home, Documents, tmp, proc, dev)

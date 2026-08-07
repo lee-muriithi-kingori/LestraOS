@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Brightness flyout
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small horizontal slider popup that appears when the user clicks
  * the brightness icon. Range is 10..100% (we never let the screen go

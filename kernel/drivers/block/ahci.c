@@ -1,6 +1,6 @@
 /*
  * Lestra OS - AHCI (SATA) Host Bus Adapter driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A minimal AHCI driver that can detect SATA drives and read sectors.
  * This is enough to support an ext2 filesystem on a virtual disk.

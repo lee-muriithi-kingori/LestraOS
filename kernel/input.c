@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Input subsystem implementation (mouse + keyboard event queue)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * The PS/2 mouse driver is now a separate module (drivers/char/mouse.c)
  * that handles aux port initialization, IRQ12 processing, and packet

@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle: a from-scratch GGUF model loader and inference engine.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Pickle is a self-contained GGUF (v3) parser + transformer forward-pass
  * engine. It does NOT use llama.cpp, ggml, or ollama. The math is done with

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Task Manager
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A small process-monitoring window. It polls the scheduler for the
  * current process list, renders a 5-column table (PID / Name / State /

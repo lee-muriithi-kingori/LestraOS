@@ -1,6 +1,6 @@
 /*
  * Lestra OS - About + Help dialogs
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  */
 #include <lestra/types.h>
 #include <lestra/fb.h>
@@ -20,7 +20,7 @@ static void about_draw(struct widget* w) {
 
     int y = w->y + 50;
     fb_draw_string(w->x + 16, y, "Lestra OS 1.0.0-alpha", UI_ACCENT_SOFT); y += 20;
-    fb_draw_string(w->x + 16, y, "by Lee Muriihi Kingori", UI_TEXT_PRIMARY); y += 18;
+    fb_draw_string(w->x + 16, y, "by Lee Muriithi Kingori", UI_TEXT_PRIMARY); y += 18;
     fb_draw_string(w->x + 16, y, "lestramk.org (c) 2026", UI_TEXT_MUTED); y += 24;
 
     fb_draw_string(w->x + 16, y, "Architecture: x86_64 long-mode", UI_TEXT_PRIMARY); y += 18;

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Clock widget
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A desktop clock with two faces (digital and analog), 12/24h toggle,
  * date, and day-of-week. Click the widget to cycle face; press 'F' to

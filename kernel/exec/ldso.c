@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Dynamic ELF Linker (ld-linux.so equivalent)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This is the Linux dynamic linker rewritten for LestraOS. It does
  * the same job as glibc's ld.so:

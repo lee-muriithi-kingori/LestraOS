@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Speech-to-Text Engine (REAL, on-device, no cloud)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * PREVIOUSLY: this module was an honest simulation that emitted
  *            canned phrases so the UI showed feedback.

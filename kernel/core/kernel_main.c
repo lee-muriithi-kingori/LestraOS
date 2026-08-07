@@ -94,7 +94,7 @@ static void print_banner(void) {
     printk("  |                                          |\n");
     printk("  |     L e s t r a   O S                    |\n");
     printk("  |                                          |\n");
-    printk("  |     by Lee Muriihi Kingori               |\n");
+    printk("  |     by Lee Muriithi Kingori               |\n");
     printk("  |     lestramk.org  (c) 2026               |\n");
     printk("  |     Version 1.0.0-alpha                  |\n");
     printk("  |                                          |\n");
@@ -695,18 +695,25 @@ void kernel_main(void* mb2_info) {
             input_init();
             compositor_init();
 
-            /* Boot PID 1 — attempt to execve("/init") into ring 3.
-             * If the initrd was loaded and /init is a valid ELF, the
-             * system now has a real userspace process. If it fails
-             * (no initrd, bad ELF, etc.) we fall through to the
-             * in-kernel compositor as a recovery surface. */
-            extern void userspace_boot(void);
-            userspace_boot();
-
             /* Boot to clean desktop — NO auto-opened apps.
              * User clicks desktop icons or the dock to launch apps.
-             * This is how a real OS works: you see the desktop first. */
-
+             * This is how a real OS works: you see the desktop first.
+             *
+             * NOTE: we deliberately do NOT call userspace_boot() here.
+             * userspace_boot() -> sched_start_first() jumps to ring 3
+             * and never returns, which would leave the in-kernel
+             * compositor (the desktop renderer) dead-coded — the
+             * framebuffer would freeze on the last splash frame and
+             * no desktop/dock/icons would ever paint. The ring-3
+             * /shell has no window-server bridge to the in-kernel
+             * framebuffer yet, so it cannot draw to the screen.
+             *
+             * In GUI mode the in-kernel compositor IS the desktop.
+             * Userspace /init is only launched in cloud/serial mode
+             * (where the serial console, not the framebuffer, is the
+             * primary I/O). When a proper window server / pty-to-fb
+             * terminal bridge lands, userspace_boot() can be moved
+             * into a kernel thread that runs alongside the compositor. */
             compositor_run();
             if (!fb_available) {
                 shell_run();

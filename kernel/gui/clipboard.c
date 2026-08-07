@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Clipboard Manager
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A 10-item ring buffer that holds the most recent clipboard strings.
  * Win+V opens a popup that lists them; click any to paste it back into

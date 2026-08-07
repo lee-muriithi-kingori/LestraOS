@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Settings App
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Classic two-pane settings window:
  *   - Left sidebar: 7 categories (Display, Sound, Network, Personalization,
@@ -233,7 +233,7 @@ static void set_panel_about(struct widget* w) {
               (unsigned)(pmm_get_total() / (1024 * 1024)));
     fb_draw_string(px + 16, py + 88, buf, UI_TEXT_PRIMARY);
     fb_draw_string(px + 16, py + 108,
-                   "(c) 2026 lestramk.org / Lee Muriihi Kingori",
+                   "(c) 2026 lestramk.org / Lee Muriithi Kingori",
                    UI_TEXT_MUTED);
 }
 

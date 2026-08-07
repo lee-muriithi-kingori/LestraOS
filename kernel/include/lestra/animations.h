@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Animation engine
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A tiny fixed-point animation engine for UI transitions. The kernel
  * has no FPU/SSE (we compile with -mno-sse), so all math is integer.

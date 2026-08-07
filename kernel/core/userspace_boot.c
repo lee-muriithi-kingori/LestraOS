@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Userspace boot
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * PREVIOUSLY: this file was a no-op stub. The kernel would initialize
  *             all subsystems, then sit in the in-kernel shell/compositor

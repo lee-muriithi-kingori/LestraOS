@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Power Menu
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * A full-screen overlay with three big options: Shut Down, Restart,
  * Sleep. Clicking one of them opens a confirmation prompt ("Are you

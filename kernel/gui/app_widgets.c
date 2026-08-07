@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Files / Browser / Calendar / Photos widgets
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Four real desktop app widgets that previously had icons but no
  * backing implementation. Each is a draggable window with its own

@@ -1,6 +1,6 @@
 /*
  * Lestra OS — NIC Driver Table
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Central registry of all NIC driver vtables.
  * Each driver object file exports a 'const struct nic_ops' symbol;

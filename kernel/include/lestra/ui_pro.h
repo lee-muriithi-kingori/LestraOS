@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Pro UI public API
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  */
 #ifndef LESTRA_UI_PRO_H
 #define LESTRA_UI_PRO_H

@@ -1,6 +1,6 @@
 /*
  * Lestra OS - VirtIO-net Network Device Driver
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * VirtIO is the standard paravirtualized device interface for KVM/QEMU.
  * This driver supports both legacy (0.9.5, IO port) and modern (1.0, MMIO

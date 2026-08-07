@@ -1,6 +1,6 @@
 /*
  * Lestra OS - Material App Grid (clickable)
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Renders the 16 Material-Design app icons from app_icons.c in a 8x2
  * grid on the desktop. Each icon is hit-tested on mouse-down; the
