@@ -630,6 +630,11 @@ void compositor_run(void) {
          * icon is clickable — see app_grid_handle_click. */
         app_grid_render();
 
+        /* Render the enhanced desktop icons (left column: Terminal,
+         * AI Lab, Editor, Media, Files, Settings, Help, About). These
+         * use the real 48x48 RGB bitmap assets with proper transparency. */
+        ui_render_desktop_icons();
+
         for (int i = 0; i < n_widgets; i++) {
             if (widgets[i]->visible && widgets[i]->draw) {
                 widgets[i]->draw(widgets[i]);

@@ -37,6 +37,8 @@
 #include <lestra/assets/icon_media.h>
 #include <lestra/assets/icon_files.h>
 #include <lestra/assets/icon_settings.h>
+#include <lestra/assets/icon_help.h>
+#include <lestra/assets/icon_about.h>
 #include <string.h>
 
 /* Forward declaration */
@@ -322,7 +324,7 @@ void ui_render_dock(void) {
                     int sy = (row * 48) / 32;
                     const uint8_t* src = &icon_data[(sy * 48 + sx) * 3];
                     uint8_t r = src[0], g = src[1], b = src[2];
-                    if (r < 10 && g < 15 && b < 20) continue;
+                    if (r == 0x01 && g == 0x01 && b == 0x01) continue;
                     uint32_t color = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                     fb_set_pixel(ix + icon_off + col, iy + offset + icon_off + row, color);
                 }
@@ -442,8 +444,8 @@ void ui_render_desktop_icons(void) {
                 for (int col = 0; col < 48; col++) {
                     const uint8_t* src = &icon_data[(row * 48 + col) * 3];
                     uint8_t r = src[0], g = src[1], b = src[2];
-                    /* Skip near-black background (transparent) */
-                    if (r < 10 && g < 15 && b < 20) continue;
+                    /* Skip transparent pixels (key = 0x01,0x01,0x01) */
+                    if (r == 0x01 && g == 0x01 && b == 0x01) continue;
                     uint32_t color = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                     fb_set_pixel(ic->x + offset + icon_off + col, ic->y + offset + icon_off + row, color);
                 }
@@ -523,7 +525,7 @@ void ui_render_wallpaper(void) {
     }
 
     /* Subtitle */
-    const char* sub = "by Lee Muriihi Kingori";
+    const char* sub = "by Lee Muriithi Kingori";
     int sub_w = fb_text_width(sub) * 2;
     int sx = (int)fb_w / 2 - sub_w / 2;
     int sy = by + 100;
@@ -535,7 +537,9 @@ void ui_render_wallpaper(void) {
     }
 }
 
-/* Get icon data by index (0=terminal, 1=ai, 2=editor, 3=media, 4=files, 5=settings) */
+/* Get icon data by index (0=terminal, 1=ai, 2=editor, 3=media, 4=files,
+ * 5=settings, 6=help, 7=about). Returns 48x48 RGB888 with transparent
+ * key 0x010101. */
 const uint8_t* get_icon_data(int idx) {
     switch (idx) {
         case 0: return icon_terminal_data;
@@ -544,6 +548,8 @@ const uint8_t* get_icon_data(int idx) {
         case 3: return icon_media_data;
         case 4: return icon_files_data;
         case 5: return icon_settings_data;
+        case 6: return icon_help_data;
+        case 7: return icon_about_data;
         default: return icon_terminal_data;
     }
 }
