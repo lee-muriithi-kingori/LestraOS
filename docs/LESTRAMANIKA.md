@@ -204,11 +204,11 @@ kernel-compatible half into lestraOS.
 
 | Component | Version | Commit |
 |---|---|---|
-| lestraOS (this repo) | KE-36 | `34687a6` (pre-submodule) → this commit |
-| lestramanika submodule | v0.4 alpha | `3e671ec` |
-| In-kernel pickle (vendored) | synced to `3e671ec` | `kernel/ai/pickle.c` |
+| lestraOS (this repo) | KE-36 | `f9df70e` (submodule wired) → this commit |
+| lestramanika submodule | v0.4 alpha | `7ab120a` |
+| In-kernel pickle (vendored) | synced to `7ab120a` | `kernel/ai/pickle.c` |
 
-The kernel-compatible core at `3e671ec` adds (over the original KE-28
+The kernel-compatible core at `7ab120a` adds (over the original KE-28
 vendoring at `8d3300c`):
 
 - **Metadata-only load** (`pickle_load_meta`) — parse GGUF header +
@@ -223,6 +223,16 @@ vendoring at `8d3300c`):
   `pickle_free` if the io is owned.
 - **Conditional `pickle.h` include** — the source now compiles verbatim
   into both the kernel and host builds with zero post-processing.
+
+> **Note on `7ab120a`:** this lestramanika commit fixes a critical
+> host-only correctness bug (mmap + quantized embedding → all-zero
+> logits → `<unk>` output). The fix is entirely in `pickle_fast.c` /
+> `pickle_fast.h` / `pickle_host.c` — **none of which are vendored
+> into the kernel**. The kernel's soft-float path in `pickle.c` was
+> never affected (it doesn't use mmap; it reads via `pickle_io_t`
+> callbacks and dequantizes through the bump allocator). The submodule
+> bump is for consistency — the kernel sources themselves are
+> byte-identical to `3e671ec` (verified by `sync_lestramanika.sh --check`).
 
 The kernel's `pickle_selftest()` boot-time behavior is unchanged — it
 still prints `pickle: selftest OK, next token = 6` (the kernel bump
