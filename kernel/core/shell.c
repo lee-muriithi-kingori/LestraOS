@@ -168,7 +168,9 @@ static void cmd_help(void) {
     printk("    file cat <path>         Show file contents\n");
     printk("    file write <p> <text>   Write text to a file\n");
     printk("    file mkdir <path>       Create a directory\n");
+    printk("    file rmdir <path>       Remove an empty directory\n");
     printk("    file rm <path>          Remove a file\n");
+    printk("    file chmod <p> <mode>   Change file mode (octal, e.g. 755)\n");
     printk("    file stat <path>        Show file info\n");
     printk("\n");
     printk("  Hardware:\n");
@@ -1343,7 +1345,7 @@ void cmd_mount(int argc, char** argv) {
 /* ----- file subcommands ----------------------------------------------- */
 static void cmd_file(int argc, char** argv) {
     if (argc < 2) {
-        printk("Usage: file <ls|cat|write|mkdir|rm|stat> [args]\n");
+        printk("Usage: file <ls|cat|write|mkdir|rmdir|rm|chmod|stat> [args]\n");
         return;
     }
     if (strcmp(argv[1], "ls") == 0) {
@@ -1428,6 +1430,14 @@ static void cmd_file(int argc, char** argv) {
         } else {
             printk("file: created directory %s\n", argv[2]);
         }
+    } else if (strcmp(argv[1], "rmdir") == 0) {
+        if (argc < 3) { printk("Usage: file rmdir <path>\n"); return; }
+        int rc = vfs_rmdir(argv[2]);
+        if (rc < 0) {
+            printk("file: rmdir %s: failed (not a dir, not empty, or not found)\n", argv[2]);
+        } else {
+            printk("file: removed directory %s\n", argv[2]);
+        }
     } else if (strcmp(argv[1], "rm") == 0) {
         if (argc < 3) { printk("Usage: file rm <path>\n"); return; }
         int rc = vfs_unlink(argv[2]);
@@ -1435,6 +1445,25 @@ static void cmd_file(int argc, char** argv) {
             printk("file: rm %s: failed\n", argv[2]);
         } else {
             printk("file: removed %s\n", argv[2]);
+        }
+    } else if (strcmp(argv[1], "chmod") == 0) {
+        if (argc < 4) { printk("Usage: file chmod <path> <mode>\n"); return; }
+        /* Parse octal mode string (e.g. "755", "644"). */
+        uint32_t mode = 0;
+        const char* s = argv[3];
+        while (*s >= '0' && *s <= '7') {
+            mode = mode * 8 + (uint32_t)(*s - '0');
+            s++;
+        }
+        if (*s != '\0' || argv[3][0] == '\0') {
+            printk("file: chmod: invalid mode '%s' (use octal, e.g. 755)\n", argv[3]);
+            return;
+        }
+        int rc = vfs_chmod(argv[2], mode);
+        if (rc < 0) {
+            printk("file: chmod %s: failed (not found)\n", argv[2]);
+        } else {
+            printk("file: chmod %s: mode set to 0%o\n", argv[2], mode);
         }
     } else if (strcmp(argv[1], "stat") == 0) {
         if (argc < 3) { printk("Usage: file stat <path>\n"); return; }

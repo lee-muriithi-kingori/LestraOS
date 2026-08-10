@@ -839,14 +839,12 @@ static int64_t sys_mkdir(const char* path, uint32_t mode) {
 static int64_t sys_rmdir(const char* path) {
     if (!path) return -EFAULT;
     if (!access_ok(path, 1)) return -EFAULT;
-    /* Validate the user pointer is readable (even though we don't
-     * use the path yet — future-proofs against SMAP #PF when rmdir
-     * gets a real implementation). */
     char kpath[MAX_PATH_LEN];
     int rc = strncpy_from_user(kpath, path, sizeof(kpath));
     if (rc < 0) return -EFAULT;
-    /* VFS doesn't support rmdir yet. */
-    return -EROFS;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    int vrc = vfs_rmdir(kpath);
+    return (vrc < 0) ? -ENOENT : 0;
 }
 
 static int64_t sys_stat(const char* path, void* st) {
@@ -1040,13 +1038,12 @@ static int64_t sys_dup2(int oldfd, int newfd) {
 static int64_t sys_chmod(const char* path, uint32_t mode) {
     if (!path) return -EFAULT;
     if (!access_ok(path, 1)) return -EFAULT;
-    /* Validate the user pointer (future-proof for SMAP). We don't
-     * use the path yet because VFS has no chmod op. */
     char kpath[MAX_PATH_LEN];
     int rc = strncpy_from_user(kpath, path, sizeof(kpath));
     if (rc < 0) return -EFAULT;
-    (void)mode;
-    return -ENOSYS;
+    if (rc == 0 || kpath[0] == '\0') return -EINVAL;
+    int vrc = vfs_chmod(kpath, mode);
+    return (vrc < 0) ? -ENOENT : 0;
 }
 
 static int64_t sys_fstat(int64_t fd_num, void* st) {

@@ -48,7 +48,10 @@ void schedule(void);
 
 static struct process* find_free_proc(void) {
     for (int i = 0; i < MAX_PROCS; i++) {
-        if (procs[i].state == PROC_FREE) return &procs[i];
+        if (procs[i].state == PROC_FREE) {
+            procs[i].priority = PRIO_DEFAULT;  /* reset priority on alloc */
+            return &procs[i];
+        }
     }
     return NULL;
 }
@@ -678,7 +681,14 @@ void task_sleep(uint64_t ms) {
     current->state = PROC_RUNNING;
 }
 
-void task_set_priority(int p) { (void)p; }
+/* Priority scheduling: lower value = higher priority (Unix nice-style).
+ * Clamps to [PRIO_MIN, PRIO_MAX] and applies to the current process. */
+void task_set_priority(int p) {
+    if (!current) return;
+    if (p < PRIO_MIN) p = PRIO_MIN;
+    if (p > PRIO_MAX) p = PRIO_MAX;
+    current->priority = p;
+}
 
 /* Called on timer tick to check for processes that need waking */
 void sched_check_wakeups(void) {
@@ -762,19 +772,23 @@ int proc_wait_blocking(int pid, int* status) {
 
 /* ---- Scheduling core ---- */
 
+/* Priority-aware pick_next: among all RUNNABLE processes, select the one
+ * with the lowest priority value (highest priority). Ties are broken by
+ * round-robin starting from the slot after the current process, so equal-
+ * priority tasks still get fair time slices. */
 static struct process* pick_next(void) {
-    if (!current) {
-        for (int i = 0; i < MAX_PROCS; i++) {
-            if (procs[i].state == PROC_RUNNABLE) return &procs[i];
-        }
-        return NULL;
-    }
-    int start = (current - procs) + 1;
+    int start = 0;
+    if (current)
+        start = (current - procs) + 1;
+
+    struct process* best = NULL;
     for (int i = 0; i < MAX_PROCS; i++) {
         int idx = (start + i) % MAX_PROCS;
-        if (procs[idx].state == PROC_RUNNABLE) return &procs[idx];
+        if (procs[idx].state != PROC_RUNNABLE) continue;
+        if (!best || procs[idx].priority < best->priority)
+            best = &procs[idx];
     }
-    return NULL;
+    return best;
 }
 
 void schedule(void) {

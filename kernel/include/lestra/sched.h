@@ -7,6 +7,13 @@
 #define MAX_SIGNALS     32
 #define MAX_FD_PER_PROC 128
 
+/* Priority scheduling (lower value = higher priority, Unix nice-style).
+ * Range 0..39; PRIO_DEFAULT (20) is the midpoint — every newly allocated
+ * process starts here unless task_set_priority() changes it. */
+#define PRIO_MIN        0
+#define PRIO_MAX        39
+#define PRIO_DEFAULT    20
+
 /* Per-process file descriptor entry.
  * Maps a process-local fd number to an underlying resource.
  * FD types: FD_UNUSED (free slot), FD_SPECIAL (stdin/stdout/stderr),
@@ -78,6 +85,7 @@ struct process {
     uint64_t brk;
     uint64_t stack_bottom;               /* bottom of mapped stack region (grows downward) */
     uint64_t wake_tick;                  /* timer_get_ms() deadline while sleeping in task_sleep; 0 = not sleeping */
+    int priority;                         /* scheduling priority 0..39 (lower = higher priority, PRIO_DEFAULT=20) */
     struct fd_entry fds[MAX_FD_PER_PROC]; /* per-process file descriptor table */
 };
 

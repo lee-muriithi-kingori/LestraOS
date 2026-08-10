@@ -377,6 +377,10 @@ void kernel_main(void* mb2_info) {
         pr_info("No rootfs.tar module — running with initrd only\n");
     }
 
+    /* Run VFS self-test (chmod, rmdir, mkdir, stat, error paths).
+     * Exercises the new VFS operations to verify they work at boot. */
+    vfs_selftest();
+
     /* Print memory stats */
     mm_print_stats();
 

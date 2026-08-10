@@ -882,6 +882,113 @@ int vfs_unlink(const char* path) {
     return -1;
 }
 
+/* vfs_chmod — change permission bits on a memfs file or directory.
+ * Preserves the file-type bits (S_IFMT) and replaces only the permission
+ * bits (mode & 0777). Returns 0 on success, -1 if the path doesn't exist
+ * in memfs (ext2 chmod not yet supported — falls through to -1). */
+int vfs_chmod(const char* path, uint32_t mode) {
+    if (!path || path[0] != '/') return -1;
+
+    int idx = memfs_resolve_path(path);
+    if (idx < 0) {
+        /* Not in memfs — ext2 chmod not implemented yet. */
+        return -1;
+    }
+
+    /* Preserve file-type bits, set only the permission bits. */
+    uint32_t type_bits = fs_files[idx].mode & S_IFMT;
+    fs_files[idx].mode = type_bits | (mode & 0777);
+    pr_info("VFS: chmod '%s' mode 0%o\n", path, fs_files[idx].mode);
+    return 0;
+}
+
+/* vfs_rmdir — remove an EMPTY directory from memfs.
+ * Returns 0 on success. Returns -1 if:
+ *   - path is NULL or doesn't start with '/'
+ *   - the path doesn't exist in memfs
+ *   - the target is not a directory
+ *   - the target is the root directory (idx 0)
+ *   - the directory is not empty (num_children > 0)
+ * (ext2 rmdir not yet supported — falls through to -1.) */
+int vfs_rmdir(const char* path) {
+    if (!path || path[0] != '/') return -1;
+
+    int idx = memfs_resolve_path(path);
+    if (idx < 0) {
+        /* Not in memfs — ext2 rmdir not implemented yet. */
+        return -1;
+    }
+
+    /* Can't rmdir the root. */
+    if (idx == ROOT_IDX) return -1;
+    /* Must be a directory. */
+    if (!fs_files[idx].is_dir) return -1;
+    /* Must be empty. */
+    if (fs_files[idx].num_children > 0) return -1;
+
+    /* Detach from parent's child list and free the slot. */
+    int parent = fs_files[idx].parent_idx;
+    if (parent >= 0 && parent < MAX_FILES) {
+        memfs_remove_child(parent, idx);
+    }
+
+    fs_files[idx].exists = 0;
+    fs_files[idx].num_children = 0;
+    fs_num_files--;
+    pr_info("VFS: rmdir '%s'\n", path);
+    return 0;
+}
+
+/* vfs_selftest — exercise mkdir, create, stat, chmod, rmdir, and the
+ * error paths (rmdir non-empty, rmdir non-dir, chmod nonexistent).
+ * Prints a PASS/FAIL line for each check and a summary at the end.
+ * Called from kernel_main after initrd load. */
+void vfs_selftest(void) {
+    int pass = 0, fail = 0;
+
+    pr_info("vfs_selftest: starting (8 checks)\n");
+
+    /* 1. mkdir /tmp — should succeed. */
+    if (vfs_mkdir("/tmp", 0755) == 0) { pass++; pr_info("vfs_selftest: 1/8 PASS mkdir /tmp\n"); }
+    else { fail++; pr_warn("vfs_selftest: 1/8 FAIL mkdir /tmp\n"); }
+
+    /* 2. mkdir /tmp (again) — should fail (EEXIST). */
+    if (vfs_mkdir("/tmp", 0755) < 0) { pass++; pr_info("vfs_selftest: 2/8 PASS mkdir /tmp (EEXIST)\n"); }
+    else { fail++; pr_warn("vfs_selftest: 2/8 FAIL mkdir /tmp (should have failed)\n"); }
+
+    /* 3. create /tmp/hello.txt — should succeed. */
+    int fd = vfs_open("/tmp/hello.txt", O_CREAT);
+    if (fd >= 0) { pass++; pr_info("vfs_selftest: 3/8 PASS create /tmp/hello.txt\n"); vfs_close(fd); }
+    else { fail++; pr_warn("vfs_selftest: 3/8 FAIL create /tmp/hello.txt\n"); }
+
+    /* 4. stat /tmp/hello.txt — should be a regular file. */
+    struct stat st;
+    if (vfs_stat("/tmp/hello.txt", &st) == 0 && S_ISREG(st.mode)) { pass++; pr_info("vfs_selftest: 4/8 PASS stat /tmp/hello.txt (regular)\n"); }
+    else { fail++; pr_warn("vfs_selftest: 4/8 FAIL stat /tmp/hello.txt\n"); }
+
+    /* 5. chmod /tmp/hello.txt 0644 — should succeed; verify mode bits. */
+    if (vfs_chmod("/tmp/hello.txt", 0644) == 0) {
+        struct stat st2;
+        if (vfs_stat("/tmp/hello.txt", &st2) == 0 && (st2.mode & 0777) == 0644) { pass++; pr_info("vfs_selftest: 5/8 PASS chmod /tmp/hello.txt 0644\n"); }
+        else { fail++; pr_warn("vfs_selftest: 5/8 FAIL chmod mode not applied\n"); }
+    } else { fail++; pr_warn("vfs_selftest: 5/8 FAIL chmod /tmp/hello.txt\n"); }
+
+    /* 6. rmdir /tmp (non-empty) — should fail. */
+    if (vfs_rmdir("/tmp") < 0) { pass++; pr_info("vfs_selftest: 6/8 PASS rmdir /tmp (non-empty, ENOTEMPTY)\n"); }
+    else { fail++; pr_warn("vfs_selftest: 6/8 FAIL rmdir /tmp (should have failed — not empty)\n"); }
+
+    /* 7. rmdir /tmp/hello.txt (not a dir) — should fail. */
+    if (vfs_rmdir("/tmp/hello.txt") < 0) { pass++; pr_info("vfs_selftest: 7/8 PASS rmdir /tmp/hello.txt (ENOTDIR)\n"); }
+    else { fail++; pr_warn("vfs_selftest: 7/8 FAIL rmdir /tmp/hello.txt (should have failed — not a dir)\n"); }
+
+    /* 8. cleanup: unlink the file, then rmdir /tmp (now empty) — should succeed. */
+    vfs_unlink("/tmp/hello.txt");
+    if (vfs_rmdir("/tmp") == 0) { pass++; pr_info("vfs_selftest: 8/8 PASS rmdir /tmp (empty, cleaned up)\n"); }
+    else { fail++; pr_warn("vfs_selftest: 8/8 FAIL rmdir /tmp (should have succeeded)\n"); }
+
+    pr_info("vfs_selftest: %d/%d PASS, %d FAIL\n", pass, pass + fail, fail);
+}
+
 off_t vfs_lseek(int fd, off_t offset, int whence) {
     /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
      * The unified fs_offsets[] array is shared between read, write,
