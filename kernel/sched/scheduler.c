@@ -56,6 +56,23 @@ static struct process* find_free_proc(void) {
     return NULL;
 }
 
+/* W3-B: initialize per-process state that used to be process-global
+ * statics in syscall.c (cwd, brk, mmap_next_addr, root, umask).
+ * Called after the memset() in proc_create / proc_fork so the fields
+ * are populated correctly even though memset zeroed them. */
+static void proc_init_per_process_state(struct process* p) {
+    p->cwd[0] = '/';
+    p->cwd[1] = '\0';
+    p->root[0] = '/';
+    p->root[1] = '\0';
+    p->brk = 0;
+    p->brk_base = 0;
+    p->mmap_next_addr = 0;
+    p->umask = 0022;            /* default POSIX umask */
+    p->needs_kstack_free = 0;
+    p->priority = PRIO_DEFAULT;
+}
+
 struct process* sched_alloc_proc(void) {
     return find_free_proc();
 }
@@ -397,6 +414,7 @@ int proc_create(const char* name, const void* elf_data, size_t elf_size) {
     }
 
     memset(p, 0, sizeof(*p));
+    proc_init_per_process_state(p);   /* W3-B: per-process cwd/brk/mmap/umask */
     p->pid = next_pid++;
     p->state = PROC_RUNNABLE;
     p->parent_pid = current ? current->pid : 0;
@@ -454,10 +472,24 @@ int proc_fork(void) {
     if (!child) return -1;
 
     memset(child, 0, sizeof(*child));
+    proc_init_per_process_state(child);   /* W3-B: defaults */
     child->pid = next_pid++;
     child->state = PROC_RUNNABLE;
     child->parent_pid = current->pid;
     strncpy(child->name, current->name, sizeof(child->name) - 1);
+
+    /* W3-B: inherit per-process state from the parent so the child
+     * starts with the same cwd, root, brk, mmap cursor, umask, and
+     * priority. Previously these were global statics in syscall.c so
+     * "inheritance" was implicit; now they're per-process so we must
+     * explicitly copy them at fork time. */
+    memcpy(child->cwd, current->cwd, sizeof(child->cwd));
+    memcpy(child->root, current->root, sizeof(child->root));
+    child->brk = current->brk;
+    child->brk_base = current->brk_base;
+    child->mmap_next_addr = current->mmap_next_addr;
+    child->umask = current->umask;
+    child->priority = current->priority;
 
     child->pml4 = create_proc_pml4();
     if (!child->pml4) { child->state = PROC_FREE; return -1; }
@@ -573,9 +605,58 @@ void proc_exit(int status) {
         return;
     }
 
+    pr_info("sched: process %d exited with status %d\n", current->pid, status);
+
+    /* W3-B: clean up resources BEFORE going zombie so we don't leak
+     * file descriptors while waiting for the parent to call waitpid().
+     *
+     *   1. Close all open fds (VFS files, pipes). FD_SPECIAL has no
+     *      underlying resource. The fd table is zeroed so subsequent
+     *      ops on this process fail with EBADF.
+     *   2. Re-parent any surviving children to PID 1 (init) so they
+     *      don't get orphaned with a dead parent_pid.
+     *   3. Send SIGCHLD to the parent so a waitpid() loop can wake up.
+     *   4. Mark the kernel stack for deferred free (proc_reap will
+     *      kfree it after the parent collects the exit status).
+     *
+     * We DO NOT destroy current->pml4 here — that would free the
+     * page-table root we're currently running on (CR3 still points
+     * at it). The address space teardown is deferred to proc_reap(),
+     * which runs in the PARENT's context after the parent has
+     * collected our exit status via waitpid(). proc_reap already
+     * calls vmm_destroy_address_space(p->pml4) — by then CR3 has
+     * been switched to the parent's (or next) PML4, so freeing
+     * our PML4 is safe. */
+    fd_table_close_all(current);
+
+    /* Re-parent surviving children to PID 1 (init). */
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (procs[i].state == PROC_FREE || procs[i].state == PROC_ZOMBIE)
+            continue;
+        if (procs[i].parent_pid == current->pid) {
+            procs[i].parent_pid = 1;  /* init */
+        }
+    }
+
+    /* Send SIGCHLD to the parent (if a signal handler is installed
+     * it'll be delivered on the parent's next syscall return / timer
+     * tick). signal_kill is in signals.c — declare it extern here to
+     * avoid pulling signals.h (which doesn't exist as a header). */
+    extern int64_t signal_kill(int pid, int sig);
+    if (current->parent_pid > 0) {
+        signal_kill(current->parent_pid, 17 /* SIGCHLD */);
+    }
+
+    /* Mark kernel stack for deferred free. We can't kfree() it here
+     * because we're running on it. proc_reap() (called by proc_wait
+     * when the parent collects our status) will kfree it after the
+     * context switch has moved us off this stack. The needs_kstack_free
+     * flag is set here for any future scavenger that might want to
+     * free orphaned kstacks (e.g. if the parent never waits). */
+    current->needs_kstack_free = 1;
+
     current->state = PROC_ZOMBIE;
     current->exit_status = status;
-    pr_info("sched: process %d exited with status %d\n", current->pid, status);
 
     /* Wake parent if it's blocked in waitpid */
     struct process* parent = sched_find_by_pid_impl(current->parent_pid);

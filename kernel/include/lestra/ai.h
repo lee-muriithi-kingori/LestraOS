@@ -98,6 +98,11 @@ int ai_chat_with_tools_provider(int provider, const char* prompt,
                                 char* response, size_t response_size,
                                 int max_iterations);
 
+/* Clear the per-session conversation memory (history buffer).
+ * Called automatically when the user sends "/clear" as a prompt,
+ * and can be called explicitly by the shell via `ai clear`. */
+void ai_clear_memory(void);
+
 /* Initialize the AI subsystem (registers built-in tools) */
 void ai_init(void);
 

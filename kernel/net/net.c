@@ -24,6 +24,7 @@
 #include <lestra/printk.h>
 #include <lestra/panic.h>
 #include <lestra/timer.h>
+#include <lestra/mm.h>
 #include <string.h>
 
 /* NIC driver table and active pointer (defined in net/nic.c) */
@@ -541,6 +542,27 @@ static mac_addr_t ndp_resolve(ipv6_addr_t ip, uint32_t timeout_ms) {
 /* Send an IPv6 packet over Ethernet. Returns bytes sent or 0 on failure. */
 static int eth_send_ipv6_raw(ipv6_addr_t dst, uint8_t next_hdr,
                               const void* payload, uint16_t payload_len) {
+    /* Loopback short-circuit for ::1 — never goes on the wire. Build the
+     * IPv6 packet and feed it directly to the local IPv6 receive path.
+     * handle_ipv6 already accepts IPV6_LOOPBACK as "for us". */
+    if (ipv6_eq(dst, IPV6_LOOPBACK)) {
+        uint16_t total = sizeof(struct ipv6_hdr) + payload_len;
+        if (total > NET_MAX_PKT) return 0;
+        uint8_t* pkt = (uint8_t*)kmalloc(total);
+        if (!pkt) return 0;
+        struct ipv6_hdr* ip6 = (struct ipv6_hdr*)pkt;
+        ip6->ver_traffic_flow = htonl32(6u << 28);
+        ip6->payload_len  = htons16(payload_len);
+        ip6->next_header  = next_hdr;
+        ip6->hop_limit    = 64;
+        ip6->src          = IPV6_LOOPBACK;
+        ip6->dst          = dst;
+        memcpy(pkt + sizeof(struct ipv6_hdr), payload, payload_len);
+        handle_ipv6(pkt, total);
+        kfree(pkt);
+        return total;
+    }
+
     if (!net_link_up) return 0;
 
     mac_addr_t dst_mac = ndp_resolve(dst, 1000);
@@ -771,6 +793,38 @@ static void handle_ndp(uint8_t* data, uint16_t len, mac_addr_t src_mac) {
 /* Send an IPv4 packet to `dst_ip`. Handles gateway routing and ARP. */
 static int eth_send_ipv4(ipv4_addr_t dst_ip, uint8_t proto,
                           const void* payload, uint16_t payload_len) {
+    /* Loopback short-circuit: 127.0.0.0/8 never touches the NIC.
+     * Build the IP packet and hand it directly to the local IP receive
+     * path so a process listening on 127.0.0.1 sees it. Works even when
+     * net_link_up is 0 (no NIC / no carrier). Uses a kmalloc'd buffer
+     * so a recursive eth_send_ipv4 (e.g. SYN -> SYN-ACK) doesn't clobber
+     * the packet we're currently delivering. */
+    if (dst_ip.bytes[0] == 127) {
+        uint16_t ip_total = sizeof(struct ip_hdr) + payload_len;
+        if (ip_total > NET_MAX_PKT) return 0;
+        uint8_t* pkt = (uint8_t*)kmalloc(ip_total);
+        if (!pkt) return 0;
+        struct ip_hdr* ip = (struct ip_hdr*)pkt;
+        ip->ver_ihl    = 0x45;
+        ip->tos        = 0;
+        ip->total_len  = htons16(ip_total);
+        ip->id         = htons16(0x1234);
+        ip->flags_frag = htons16(0x4000);
+        ip->ttl        = 64;
+        ip->proto      = proto;
+        ip->checksum   = 0;
+        /* Loopback source so replies also short-circuit. */
+        ip->src = ipv4(127, 0, 0, 1);
+        ip->dst = dst_ip;
+        ip->checksum = htons16(ip_checksum(ip, sizeof(struct ip_hdr)));
+        memcpy(pkt + sizeof(struct ip_hdr), payload, payload_len);
+        /* Deliver locally. handle_ipv4 accepts 127.0.0.0/8 as "for us"
+         * (see the for_us check below). */
+        handle_ipv4(pkt, ip_total);
+        kfree(pkt);
+        return ip_total;
+    }
+
     if (!net_link_up) return 0;
 
     /* Pick next hop: if dst is on our subnet, send direct; else use gateway. */
@@ -1418,8 +1472,9 @@ static void handle_ipv4(uint8_t* data, uint16_t len) {
     uint16_t ip_hdr_len = ihl * 4;
     if (ip_hdr_len > len) return;
 
-    /* Verify it's destined for us (or broadcast) */
-    int for_us = ipv4_eq(ip->dst, my_ip) || ipv4_eq(ip->dst, IP_BROADCAST);
+    /* Verify it's destined for us (or broadcast, or loopback 127.0.0.0/8) */
+    int for_us = ipv4_eq(ip->dst, my_ip) || ipv4_eq(ip->dst, IP_BROADCAST)
+              || (ip->dst.bytes[0] == 127);
     if (!for_us) return;
 
     uint8_t* l4 = &data[ip_hdr_len];

@@ -45,6 +45,105 @@ static char* argv[ARG_MAX_NUM + 1];
 static int argc = 0;
 static char cwd[64] = "/";
 
+/* ----- command history (W1-F fix #4) -----------------------------------
+ *
+ * A 64-entry ring buffer of up-to-255-char command lines. Up arrow
+ * recalls the previous entry; Down arrow moves forward. The browse
+ * cursor (history_browse) is reset to "past the end" (i.e. new input)
+ * whenever a command is executed. Entries are stored verbatim — no
+ * expansion, no de-duplication (a user re-running the same command
+ * gets two history slots, matching bash behaviour).
+ *
+ * The arrow keys themselves are NOT in the PS/2 keyboard's ASCII
+ * buffer (kernel/drivers/char/keyboard.c drops E0-prefixed extended
+ * scancodes). To make Up/Down work in the in-kernel shell we install
+ * a tiny keyboard-handler hook (shell_kb_hook, below) that watches
+ * for the E0 0x48 / E0 0x50 make sequences and injects two private
+ * sentinel bytes (0x80 / 0x81) into the same key_buffer that
+ * keyboard_getchar() drains. read_line() then recognises those
+ * sentinels and triggers history navigation.
+ *
+ * For the serial shell (shell_run_serial), arrow keys arrive as ANSI
+ * escape sequences (ESC [ A / ESC [ B) via serial_getchar(); those
+ * are decoded directly in read_line_serial(). */
+#define HIST_MAX     64
+#define HIST_LINE    256
+static char history[HIST_MAX][HIST_LINE];
+static int  history_count = 0;     /* number of valid entries (<= HIST_MAX) */
+static int  history_browse = 0;    /* index of the entry currently shown;
+                                    * == history_count means "new input" */
+
+/* Sentinel bytes injected by shell_kb_hook for arrow keys. These are
+ * above 0x7F so they fall outside the printable ASCII range checked
+ * by read_line()'s `c >= ' '` clause — they will never be inserted
+ * into the input buffer as text. */
+#define SHELL_KEY_UP    0x80
+#define SHELL_KEY_DOWN  0x81
+
+/* Append a command line to the history ring. Empty lines and lines
+ * that are exact duplicates of the most recent entry are skipped
+ * (matches the common shell convention). */
+static void history_push(const char* line) {
+    if (!line || !*line) return;
+    /* Skip if identical to the most recent entry. */
+    if (history_count > 0) {
+        int last = (history_count - 1) % HIST_MAX;
+        if (strcmp(history[last], line) == 0) return;
+    }
+    int slot = history_count % HIST_MAX;
+    strncpy(history[slot], line, HIST_LINE - 1);
+    history[slot][HIST_LINE - 1] = '\0';
+    history_count++;
+}
+
+/* Recall entry `idx` into `out` (NUL-terminated). Returns 0 on
+ * success, -1 if idx is out of range. */
+static int history_get(int idx, char* out, size_t out_sz) {
+    if (idx < 0 || idx >= history_count || !out || out_sz == 0) return -1;
+    /* Entries wrap around the ring when history_count > HIST_MAX. */
+    int base = (history_count > HIST_MAX) ? (history_count - HIST_MAX) : 0;
+    int slot = (base + idx) % HIST_MAX;
+    strncpy(out, history[slot], out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return 0;
+}
+
+/* ----- arrow-key keyboard hook (PS/2 path only) -----------------------
+ *
+ * Installed by shell_run() before the main loop. Watches the raw
+ * scancode stream for E0-prefixed Up/Down arrows and injects the
+ * SHELL_KEY_UP / SHELL_KEY_DOWN sentinels into the keyboard buffer.
+ *
+ * This hook runs in IRQ1 context (called by keyboard.c's IRQ handler
+ * before its own scancode-to-ASCII translation). It only touches the
+ * E0-extended arrow keys — everything else falls through to
+ * keyboard.c unchanged. */
+static int shell_kb_e0_pending = 0;
+
+static void shell_kb_hook(uint8_t scancode, char ascii) {
+    (void)ascii;
+
+    if (scancode == 0xE0) {
+        shell_kb_e0_pending = 1;
+        return;
+    }
+    if (!shell_kb_e0_pending) {
+        /* Not an extended key — ignore (keyboard.c handles it). */
+        return;
+    }
+    /* We have an E0-prefixed scancode. Only act on the make codes
+     * (bit 7 clear); releases are silently absorbed. */
+    shell_kb_e0_pending = 0;
+    if (scancode & 0x80) return;   /* release */
+    if (scancode == 0x48) {
+        keyboard_inject_char((char)SHELL_KEY_UP);
+    } else if (scancode == 0x50) {
+        keyboard_inject_char((char)SHELL_KEY_DOWN);
+    }
+    /* Other extended keys (Left/Right/Home/End/PgUp/PgDn) are not
+     * consumed — keyboard.c will continue to drop them as before. */
+}
+
 /* ----- prompt --------------------------------------------------------- */
 static void print_prompt(void) {
     vga_set_color(VGA_CYAN, VGA_BLACK);
@@ -224,13 +323,64 @@ static void cmd_theme(int argc, char** argv) {
 }
 
 /* ----- install -------------------------------------------------------- */
+/* The in-OS installer (installer/install.c) is still a 17-line stub.
+ * Until a real partitioner + ext2-formatter + file-copy pipeline lands
+ * in the kernel, this command gives the user an honest picture of the
+ * current storage situation (which disk controllers are visible, what
+ * is mounted where) and points them at the working host-side installer
+ * script (installer/install.sh) that writes a raw image to a device. */
 static void cmd_install(void) {
-    printk("\nLestra OS Installer (in-kernel stub)\n");
-    printk("For real installation use the host-side tools:\n");
+    printk("\n=== Lestra OS Installer ===\n");
+    printk("(in-kernel installer is a stub — uses host-side tools for now)\n\n");
+
+    /* ---- In-OS storage picture ---- */
+    extern int ahci_has_drive(void);
+    extern int virtio_blk_is_present(void);
+    extern int ext2_is_mounted(void);
+    extern int fat32_is_mounted(void);
+
+    printk("Storage detected:\n");
+    printk("  AHCI/SATA disk:   %s\n",
+           ahci_has_drive() ? "present" : "absent");
+    printk("  VirtIO-blk disk:  %s\n",
+           virtio_blk_is_present() ? "present" : "absent");
+    printk("  ext2 mounted:     %s\n",
+           ext2_is_mounted() ? "yes" : "no");
+    printk("  FAT32 mounted:    %s\n",
+           fat32_is_mounted() ? "yes" : "no");
+
+    /* List the VFS mount table. */
+    printk("\nMounts:\n");
+    int nm = vfs_get_mount_count();
+    if (nm == 0) {
+        printk("  (none)\n");
+    } else {
+        for (int i = 0; i < nm; i++) {
+            struct mount* m = vfs_get_mount(i);
+            if (!m) continue;
+            const char* fstype = "?";
+            switch (m->fs_type) {
+                case FS_TYPE_MEMFS: fstype = "memfs"; break;
+                case FS_TYPE_EXT2:  fstype = "ext2";  break;
+                case FS_TYPE_FAT32: fstype = "fat32"; break;
+            }
+            printk("  %-12s %s\n", m->path, fstype);
+        }
+    }
+
+    /* ---- Host-side installer ---- */
+    printk("\nTo install Lestra OS onto a real disk, run the host-side\n");
+    printk("installer from a Linux host with the build outputs present:\n");
     printk("  Windows:  installer\\install.py --target <dev> --image build\\lestraos.img\n");
     printk("  POSIX:    installer/install.sh --target /dev/sdX --image build/lestraos.img\n");
-    printk("Then boot the target device; Lestra OS loads automatically.\n\n");
+    printk("Then boot the target device; Lestra OS loads automatically.\n");
+    printk("\nIn-OS, you can also use the shell to prepare a disk manually:\n");
+    printk("  disk                 - show AHCI disk info\n");
+    printk("  mount ext2 <dev> <t> - mount an ext2 partition\n");
+    printk("  save <path> <text>   - write a file to the mounted ext2 fs\n");
+    printk("\n");
 }
+
 
 /* ----- echo ----------------------------------------------------------- */
 static void cmd_echo(void) {
@@ -2313,11 +2463,290 @@ static void execute_command(void) {
     }
 }
 
+/* ----- tab completion (W1-F fix #5) ------------------------------------
+ *
+ * When the user presses Tab, we try to complete the token currently
+ * being typed (the substring of input_buffer from the last
+ * whitespace to the cursor position `pos`).
+ *
+ *   1. If the token contains no '/', we attempt COMMAND completion
+ *      against the static builtin command table. If exactly one
+ *      builtin starts with the token, the token is replaced with the
+ *      full command name + a trailing space. If multiple match, they
+ *      are listed (like bash) and the input is left unchanged.
+ *
+ *   2. We also attempt FILE completion: the token is split into a
+ *      directory part (before the last '/', or cwd if none) and a
+ *      filename prefix. vfs_readdir enumerates the directory; any
+ *      entry whose name starts with the prefix is a candidate. Same
+ *      single-match-completes / multi-match-lists semantics.
+ *
+ * Command completion takes precedence (most commands are typed
+ * bare), so `fil<Tab>` completes to `file ` rather than listing
+ * /files. File completion kicks in once the token contains a '/'.
+ *
+ * Returns the new cursor position (the index into input_buffer at
+ * which the next typed char will land). The buffer is NUL-terminated
+ * by the caller. */
+static const char* const shell_builtins[] = {
+    "help", "echo", "cd", "clear", "uname", "free", "reboot", "shutdown",
+    "uptime", "version", "ps", "cpuinfo", "meminfo", "test", "neofetch",
+    "install", "ui", "theme", "pkg", "ai", "file", "network", "ifconfig",
+    "ping", "ping6", "wget", "claude", "glm", "gemini", "openai", "uai",
+    "disk", "mount", "exec", "save", "play", "speak", "date", "time",
+    "battery", "temp", "wifi", "cron", "lee", "firewall", "sysinfo",
+    "lspci", "exit", NULL
+};
+
+/* Erase `old_len` chars from the line, then print `buf` (which is
+ * NUL-terminated). Used to redraw the input line on history recall
+ * or tab completion. */
+static void shell_redraw_line(const char* buf, int old_len) {
+    /* Erase old chars one by one with "\b \b". */
+    for (int k = 0; k < old_len; k++) printk("\b \b");
+    /* Print the new content. */
+    printk("%s", buf);
+}
+
+/* Try to complete the token at the end of input_buffer (which is
+ * currently `pos` chars long). On success, mutates input_buffer in
+ * place and returns the new cursor position. On no match, returns
+ * `pos` unchanged. Multi-match: prints the candidates on a new line
+ * (the caller is responsible for re-printing the prompt+buffer
+ * afterwards — for simplicity we just leave the input unchanged and
+ * let the user keep typing). */
+static int shell_tab_complete(int pos) {
+    if (pos <= 0) return pos;
+
+    /* Find the start of the current token (last whitespace). */
+    int tok_start = pos;
+    while (tok_start > 0 && input_buffer[tok_start - 1] != ' ' &&
+           input_buffer[tok_start - 1] != '\t') {
+        tok_start--;
+    }
+    int tok_len = pos - tok_start;
+    if (tok_len <= 0) return pos;
+
+    char token[64];
+    if (tok_len >= (int)sizeof(token)) tok_len = sizeof(token) - 1;
+    memcpy(token, input_buffer + tok_start, tok_len);
+    token[tok_len] = '\0';
+
+    /* ---- Step 1: command completion (only if no '/' in token) ---- */
+    if (strchr(token, '/') == NULL) {
+        const char* single_match = NULL;
+        int n_matches = 0;
+        for (int i = 0; shell_builtins[i] != NULL; i++) {
+            if (strncmp(shell_builtins[i], token, tok_len) == 0) {
+                single_match = shell_builtins[i];
+                n_matches++;
+            }
+        }
+        if (n_matches == 1 && single_match) {
+            /* Replace token with the full command + trailing space. */
+            int full_len = (int)strlen(single_match);
+            /* Make room: shift everything after `pos` by the delta. */
+            int delta = full_len - tok_len + 1;  /* +1 for trailing space */
+            if (pos + delta >= CMD_MAX_LEN) return pos;
+            /* Move the tail (if any). */
+            for (int k = pos; k >= tok_start + tok_len; k--) {
+                input_buffer[k + delta] = input_buffer[k];
+            }
+            /* Write the completed command + space. */
+            memcpy(input_buffer + tok_start, single_match, full_len);
+            input_buffer[tok_start + full_len] = ' ';
+            int new_pos = pos + delta;
+            input_buffer[new_pos] = '\0';
+            /* Redraw from tok_start onward. */
+            int old_visible = pos - tok_start;
+            for (int k = 0; k < old_visible; k++) printk("\b \b");
+            printk("%s", input_buffer + tok_start);
+            return new_pos;
+        }
+        if (n_matches > 1) {
+            /* List matches on a new line, then re-print the prompt
+             * and current input so the user can keep typing. */
+            printk("\n");
+            for (int i = 0; shell_builtins[i] != NULL; i++) {
+                if (strncmp(shell_builtins[i], token, tok_len) == 0) {
+                    printk("%s  ", shell_builtins[i]);
+                }
+            }
+            printk("\n");
+            return pos;  /* input unchanged */
+        }
+        /* No command match — fall through to file completion. */
+    }
+
+    /* ---- Step 2: file completion ---- */
+    /* Split token into dir + prefix at the last '/'. */
+    char dir[MAX_PATH_LEN];
+    char prefix[MAX_NAME_LEN];
+    const char* last_slash = strrchr(token, '/');
+    if (last_slash) {
+        int dlen = (int)(last_slash - token);
+        if (dlen >= (int)sizeof(dir)) dlen = sizeof(dir) - 1;
+        memcpy(dir, token, dlen);
+        dir[dlen] = '\0';
+        /* If the dir part is empty (token started with '/'), use "/". */
+        if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; }
+        /* Resolve relative dirs against cwd. */
+        if (dir[0] != '/') {
+            char tmp[MAX_PATH_LEN];
+            ksnprintf(tmp, sizeof(tmp), "%s/%s", cwd, dir);
+            strncpy(dir, tmp, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+        }
+        strncpy(prefix, last_slash + 1, sizeof(prefix) - 1);
+        prefix[sizeof(prefix) - 1] = '\0';
+    } else {
+        /* No '/' — complete against cwd. */
+        strncpy(dir, cwd, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        strncpy(prefix, token, sizeof(prefix) - 1);
+        prefix[sizeof(prefix) - 1] = '\0';
+    }
+    int prefix_len = (int)strlen(prefix);
+
+    /* Enumerate the directory. */
+    int fd = vfs_open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return pos;
+    char single_name[MAX_NAME_LEN] = {0};
+    int single_is_dir = 0;
+    int n_matches = 0;
+    struct dirent de;
+    while (1) {
+        int rc = vfs_readdir(fd, &de);
+        if (rc != 0 || de.name[0] == '\0') break;
+        if (prefix_len == 0 ||
+            strncmp(de.name, prefix, prefix_len) == 0) {
+            if (n_matches == 0) {
+                strncpy(single_name, de.name, sizeof(single_name) - 1);
+                single_name[sizeof(single_name) - 1] = '\0';
+                single_is_dir = (de.type == FT_DIRECTORY);
+            } else if (n_matches == 1) {
+                /* Second match — print the first one + this one. */
+                printk("\n%s  %s", single_name, de.name);
+            } else {
+                printk("  %s", de.name);
+            }
+            n_matches++;
+        }
+    }
+    vfs_close(fd);
+
+    if (n_matches == 1) {
+        /* Replace the prefix portion of the token with the full name.
+         * Append a '/' if it's a directory so the user can keep
+         * tab-completing subdirectories. */
+        int name_len = (int)strlen(single_name);
+        int extra = single_is_dir ? 1 : 0;  /* trailing '/' */
+        int delta = name_len + extra - prefix_len;
+        if (pos + delta >= CMD_MAX_LEN) return pos;
+        for (int k = pos; k >= tok_start + tok_len; k--) {
+            input_buffer[k + delta] = input_buffer[k];
+        }
+        memcpy(input_buffer + tok_start + (tok_len - prefix_len),
+               single_name, name_len);
+        if (single_is_dir) {
+            input_buffer[tok_start + (tok_len - prefix_len) + name_len] = '/';
+        }
+        int new_pos = pos + delta;
+        input_buffer[new_pos] = '\0';
+        int old_visible = pos - (tok_start + (tok_len - prefix_len));
+        for (int k = 0; k < old_visible; k++) printk("\b \b");
+        printk("%s", input_buffer + tok_start + (tok_len - prefix_len));
+        return new_pos;
+    }
+    if (n_matches > 1) {
+        printk("\n");
+        return pos;
+    }
+    /* No file match either — silently do nothing. */
+    return pos;
+}
+
 /* ----- input ---------------------------------------------------------- */
+/* Forward decl: defined further down, but read_line_serial references
+ * it for the Tab-completion redraw path. */
+static void print_prompt_serial(void);
+
 static int read_line(void) {
     int i = 0;
+    /* Save the in-progress input when the user first presses Up, so
+     * Down-arrow can restore it after browsing past the newest entry. */
+    char saved_input[CMD_MAX_LEN];
+    int  saved_len = 0;
+    saved_input[0] = '\0';
+    history_browse = history_count;  /* start "after" the last entry */
+
     while (i < CMD_MAX_LEN - 1) {
         char c = keyboard_getchar();
+
+        if (c == (char)SHELL_KEY_UP) {
+            /* Up arrow — recall the previous history entry. */
+            if (history_count == 0) continue;
+            if (history_browse == history_count) {
+                /* First Up press: save the current in-progress input. */
+                input_buffer[i] = '\0';
+                strncpy(saved_input, input_buffer, sizeof(saved_input) - 1);
+                saved_input[sizeof(saved_input) - 1] = '\0';
+                saved_len = i;
+            }
+            if (history_browse > 0) {
+                history_browse--;
+                char entry[HIST_LINE];
+                if (history_get(history_browse, entry, sizeof(entry)) == 0) {
+                    int old_i = i;
+                    strncpy(input_buffer, entry, CMD_MAX_LEN - 1);
+                    input_buffer[CMD_MAX_LEN - 1] = '\0';
+                    i = (int)strlen(input_buffer);
+                    shell_redraw_line(input_buffer, old_i);
+                }
+            }
+            continue;
+        }
+        if (c == (char)SHELL_KEY_DOWN) {
+            /* Down arrow — move forward in history. */
+            if (history_count == 0) continue;
+            if (history_browse < history_count) {
+                history_browse++;
+                int old_i = i;
+                if (history_browse == history_count) {
+                    /* Past the end — restore the saved in-progress input. */
+                    strncpy(input_buffer, saved_input, CMD_MAX_LEN - 1);
+                    input_buffer[CMD_MAX_LEN - 1] = '\0';
+                    i = saved_len;
+                } else {
+                    char entry[HIST_LINE];
+                    if (history_get(history_browse, entry, sizeof(entry)) == 0) {
+                        strncpy(input_buffer, entry, CMD_MAX_LEN - 1);
+                        input_buffer[CMD_MAX_LEN - 1] = '\0';
+                        i = (int)strlen(input_buffer);
+                    }
+                }
+                shell_redraw_line(input_buffer, old_i);
+            }
+            continue;
+        }
+        if (c == '\t') {
+            /* Tab — attempt completion. */
+            input_buffer[i] = '\0';
+            int new_i = shell_tab_complete(i);
+            if (new_i != i) {
+                i = new_i;
+            }
+            /* If no completion happened, re-print the prompt+input so
+             * the user sees where they are (matches the multi-match
+             * listing case). */
+            if (new_i == i && i > 0) {
+                printk("\n");
+                print_prompt();
+                printk("%s", input_buffer);
+            }
+            continue;
+        }
+
         if (c == '\n' || c == '\r') {
             input_buffer[i] = '\0';
             printk("\n");
@@ -2331,6 +2760,8 @@ static int read_line(void) {
             input_buffer[i++] = c;
             printk("%c", c);
         }
+        /* Any byte ≥ 0x80 (other arrow sentinels we don't handle here)
+         * is silently dropped by the c >= ' ' filter above. */
     }
     input_buffer[i] = '\0';
     return i;
@@ -2340,11 +2771,102 @@ static int read_line(void) {
 /* Reads a line from the serial port (COM1). No VGA or keyboard needed.
  * This is the primary I/O path in cloud/VPS mode where there is no
  * monitor or keyboard attached. All stdin/stdout/stderr goes through
- * COM1 (0x3F8). */
+ * COM1 (0x3F8).
+ *
+ * Supports the same Up/Down history and Tab completion as the PS/2
+ * read_line(). Arrow keys arrive as ANSI X3.64 / VT100 escape
+ * sequences: ESC [ A (Up), ESC [ B (Down). Tab is ASCII 0x09. */
 static int read_line_serial(void) {
     int i = 0;
+    char saved_input[CMD_MAX_LEN];
+    int  saved_len = 0;
+    saved_input[0] = '\0';
+    history_browse = history_count;
+
     while (i < CMD_MAX_LEN - 1) {
         char c = serial_getchar(COM1);
+
+        /* ESC starts a possible ANSI escape sequence. */
+        if (c == 0x1B) {
+            /* Peek: if the next two bytes are '[' + 'A'/'B', it's an
+             * arrow key. Otherwise treat ESC as a no-op. serial_getchar
+             * blocks, so we can safely read the next byte. */
+            char c2 = serial_getchar(COM1);
+            if (c2 == '[') {
+                char c3 = serial_getchar(COM1);
+                if (c3 == 'A') {
+                    /* Up arrow. */
+                    if (history_count == 0) continue;
+                    if (history_browse == history_count) {
+                        input_buffer[i] = '\0';
+                        strncpy(saved_input, input_buffer,
+                                sizeof(saved_input) - 1);
+                        saved_input[sizeof(saved_input) - 1] = '\0';
+                        saved_len = i;
+                    }
+                    if (history_browse > 0) {
+                        history_browse--;
+                        char entry[HIST_LINE];
+                        if (history_get(history_browse, entry,
+                                        sizeof(entry)) == 0) {
+                            int old_i = i;
+                            strncpy(input_buffer, entry, CMD_MAX_LEN - 1);
+                            input_buffer[CMD_MAX_LEN - 1] = '\0';
+                            i = (int)strlen(input_buffer);
+                            /* Erase old line, draw new. */
+                            for (int k = 0; k < old_i; k++)
+                                serial_puts(COM1, "\b \b");
+                            serial_puts(COM1, input_buffer);
+                        }
+                    }
+                    continue;
+                } else if (c3 == 'B') {
+                    /* Down arrow. */
+                    if (history_count == 0) continue;
+                    if (history_browse < history_count) {
+                        history_browse++;
+                        int old_i = i;
+                        if (history_browse == history_count) {
+                            strncpy(input_buffer, saved_input,
+                                    CMD_MAX_LEN - 1);
+                            input_buffer[CMD_MAX_LEN - 1] = '\0';
+                            i = saved_len;
+                        } else {
+                            char entry[HIST_LINE];
+                            if (history_get(history_browse, entry,
+                                            sizeof(entry)) == 0) {
+                                strncpy(input_buffer, entry, CMD_MAX_LEN - 1);
+                                input_buffer[CMD_MAX_LEN - 1] = '\0';
+                                i = (int)strlen(input_buffer);
+                            }
+                        }
+                        for (int k = 0; k < old_i; k++)
+                            serial_puts(COM1, "\b \b");
+                        serial_puts(COM1, input_buffer);
+                    }
+                    continue;
+                }
+                /* Other ANSI sequences (C/D = Left/Right, etc.) —
+                 * consume c3 and continue. */
+                continue;
+            }
+            /* ESC alone (no '[') — ignore. */
+            continue;
+        }
+
+        if (c == '\t') {
+            input_buffer[i] = '\0';
+            int new_i = shell_tab_complete(i);
+            if (new_i != i) {
+                i = new_i;
+            }
+            if (new_i == i && i > 0) {
+                serial_puts(COM1, "\r\n");
+                print_prompt_serial();
+                serial_puts(COM1, input_buffer);
+            }
+            continue;
+        }
         if (c == '\n' || c == '\r') {
             input_buffer[i] = '\0';
             serial_puts(COM1, "\r\n");
@@ -2374,13 +2896,25 @@ static void print_prompt_serial(void) {
 void shell_run(void) {
     printk("\n");
     printk("Lestra Shell (lsh) 1.0 - by Lee Muriithi Kingori\n");
-    printk("Type 'help' for available commands.\n");
+    printk("Type 'help' for available commands.  (Up/Down: history, Tab: complete)\n");
     printk("\n");
+
+    /* Install the arrow-key hook so Up/Down recall history (W1-F #4).
+     * The hook injects sentinel bytes into the PS/2 keyboard buffer
+     * that read_line() recognises. Safe to install here because in
+     * the text/recovery paths input_init() has NOT been called, so
+     * we're not clobbering input.c's hook. */
+    keyboard_set_handler(shell_kb_hook);
 
     while (1) {
         print_prompt();
         int len = read_line();
         if (len == 0) continue;
+        /* Record the command in the history ring before execution
+         * (matches bash, which stores the line regardless of exit
+         * status). Empty / duplicate-of-last entries are skipped by
+         * history_push itself. */
+        history_push(input_buffer);
         parse_args(input_buffer);
         if (argc > 0) {
             execute_command();
@@ -2403,13 +2937,14 @@ void shell_run(void) {
 void shell_run_serial(void) {
     serial_puts(COM1, "\r\n");
     serial_puts(COM1, "Lestra Shell (lsh) 1.0 - Cloud/VPS Serial Mode\r\n");
-    serial_puts(COM1, "Type 'help' for available commands.\r\n");
+    serial_puts(COM1, "Type 'help' for available commands.  (Up/Down: history, Tab: complete)\r\n");
     serial_puts(COM1, "\r\n");
 
     while (1) {
         print_prompt_serial();
         int len = read_line_serial();
         if (len == 0) continue;
+        history_push(input_buffer);
         parse_args(input_buffer);
         if (argc > 0) {
             /* Execute the command — output goes through printk which

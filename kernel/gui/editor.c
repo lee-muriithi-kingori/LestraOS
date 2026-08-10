@@ -9,6 +9,7 @@
  *   - Cursor movement (arrows, Home, End)
  *   - Insert/delete characters
  *   - Save/load via the in-memory VFS
+ *   - Ctrl+S saves the current buffer back to its file
  *
  * Good enough for editing config files or writing short scripts.
  */
@@ -23,6 +24,13 @@
 #include <lestra/printk.h>
 #include <lestra/timer.h>
 #include <string.h>
+
+/* Toast notifications (kernel/gui/notifications.c). Used to confirm
+ * saves and surface load errors without blocking the editor. */
+extern void notify_show(const char* title, const char* body, uint32_t color);
+#define EDIT_COLOR_OK      0xFF16A34A   /* green  - success */
+#define EDIT_COLOR_ERR     0xFFEF4444   /* red    - error   */
+#define EDIT_COLOR_INFO    UI_ACCENT    /* cyan   - info    */
 
 #define EDIT_W  600
 #define EDIT_H  440
@@ -69,6 +77,129 @@ static void editor_init(void) {
     editor_state.lines[0][0] = '\0';
     editor_state.line_lens[0] = 0;
     strcpy(editor_state.filename, "untitled.txt");
+}
+
+/* ---------- file load / save ---------- */
+
+/* Copy the basename component of `path` into `out` (NUL-terminated).
+ * e.g. "/docs/notes.txt" -> "notes.txt". Falls back to the full path
+ * if no '/' is present. */
+static void editor_basename(const char* path, char* out, size_t out_sz) {
+    if (!path || !out || out_sz == 0) return;
+    const char* slash = strrchr(path, '/');
+    const char* base = slash ? slash + 1 : path;
+    strncpy(out, base, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
+/* Load a file from the VFS into the editor buffer. Replaces the current
+ * buffer contents and sets the editor's filename to the basename of the
+ * path. Returns 0 on success, negative on error.
+ *
+ * Used by the file_explorer "Open" action (kernel/gui/file_explorer.c)
+ * and could be reused by any other GUI widget that needs to drop a file
+ * path into the editor. The editor widget itself does NOT need to be
+ * visible for this to work — it mutates the singleton editor_state. The
+ * caller is responsible for showing the editor widget (via
+ * editor_create + compositor_add / compositor_bring_to_front). */
+int editor_load_file(const char* path) {
+    if (!path || !*path) return -1;
+
+    int fd = vfs_open(path, O_RDONLY);
+    if (fd < 0) {
+        pr_info("editor: load '%s' failed (vfs_open rc=%d)\n", path, fd);
+        return -1;
+    }
+
+    /* Read into a flat scratch buffer first, then split into lines.
+     * The editor's total capacity is MAX_LINES * (MAX_LINE_LEN-1) so a
+     * 4 KiB scratch buffer is generous for the kind of small config
+     * files / scripts this editor is meant for. */
+    static char scratch[4096];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(scratch)) {
+        ssize_t n = vfs_read(fd, scratch + total,
+                             sizeof(scratch) - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    vfs_close(fd);
+
+    /* Reset the buffer. */
+    memset(editor_state.lines, 0, sizeof(editor_state.lines));
+    memset(editor_state.line_lens, 0, sizeof(editor_state.line_lens));
+    editor_state.n_lines = 0;
+    editor_state.cursor_row = 0;
+    editor_state.cursor_col = 0;
+    editor_state.scroll_row = 0;
+
+    /* Split scratch by '\n' into lines[]. Each line is NUL-terminated
+     * and truncated to MAX_LINE_LEN-1. '\r' (CRLF) is stripped. */
+    int row = 0;
+    int col = 0;
+    for (ssize_t i = 0; i < total && row < MAX_LINES; i++) {
+        char c = scratch[i];
+        if (c == '\r') continue;
+        if (c == '\n') {
+            editor_state.lines[row][col] = '\0';
+            editor_state.line_lens[row] = col;
+            row++;
+            col = 0;
+            continue;
+        }
+        if (c >= 0x20 && c < 0x7F && col < MAX_LINE_LEN - 1) {
+            editor_state.lines[row][col++] = c;
+        }
+    }
+    /* Flush the last line if the file didn't end with '\n'. */
+    if (row < MAX_LINES && (col > 0 || total == 0)) {
+        editor_state.lines[row][col] = '\0';
+        editor_state.line_lens[row] = col;
+        row++;
+    }
+    if (row == 0) {
+        /* Empty file — keep one blank line so the cursor has a home. */
+        editor_state.lines[0][0] = '\0';
+        editor_state.line_lens[0] = 0;
+        row = 1;
+    }
+    editor_state.n_lines = row;
+
+    editor_basename(path, editor_state.filename, sizeof(editor_state.filename));
+
+    pr_info("editor: loaded '%s' (%d lines, %d bytes)\n",
+            path, editor_state.n_lines, (int)total);
+    return 0;
+}
+
+/* Save the current buffer to `path` (creates or truncates). Returns 0
+ * on success, negative on error. Used by the Ctrl+S handler. */
+static int editor_save_to_file(const char* path) {
+    if (!path || !*path) return -1;
+
+    int fd = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        pr_info("editor: save '%s' failed (vfs_open rc=%d)\n", path, fd);
+        return -1;
+    }
+
+    int total = 0;
+    for (int i = 0; i < editor_state.n_lines; i++) {
+        int llen = editor_state.line_lens[i];
+        if (llen > 0) {
+            ssize_t w = vfs_write(fd, editor_state.lines[i], llen);
+            if (w > 0) total += w;
+        }
+        /* Always emit a '\n' after each line, matching the load-side
+         * split semantics (so a save->load round-trip preserves line
+         * counts exactly). */
+        ssize_t w = vfs_write(fd, "\n", 1);
+        if (w > 0) total += w;
+    }
+    vfs_close(fd);
+
+    pr_info("editor: saved '%s' (%d bytes)\n", path, total);
+    return 0;
 }
 
 static void editor_draw(struct widget* w) {
@@ -159,7 +290,50 @@ static void editor_on_event(struct widget* w, struct event* e) {
         return;
     }
 
-    if (e->type == EV_KEY_DOWN && st->active) {
+    if (e->type == EV_KEY_DOWN) {
+        /* Ctrl+S — save the buffer back to its file. The status bar
+         * has advertised "Ctrl+S: save" since day one but the handler
+         * was a no-op (W1-F). This works whether the editor is
+         * "active" (clicked-in) or merely focused, so a user can
+         * press Ctrl+S immediately after opening a file from the
+         * file_explorer without first clicking inside the editor.
+         *
+         * keyboard.c pushes the literal 's' (scancode 0x1F) into the
+         * key_buffer even when Ctrl is held (only Ctrl+C is special-
+         * cased to SIGINT), so we drain it here to keep the buffer
+         * in sync. */
+        if ((e->key.mods & MOD_CTRL) && e->key.scancode == KEY_S) {
+            if (keyboard_has_key()) (void)keyboard_getchar();
+
+            /* No filename set (still "untitled.txt") — there's nothing
+             * sensible to write to. Surface the error as a toast
+             * rather than silently writing to a literal
+             * "untitled.txt" in the root. */
+            if (strcmp(st->filename, "untitled.txt") == 0) {
+                notify_show("Editor",
+                            "No filename — open a file first",
+                            EDIT_COLOR_ERR);
+            } else {
+                int rc = editor_save_to_file(st->filename);
+                if (rc == 0) {
+                    char msg[80];
+                    ksnprintf(msg, sizeof(msg), "Saved %s",
+                              st->filename);
+                    notify_show("Editor", msg, EDIT_COLOR_OK);
+                } else {
+                    notify_show("Editor", "Save failed (see log)",
+                                EDIT_COLOR_ERR);
+                }
+            }
+            return;
+        }
+
+        /* All other keys only apply when the editor is active (user
+         * has clicked inside it). This matches the original behaviour
+         * and prevents typing into a different focused window from
+         * leaking into the editor buffer. */
+        if (!st->active) return;
+
         char c;
         if (keyboard_has_key()) {
             c = keyboard_getchar();

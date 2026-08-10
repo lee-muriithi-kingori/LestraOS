@@ -366,6 +366,19 @@ int fab_contains(int x, int y) {
 
 /* ----- widget management ----- */
 void compositor_add(struct widget* w) {
+    if (!w) return;
+    /* Deduplicate: if the widget is already in the array, leave it
+     * alone. The editor / file_explorer / etc. are singletons (one
+     * static struct widget per app), so two launchers calling
+     * editor_create() + compositor_add() would otherwise register
+     * the same pointer twice — which makes find_widget_at / event
+     * dispatch route the same event to the widget twice per frame. */
+    for (int i = 0; i < n_widgets; i++) {
+        if (widgets[i] == w) {
+            w->z = i;
+            return;
+        }
+    }
     if (n_widgets >= MAX_WIDGETS) return;
     w->z = n_widgets;
     widgets[n_widgets++] = w;

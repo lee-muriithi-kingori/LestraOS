@@ -885,13 +885,57 @@ int vfs_unlink(const char* path) {
 /* vfs_chmod — change permission bits on a memfs file or directory.
  * Preserves the file-type bits (S_IFMT) and replaces only the permission
  * bits (mode & 0777). Returns 0 on success, -1 if the path doesn't exist
- * in memfs (ext2 chmod not yet supported — falls through to -1). */
+ * in memfs. For ext2 paths we fall through to a best-effort unlink+recreate
+ * cycle (ext2_read_inode/ext2_write_inode are static to ext2.c so we can't
+ * update the inode in place — this is a documented gap until ext2.c exposes
+ * an ext2_chmod helper). */
 int vfs_chmod(const char* path, uint32_t mode) {
     if (!path || path[0] != '/') return -1;
 
     int idx = memfs_resolve_path(path);
     if (idx < 0) {
-        /* Not in memfs — ext2 chmod not implemented yet. */
+        /* Not in memfs. If it's on an ext2 mount, do a best-effort
+         * read+unlink+recreate+write cycle to apply the new mode.
+         * This only works for regular files (not directories) and
+         * only when ext2 is writable. */
+        int emi = find_ext2_mount_for_path(path);
+        if (emi >= 0 && ext2_is_mounted() && ext2_is_writable()) {
+            uint16_t cur_mode = ext2_get_inode_mode(path);
+            if (cur_mode == 0) return -1;
+            /* Only proceed for regular files (0x8000). */
+            if ((cur_mode & 0xF000) != 0x8000) return -1;
+            /* Read current contents into a kmalloc'd buffer. */
+            int sz = ext2_read_file(path, NULL, 0);
+            if (sz < 0) sz = 0;
+            uint8_t* buf = NULL;
+            if (sz > 0) {
+                buf = (uint8_t*)kmalloc((size_t)sz);
+                if (!buf) return -1;
+                if (ext2_read_file(path, buf, (uint32_t)sz) < 0) {
+                    kfree(buf);
+                    return -1;
+                }
+            }
+            /* Unlink the old file (frees its inode + blocks). */
+            if (ext2_unlink(path) <= 0) {
+                if (buf) kfree(buf);
+                return -1;
+            }
+            /* Recreate with the new mode (preserve type bit, set perm bits). */
+            uint16_t new_mode = (uint16_t)((cur_mode & 0xF000) | (mode & 0xFFF));
+            uint32_t ino = ext2_create_file(path, new_mode);
+            if (ino == 0) {
+                if (buf) kfree(buf);
+                return -1;
+            }
+            /* Write the contents back. */
+            if (buf && sz > 0) {
+                ext2_write_file(path, buf, (uint32_t)sz);
+                kfree(buf);
+            }
+            pr_info("VFS: chmod '%s' mode 0%o (ext2 recreate)\n", path, new_mode);
+            return 0;
+        }
         return -1;
     }
 
@@ -909,13 +953,18 @@ int vfs_chmod(const char* path, uint32_t mode) {
  *   - the target is not a directory
  *   - the target is the root directory (idx 0)
  *   - the directory is not empty (num_children > 0)
- * (ext2 rmdir not yet supported — falls through to -1.) */
+ * For paths on an ext2 mount, delegates to ext2_unlink() (which already
+ * handles directories by freeing their blocks + dir entry). */
 int vfs_rmdir(const char* path) {
     if (!path || path[0] != '/') return -1;
 
     int idx = memfs_resolve_path(path);
     if (idx < 0) {
-        /* Not in memfs — ext2 rmdir not implemented yet. */
+        /* Not in memfs — try ext2 (ext2_unlink already handles dirs). */
+        int emi = find_ext2_mount_for_path(path);
+        if (emi >= 0 && ext2_is_mounted()) {
+            return ext2_unlink(path) > 0 ? 0 : -1;
+        }
         return -1;
     }
 
@@ -937,6 +986,144 @@ int vfs_rmdir(const char* path) {
     fs_num_files--;
     pr_info("VFS: rmdir '%s'\n", path);
     return 0;
+}
+
+/* vfs_rename — rename oldpath to newpath, possibly re-parenting.
+ *
+ * POSIX semantics implemented:
+ *   - If oldpath doesn't exist → -1 (ENOENT).
+ *   - If newpath exists and is a file → unlink it first, then rename.
+ *   - If newpath exists and is an empty directory → unlink it first.
+ *   - If newpath exists and is a non-empty directory → -1 (ENOTEMPTY).
+ *   - oldpath and newpath must be on the same filesystem (memfs→memfs OK,
+ *     ext2→ext2 OK; cross-FS rename returns -1 → -EXDEV at the syscall
+ *     layer).
+ *
+ * memfs: re-parent the mem_file (remove from old parent's children list,
+ *        add to new parent's children list, update basename). The mem_file
+ *        slot, contents, and inode are preserved.
+ *
+ * ext2: ext2 has no rename primitive, so we do unlink+create+copy+unlink:
+ *       read old file's contents, unlink old, create new with old's mode,
+ *       write contents to new. Directories on ext2 are NOT supported
+ *       (returns -1 → caller maps to -EISDIR/-EPERM as appropriate).
+ */
+int vfs_rename(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+    if (oldpath[0] != '/' || newpath[0] != '/') return -1;
+    if (strcmp(oldpath, newpath) == 0) return 0;  /* no-op */
+
+    /* Try memfs first. */
+    int old_idx = memfs_resolve_path(oldpath);
+
+    if (old_idx >= 0) {
+        /* ===== memfs → memfs ===== */
+        /* Don't allow renaming the root directory. */
+        if (old_idx == ROOT_IDX) return -1;
+
+        /* Resolve newpath's parent. */
+        char new_basename[MAX_NAME_LEN];
+        int new_parent_idx;
+        if (memfs_split_path(newpath, &new_parent_idx,
+                             new_basename, sizeof(new_basename)) < 0) {
+            return -1;
+        }
+        if (!fs_files[new_parent_idx].is_dir) return -1;
+
+        /* If newpath already exists, handle the replace case. */
+        int new_idx = memfs_resolve_path(newpath);
+        if (new_idx >= 0) {
+            if (new_idx == ROOT_IDX) return -1;          /* can't replace root */
+            if (fs_files[old_idx].is_dir && !fs_files[new_idx].is_dir)
+                return -1;   /* can't rename dir over file */
+            if (fs_files[old_idx].is_dir && fs_files[new_idx].is_dir) {
+                /* Both dirs: new must be empty. */
+                if (fs_files[new_idx].num_children > 0) return -1;
+            }
+            /* Detach + free the newpath slot. */
+            int np = fs_files[new_idx].parent_idx;
+            if (np >= 0 && np < MAX_FILES) memfs_remove_child(np, new_idx);
+            fs_files[new_idx].exists = 0;
+            fs_files[new_idx].num_children = 0;
+            fs_num_files--;
+        }
+
+        /* Detach old from its current parent. */
+        int old_parent = fs_files[old_idx].parent_idx;
+        if (old_parent >= 0 && old_parent < MAX_FILES) {
+            memfs_remove_child(old_parent, old_idx);
+        }
+
+        /* Re-parent old under new_parent with the new basename. */
+        strncpy(fs_files[old_idx].name, new_basename, MAX_NAME_LEN - 1);
+        fs_files[old_idx].name[MAX_NAME_LEN - 1] = '\0';
+        fs_files[old_idx].parent_idx = new_parent_idx;
+        memfs_add_child(new_parent_idx, old_idx);
+
+        pr_info("VFS: rename '%s' -> '%s' (memfs idx %d)\n",
+                oldpath, newpath, old_idx);
+        return 0;
+    }
+
+    /* ===== ext2 → ext2 (file only, best-effort) ===== */
+    int emi = find_ext2_mount_for_path(oldpath);
+    if (emi >= 0 && ext2_is_mounted()) {
+        /* Cross-device check: newpath must be on the same mount. */
+        int emi_new = find_ext2_mount_for_path(newpath);
+        if (emi_new < 0) return -1;   /* EXDEV at syscall layer */
+
+        uint16_t old_mode = ext2_get_inode_mode(oldpath);
+        if (old_mode == 0) return -1;       /* ENOENT */
+        /* Only regular files are supported on ext2 (dir rename would
+         * require recursively copying children). */
+        if ((old_mode & 0xF000) != 0x8000) return -1;
+
+        /* Read old file's contents into a kmalloc'd buffer. */
+        int sz = ext2_read_file(oldpath, NULL, 0);
+        if (sz < 0) sz = 0;
+        uint8_t* buf = NULL;
+        if (sz > 0) {
+            buf = (uint8_t*)kmalloc((size_t)sz);
+            if (!buf) return -1;
+            if (ext2_read_file(oldpath, buf, (uint32_t)sz) < 0) {
+                kfree(buf);
+                return -1;
+            }
+        }
+
+        /* If newpath already exists, unlink it first. */
+        if (ext2_get_inode_mode(newpath) != 0) {
+            if (ext2_unlink(newpath) <= 0) {
+                if (buf) kfree(buf);
+                return -1;
+            }
+        }
+
+        /* Create newpath with old's mode, write contents. */
+        uint32_t ino = ext2_create_file(newpath, old_mode);
+        if (ino == 0) {
+            if (buf) kfree(buf);
+            return -1;
+        }
+        if (buf && sz > 0) {
+            ext2_write_file(newpath, buf, (uint32_t)sz);
+            kfree(buf);
+        }
+
+        /* Unlink the old path. */
+        if (ext2_unlink(oldpath) <= 0) {
+            /* Best-effort cleanup: leave the new copy in place. */
+            pr_warn("VFS: rename: old '%s' unlink failed (data copied to '%s')\n",
+                    oldpath, newpath);
+            return 0;
+        }
+
+        pr_info("VFS: rename '%s' -> '%s' (ext2 recreate)\n",
+                oldpath, newpath);
+        return 0;
+    }
+
+    return -1;
 }
 
 /* vfs_selftest — exercise mkdir, create, stat, chmod, rmdir, and the

@@ -13,18 +13,24 @@
  *     segments, jumps to entry.
  *   - VDSO stub: returns 0 for the Linux VDSO lookup (most binaries
  *     fall back to vsyscall/gettimeofday via syscall).
- *   - Syscall translation: handles the 30 most common Linux x86_64
+ *   - Syscall translation: handles the 50+ most common Linux x86_64
  *     syscalls (read, write, open, close, stat, fstat, lstat, mmap,
- *     munmap, brk, ioctl, access, pipe, dup, dup2, sendfile, etc.).
- *     Unimplemented syscalls return -ENOSYS so the binary can decide
- *     whether to fail or fall back.
+ *     munmap, brk, ioctl, access, pipe, dup, dup2, fcntl, socket,
+ *     bind, connect, listen, accept, sendto, recvfrom, fork, vfork,
+ *     clone-as-fork, sysinfo, getppid, etc.). Unimplemented syscalls
+ *     return -ENOSYS so the binary can decide whether to fail or
+ *     fall back.
  *
  * Known limitations:
  *   - No shared library loading yet. Static-pie binaries work; dynamic
  *     binaries (most of glibc) need an ld-linux loader port.
  *   - Signals forwarded to native implementation (kill/sigaction/sigprocmask/sigreturn).
- *   - No threads (clone returns -ENOSYS).
- *   - No fork (returns -ENOSYS) — use vfork instead.
+ *   - No threads: clone() is translated to fork() (flags ignored), so
+ *     CLONE_VM/CLONE_THREAD still doesn't work. True thread support
+ *     needs a thread-aware scheduler (XL complexity).
+ *   - sendto/recvfrom ignore the addr argument (works for connected
+ *     sockets only; unconnected UDP sendto is not supported).
+ *   - fcntl FD_CLOEXEC is accepted but not stored (no exec yet).
  *
  * To try: copy a statically-linked Linux binary (e.g. busybox, or a
  * Go binary built with CGO_ENABLED=0) into /opt/, then in the
@@ -36,13 +42,22 @@
 #include <lestra/printk.h>
 #include <lestra/vfs.h>
 #include <lestra/uaccess.h>
+#include <lestra/sched.h>
+#include <lestra/mm.h>
 #include <string.h>
 
 /* The kernel doesn't have a syscall() wrapper (that's libc-only). We
  * call the LestraOS syscall numbers directly via inline asm. Supports
- * up to 6 args. */
+ * up to 6 args.
+ *
+ * IMPORTANT: We must temporarily flip the current process's
+ * is_linux_process flag to 0 around the inner syscall, otherwise
+ * syscall_dispatch would re-route the inner call back into
+ * linux_compat_dispatch (infinite recursion / wrong dispatch). */
 static inline int64_t lestra_syscall6(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     int64_t ret;
+    int saved_linux = proc_is_linux_process();
+    if (saved_linux) proc_set_linux_process(0);
     register uint64_t r10 __asm__("r10") = a4;
     register uint64_t r8  __asm__("r8")  = a5;
     register uint64_t r9  __asm__("r9")  = a6;
@@ -52,6 +67,7 @@ static inline int64_t lestra_syscall6(uint64_t num, uint64_t a1, uint64_t a2, ui
         : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory"
     );
+    if (saved_linux) proc_set_linux_process(saved_linux);
     return ret;
 }
 
@@ -183,8 +199,40 @@ static inline int64_t lestra_syscall6(uint64_t num, uint64_t a1, uint64_t a2, ui
 #define LESTRA_SYS_RT_SIGACTION    25
 #define LESTRA_SYS_RT_SIGPROCMASK  26
 #define LESTRA_SYS_RT_SIGRETURN    27
+#define LESTRA_SYS_DUP2            28
+#define LESTRA_SYS_UNLINK          29
+#define LESTRA_SYS_CHMOD           30
+#define LESTRA_SYS_FSTAT           31
+#define LESTRA_SYS_ACCESS          32
+#define LESTRA_SYS_RENAME          33
+#define LESTRA_SYS_IOCTL           34
+#define LESTRA_SYS_GETUID          35
+#define LESTRA_SYS_GETGID          36
+#define LESTRA_SYS_GETPPID         37
+#define LESTRA_SYS_SETUID          38
+#define LESTRA_SYS_SOCKET          44
+#define LESTRA_SYS_BIND            45
+#define LESTRA_SYS_CONNECT         46
+#define LESTRA_SYS_LISTEN          47
+#define LESTRA_SYS_ACCEPT          48
+#define LESTRA_SYS_SEND            49
+#define LESTRA_SYS_RECV            50
 
-/* Linux errno values (must match what glibc expects). */
+/* Linux fcntl commands (we implement inline since native sys_fcntl
+ * does not exist yet). */
+#define LINUX_F_DUPFD   0
+#define LINUX_F_GETFD   1
+#define LINUX_F_SETFD   2
+#define LINUX_F_GETFL   3
+#define LINUX_F_SETFL   4
+#define LINUX_FD_CLOEXEC 1
+/* Linux O_NONBLOCK / O_APPEND bits that may be set via F_SETFL. */
+#define LINUX_O_NONBLOCK  0x800
+#define LINUX_O_APPEND    0x400
+
+/* Linux errno values (must match what glibc expects).
+ * LestraOS uses the same numeric values (verified in syscall.c), so
+ * errno pass-through works without translation. */
 #define LINUX_EPERM            1
 #define LINUX_ENOENT           2
 #define LINUX_EIO              5
@@ -193,6 +241,8 @@ static inline int64_t lestra_syscall6(uint64_t num, uint64_t a1, uint64_t a2, ui
 #define LINUX_EACCES          13
 #define LINUX_EFAULT          14
 #define LINUX_EINVAL          22
+#define LINUX_EMFILE          24
+#define LINUX_ENOTTY          25
 #define LINUX_ENOSYS          38
 #define LINUX_ERANGE          34
 #define LINUX_ENAMETOOLONG    36
@@ -236,13 +286,10 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
             return (int64_t)lestra_syscall6(LESTRA_SYS_STAT, a1, a2, 0, 0, 0, 0);
 
         case LINUX_SYS_FSTAT: {
-            /* LestraOS doesn't have fstat yet - fake success with a
-             * zeroed stat struct so the binary doesn't crash.
-             * SMAP-safe: use clear_user instead of direct memset. */
-            if (!a2) return -LINUX_EFAULT;
-            if (!access_ok((void*)a2, 144)) return -LINUX_EFAULT;
-            if (clear_user((void*)a2, 144) < 0) return -LINUX_EFAULT;
-            return 0;
+            /* Translate to native sys_fstat (LESTRA_SYS_FSTAT=31).
+             * Native returns Lestra errno (same numeric values as Linux),
+             * so pass-through works. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_FSTAT, a1, a2, 0, 0, 0, 0);
         }
 
         case LINUX_SYS_LSEEK:
@@ -266,27 +313,41 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
             return (int64_t)lestra_syscall6(LESTRA_SYS_BRK, a1, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_IOCTL:
-            /* Most ioctls are no-ops for our purposes; pretend success. */
-            return 0;
+            /* Delegate to native sys_ioctl (LESTRA_SYS_IOCTL=34).
+             * Native handles TCGETS/TCSETS/FIONREAD and returns -ENOTTY
+             * for unsupported requests — same errno values as Linux. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_IOCTL, a1, a2, a3, 0, 0, 0);
 
         case LINUX_SYS_ACCESS:
-            /* Pretend everything is accessible. */
-            return 0;
+            /* Delegate to native sys_access (LESTRA_SYS_ACCESS=32). */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_ACCESS, a1, a2, 0, 0, 0, 0);
 
-        case LINUX_SYS_DUP:
-            /* We don't have dup; fake it by returning the same fd. */
-            return (int64_t)a1;
+        case LINUX_SYS_DUP: {
+            /* Linux dup(oldfd) returns the lowest available fd that is
+             * a copy of oldfd. Native LestraOS only has sys_dup2, so we
+             * find the lowest free fd and call dup2(oldfd, free_fd). */
+            struct process* cur = task_current();
+            if (!cur) return -LINUX_EBADF;
+            if ((int64_t)a1 < 0 || (int64_t)a1 >= MAX_FD_PER_PROC) return -LINUX_EBADF;
+            if (cur->fds[a1].type == FD_UNUSED) return -LINUX_EBADF;
+            int newfd = -1;
+            for (int i = 0; i < MAX_FD_PER_PROC; i++) {
+                if (cur->fds[i].type == FD_UNUSED) { newfd = i; break; }
+            }
+            if (newfd < 0) return -LINUX_EMFILE;
+            return (int64_t)lestra_syscall6(LESTRA_SYS_DUP2, a1, (uint64_t)newfd, 0, 0, 0, 0);
+        }
 
         case LINUX_SYS_DUP2:
-            /* Same as dup but to a specific fd. */
-            return (int64_t)a2;
+            /* Delegate to native sys_dup2 (LESTRA_SYS_DUP2=28). */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_DUP2, a1, a2, 0, 0, 0, 0);
 
         case LINUX_SYS_GETPID:
             return (int64_t)lestra_syscall6(LESTRA_SYS_GETPID, 0, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_GETPPID:
-            /* LestraOS doesn't expose getppid yet. Return 1 (init). */
-            return 1;
+            /* Delegate to native sys_getppid (LESTRA_SYS_GETPPID=37). */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_GETPPID, 0, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_GETUID:
         case LINUX_SYS_GETGID:
@@ -366,10 +427,19 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
             return (int64_t)lestra_syscall6(LESTRA_SYS_RT_SIGRETURN, 0, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_CLONE:
+            /* Linux clone(flags, child_stack, ptid, ctid, newtls).
+             * True clone() with CLONE_VM/CLONE_THREAD needs a thread-aware
+             * scheduler (XL complexity — sched_clone_thread is still a
+             * stub). For now, treat clone-as-fork: ignore the flags and
+             * call proc_fork via LESTRA_SYS_FORK. This unblocks Linux
+             * binaries that call clone() for fork-like behavior; threads
+             * still don't work. */
+            /* fallthrough */
         case LINUX_SYS_FORK:
         case LINUX_SYS_VFORK:
-            /* No threads/fork yet. */
-            return -LINUX_ENOSYS;
+            /* Native proc_fork returns child pid (>0) in parent, 0 in
+             * child, -1 on error — same convention as Linux fork(). */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_FORK, 0, 0, 0, 0, 0, 0);
 
         case LINUX_SYS_WAIT4:
             return (int64_t)lestra_syscall6(LESTRA_SYS_WAITPID, a1, a2, a3, 0, 0, 0);
@@ -377,34 +447,125 @@ int64_t linux_compat_dispatch(uint64_t linux_num,
         case LINUX_SYS_KILL:
             return (int64_t)lestra_syscall6(LESTRA_SYS_KILL, a1, a2, 0, 0, 0, 0);
 
-        case LINUX_SYS_FCNTL:
-            /* Most fcntl cmds are no-ops for us. */
-            return 0;
+        case LINUX_SYS_FCNTL: {
+            /* Linux fcntl(fd, cmd, arg). Native LestraOS does not yet
+             * have a sys_fcntl syscall, so we implement the common cmds
+             * inline against the current process's fd table. */
+            struct process* cur = task_current();
+            if (!cur) return -LINUX_EBADF;
+            int fd = (int)a1;
+            int cmd = (int)a2;
+            if (fd < 0 || fd >= MAX_FD_PER_PROC) return -LINUX_EBADF;
+            struct fd_entry* e = &cur->fds[fd];
+            if (e->type == FD_UNUSED) return -LINUX_EBADF;
+            switch (cmd) {
+                case LINUX_F_DUPFD: {
+                    /* Duplicate fd to lowest >= arg. */
+                    int start = (int)a3;
+                    if (start < 0) start = 0;
+                    if (start >= MAX_FD_PER_PROC) return -LINUX_EINVAL;
+                    int newfd = -1;
+                    for (int i = start; i < MAX_FD_PER_PROC; i++) {
+                        if (cur->fds[i].type == FD_UNUSED) { newfd = i; break; }
+                    }
+                    if (newfd < 0) return -LINUX_EMFILE;
+                    return (int64_t)lestra_syscall6(LESTRA_SYS_DUP2,
+                                                     (uint64_t)fd, (uint64_t)newfd, 0, 0, 0, 0);
+                }
+                case LINUX_F_GETFD:
+                    /* We don't track FD_CLOEXEC yet; report it as clear. */
+                    return 0;
+                case LINUX_F_SETFD:
+                    /* Accept FD_CLOEXEC silently (no-op until exec exists). */
+                    return 0;
+                case LINUX_F_GETFL:
+                    /* Return the open flags stored on the fd entry. */
+                    return (int64_t)e->flags;
+                case LINUX_F_SETFL: {
+                    /* Allow O_APPEND / O_NONBLOCK changes (mask out
+                     * access mode which can't be changed post-open). */
+                    int mask = LINUX_O_APPEND | LINUX_O_NONBLOCK;
+                    e->flags = (e->flags & ~mask) | ((int)a3 & mask);
+                    return 0;
+                }
+                default:
+                    /* Unknown cmds (F_GETLK/F_SETLK/F_GETOWN/...): pretend
+                     * success so the binary doesn't abort. */
+                    return 0;
+            }
+        }
 
         case LINUX_SYS_SOCKET:
-        case LINUX_SYS_CONNECT:
-        case LINUX_SYS_ACCEPT:
-        case LINUX_SYS_SENDTO:
-        case LINUX_SYS_RECVFROM:
+            /* Linux socket(domain, type, protocol) = LestraOS socket. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_SOCKET, a1, a2, a3, 0, 0, 0);
+
         case LINUX_SYS_BIND:
+            /* Linux bind(fd, addr, addrlen) = LestraOS bind. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_BIND, a1, a2, a3, 0, 0, 0);
+
+        case LINUX_SYS_CONNECT:
+            /* Linux connect(fd, addr, addrlen) = LestraOS connect. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_CONNECT, a1, a2, a3, 0, 0, 0);
+
         case LINUX_SYS_LISTEN:
-            /* Socket syscalls - return -ENOSYS so binaries fall back
-             * to other I/O. A future port could translate to LestraOS
-             * net_connect/net_send/net_recv. */
-            return -LINUX_ENOSYS;
+            /* Linux listen(fd, backlog) = LestraOS listen. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_LISTEN, a1, a2, 0, 0, 0, 0);
+
+        case LINUX_SYS_ACCEPT:
+            /* Linux accept(fd, addr, addrlen_ptr) = LestraOS accept.
+             * Native sys_accept takes (fd, addr, addrlen_ptr) — same. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_ACCEPT, a1, a2, a3, 0, 0, 0);
+
+        case LINUX_SYS_SENDTO:
+            /* Linux sendto(fd, buf, len, flags, addr, addrlen).
+             * Native sys_send(fd, buf, len, flags) is sendto with a NULL
+             * addr — it uses the connected peer for TCP, or the
+             * previously-bound dest for UDP. We translate sendto → send
+             * and IGNORE the addr argument. This works for connected
+             * sockets (the common case for Linux TCP clients); it does
+             * NOT support unconnected UDP sendto (limitation: documented). */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_SEND, a1, a2, a3, a4, 0, 0);
+
+        case LINUX_SYS_RECVFROM:
+            /* Linux recvfrom(fd, buf, len, flags, addr, addrlen_ptr).
+             * Translate to sys_recv(fd, buf, len, flags) — the src addr
+             * is NOT filled in. Works for connected sockets; the caller
+             * sees addr=NULL semantics. */
+            return (int64_t)lestra_syscall6(LESTRA_SYS_RECV, a1, a2, a3, a4, 0, 0);
 
         case LINUX_SYS_SYSINFO: {
-            /* Linux struct sysinfo is 112 bytes.
-             * SMAP-safe: build in kernel buffer, copy_to_user. */
+            /* Linux struct sysinfo is 112 bytes:
+             *   int64 totalram, freeram, sharedram, bufferram;
+             *   int32 procs;
+             *   ... padding ...
+             *   int64 totalhigh, freehigh;
+             *   int32 mem_unit;
+             * SMAP-safe: build in kernel buffer, copy_to_user.
+             * Read real PMM stats (pmm_get_total / pmm_get_free) and a
+             * real process count by walking the global process table. */
             if (!a1) return -LINUX_EFAULT;
             if (!access_ok((void*)a1, 112)) return -LINUX_EFAULT;
+            uint64_t total = (uint64_t)pmm_get_total();
+            uint64_t free_ = (uint64_t)pmm_get_free();
+            /* pmm_get_used() is available but not exposed in sysinfo's
+             * standard fields — keep the call so the linker notices if
+             * PMM stats ever disappear, but don't store the value. */
+            (void)pmm_get_used();
+            /* Count live (non-free, non-zombie) processes for `procs`. */
+            int procs_count = 0;
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (procs[i].state != PROC_FREE && procs[i].state != PROC_ZOMBIE) {
+                    procs_count++;
+                }
+            }
             uint8_t kbuf[112];
             memset(kbuf, 0, 112);
-            *(int64_t*)(kbuf + 0)  = 4 * 1024 * 1024;  /* totalram (4 GB) */
-            *(int64_t*)(kbuf + 8)  = 1 * 1024 * 1024;  /* freeram (1 GB) */
+            *(int64_t*)(kbuf + 0)  = (int64_t)total;   /* totalram (bytes) */
+            *(int64_t*)(kbuf + 8)  = (int64_t)free_;   /* freeram (bytes) */
             *(int64_t*)(kbuf + 16) = 0;                /* sharedram */
             *(int64_t*)(kbuf + 24) = 0;                /* bufferram */
-            *(int32_t*)(kbuf + 40) = 100;              /* procs */
+            *(int32_t*)(kbuf + 40) = procs_count;      /* procs */
+            /* totalswap/freeswap/.../totalhigh/freehigh/mem_unit are 0 */
             if (copy_to_user((void*)a1, kbuf, 112) < 0) return -LINUX_EFAULT;
             return 0;
         }

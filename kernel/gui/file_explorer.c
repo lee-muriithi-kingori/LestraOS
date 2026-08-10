@@ -22,6 +22,23 @@
 #include <lestra/printk.h>
 #include <string.h>
 
+/* Toast notifications + editor launcher (sibling gui/ modules). */
+extern void notify_show(const char* title, const char* body, uint32_t color);
+extern struct widget* editor_create(int x, int y);
+extern void compositor_add(struct widget* w);
+extern void compositor_bring_to_front(struct widget* w);
+extern int  editor_load_file(const char* path);
+
+/* vfs_rename() is being added by task W3-B in kernel/fs/vfs.c. It is
+ * not yet declared in <lestra/vfs.h>, so we forward-declare it here
+ * with the agreed signature. If W3-B's signature changes, only this
+ * one line needs updating. */
+extern int vfs_rename(const char* oldpath, const char* newpath);
+
+#define FE_COLOR_OK      0xFF16A34A   /* green  - success */
+#define FE_COLOR_ERR     0xFFEF4444   /* red    - error   */
+#define FE_COLOR_INFO    UI_ACCENT    /* cyan   - info    */
+
 #define FE_W    720
 #define FE_H    460
 #define FE_TITLE_H 36
@@ -49,10 +66,26 @@ struct fe_state {
     int  ctx_x, ctx_y;
     int  ctx_target;     /* index into entries[] */
     int  list_scroll;    /* index of first visible entry in the grid */
+    /* Inline rename modal state. When rename_active == 1, the widget
+     * captures EV_KEY_DOWN events to build the new filename, draws a
+     * centered input box over the grid, and calls vfs_rename() on
+     * Enter. Esc cancels. This is a self-contained modal — the rest
+     * of the GUI has no input-dialog primitive (kernel/gui/dialogs.c
+     * only has About + Help), so the file_explorer rolls its own. */
+    int  rename_active;
+    int  rename_target;              /* index into entries[] */
+    char rename_buf[FE_NAME_MAX];
+    int  rename_len;
 };
 
 static struct fe_state fe_state;
 static struct widget   fe_widget;
+
+/* Singleton editor widget pointer. We lazily create the editor the
+ * first time the user asks to Open a file, and reuse the same widget
+ * on subsequent Opens (the editor state is a singleton too, see
+ * kernel/gui/editor.c). */
+static struct widget* fe_editor_w = NULL;
 
 /* ---------- path helpers ---------- */
 static void fe_normalize_path(const char* in, char* out, size_t out_sz) {
@@ -250,6 +283,47 @@ static void fe_draw_ctx(struct widget* w) {
     }
 }
 
+/* ---------- inline rename modal ---------- */
+/* A small centered input box drawn over the grid when rename_active.
+ * The user types a new name; Enter confirms (vfs_rename), Esc cancels.
+ * We render a dimmed overlay so the rest of the grid reads as inert
+ * while the modal is up. */
+#define FE_RENAME_BOX_W  320
+#define FE_RENAME_BOX_H  100
+
+static void fe_draw_rename_modal(struct widget* w) {
+    if (!fe_state.rename_active) return;
+
+    /* Dim overlay over the whole widget. */
+    fb_fill_rect(w->x, w->y + FE_TITLE_H, w->w, w->h - FE_TITLE_H,
+                 0x80000000u);
+
+    int bx = w->x + (w->w - FE_RENAME_BOX_W) / 2;
+    int by = w->y + (w->h - FE_RENAME_BOX_H) / 2;
+    fb_draw_rounded(bx, by, FE_RENAME_BOX_W, FE_RENAME_BOX_H, 8,
+                    UI_CARD_BG, UI_ACCENT);
+
+    /* Title. */
+    fb_draw_string(bx + 12, by + 10, "Rename to:", UI_TEXT_PRIMARY);
+
+    /* Input field background. */
+    int fx = bx + 12, fy = by + 34, fw = FE_RENAME_BOX_W - 24, fh = 24;
+    fb_fill_rect(fx, fy, fw, fh, 0xFF0A0C12);
+    fb_draw_string(fx + 4, fy + 4, fe_state.rename_buf, UI_TEXT_PRIMARY);
+
+    /* Blinking cursor (toggles every 500ms — matches the editor). */
+    extern uint64_t timer_get_ms(void);
+    if ((timer_get_ms() / 500) % 2 == 0) {
+        int cx = fx + 4 + fe_state.rename_len * 8;
+        fb_fill_rect(cx, fy + 2, 8, fh - 4, UI_ACCENT);
+    }
+
+    /* Hint line. */
+    fb_draw_string_small(bx + 12, by + 68,
+                         "Enter: confirm    Esc: cancel",
+                         UI_TEXT_MUTED);
+}
+
 /* ---------- main draw ---------- */
 static void fe_draw(struct widget* w) {
     extern void ui_draw_card(int x, int y, int w, int h, int focused);
@@ -262,6 +336,7 @@ static void fe_draw(struct widget* w) {
     fe_draw_sidebar(w);
     fe_draw_grid(w);
     fe_draw_ctx(w);
+    fe_draw_rename_modal(w);
 }
 
 /* ---------- event handling ---------- */
@@ -279,7 +354,195 @@ static int fe_hit_grid_cell(struct widget* w, int mx, int my, int* idx_out) {
     return 1;
 }
 
+/* ---------- file actions (Open / Delete / Rename) ----------
+ *
+ * These were the three stubs flagged in W1-F: Open for a non-dir only
+ * pr_info()'d, Delete and Rename were "(stub)". They now drive real
+ * VFS operations (vfs_open via editor_load_file, vfs_unlink, and
+ * vfs_rename — the latter added by task W3-B) and surface the result
+ * as a toast notification (kernel/gui/notifications.c). */
+
+/* Lazily create the editor widget if needed, show it, and load the
+ * given path into its buffer. The editor widget is a singleton
+ * (single static editor_widget in editor.c) so the same pointer is
+ * reused across Opens. */
+static void fe_launch_editor_with_file(const char* path) {
+    if (!fe_editor_w) {
+        fe_editor_w = editor_create(200, 60);
+        if (fe_editor_w) compositor_add(fe_editor_w);
+    }
+    if (!fe_editor_w) return;
+    fe_editor_w->visible = 1;
+    compositor_bring_to_front(fe_editor_w);
+
+    int rc = editor_load_file(path);
+    if (rc == 0) {
+        char msg[96];
+        ksnprintf(msg, sizeof(msg), "Opened %s", path);
+        notify_show("File Explorer", msg, FE_COLOR_OK);
+    } else {
+        char msg[96];
+        ksnprintf(msg, sizeof(msg), "Could not open %s", path);
+        notify_show("File Explorer", msg, FE_COLOR_ERR);
+    }
+}
+
+/* Build the full VFS path for the entry at index `idx` and write it
+ * into `out` (NUL-terminated). Returns 0 on success, -1 if idx is out
+ * of range or out is too small. */
+static int fe_entry_path(int idx, char* out, size_t out_sz) {
+    if (idx < 0 || idx >= fe_state.n_entries) return -1;
+    fe_join_path(fe_state.cwd, fe_state.entries[idx].name, out, out_sz);
+    return 0;
+}
+
+/* Delete the entry at fe_state.ctx_target via vfs_unlink(). On
+ * success, refresh the listing so the file disappears from the grid. */
+static void fe_delete_current_target(void) {
+    if (fe_state.ctx_target < 0 || fe_state.ctx_target >= fe_state.n_entries)
+        return;
+    struct fe_entry* en = &fe_state.entries[fe_state.ctx_target];
+    if (en->is_dir) {
+        notify_show("File Explorer",
+                    "Use 'file rmdir' in shell to delete a folder",
+                    FE_COLOR_ERR);
+        return;
+    }
+
+    char path[MAX_PATH_LEN];
+    if (fe_entry_path(fe_state.ctx_target, path, sizeof(path)) < 0) return;
+
+    pr_info("file_explorer: unlink '%s'\n", path);
+    int rc = vfs_unlink(path);
+    if (rc == 0) {
+        char msg[96];
+        ksnprintf(msg, sizeof(msg), "Deleted %s", en->name);
+        notify_show("File Explorer", msg, FE_COLOR_OK);
+        fe_refresh(&fe_state);
+    } else {
+        char msg[96];
+        ksnprintf(msg, sizeof(msg), "Delete failed: %s", en->name);
+        notify_show("File Explorer", msg, FE_COLOR_ERR);
+    }
+}
+
+/* Begin inline rename for the entry at fe_state.ctx_target. Seeds the
+ * input buffer with the current name so the user can edit it. */
+static void fe_begin_rename(void) {
+    if (fe_state.ctx_target < 0 || fe_state.ctx_target >= fe_state.n_entries)
+        return;
+    struct fe_entry* en = &fe_state.entries[fe_state.ctx_target];
+    strncpy(fe_state.rename_buf, en->name, FE_NAME_MAX - 1);
+    fe_state.rename_buf[FE_NAME_MAX - 1] = '\0';
+    fe_state.rename_len = (int)strlen(fe_state.rename_buf);
+    fe_state.rename_target = fe_state.ctx_target;
+    fe_state.rename_active = 1;
+    pr_info("file_explorer: rename '%s' (editing)\n", en->name);
+}
+
+static void fe_cancel_rename(void) {
+    fe_state.rename_active = 0;
+    fe_state.rename_buf[0] = '\0';
+    fe_state.rename_len = 0;
+    fe_state.rename_target = -1;
+}
+
+/* Confirm the rename: build the new path, call vfs_rename, refresh. */
+static void fe_confirm_rename(void) {
+    int idx = fe_state.rename_target;
+    fe_state.rename_active = 0;
+
+    if (idx < 0 || idx >= fe_state.n_entries) {
+        fe_cancel_rename();
+        return;
+    }
+    /* Reject empty / unchanged names. */
+    if (fe_state.rename_len == 0) {
+        notify_show("File Explorer", "Rename: name is empty",
+                    FE_COLOR_ERR);
+        fe_cancel_rename();
+        return;
+    }
+    struct fe_entry* en = &fe_state.entries[idx];
+    if (strcmp(en->name, fe_state.rename_buf) == 0) {
+        /* No change — silently do nothing. */
+        fe_cancel_rename();
+        return;
+    }
+
+    char old_path[MAX_PATH_LEN];
+    char new_path[MAX_PATH_LEN];
+    if (fe_entry_path(idx, old_path, sizeof(old_path)) < 0) {
+        fe_cancel_rename();
+        return;
+    }
+    fe_join_path(fe_state.cwd, fe_state.rename_buf, new_path, sizeof(new_path));
+
+    pr_info("file_explorer: rename '%s' -> '%s'\n", old_path, new_path);
+    int rc = vfs_rename(old_path, new_path);
+    if (rc == 0) {
+        char msg[128];
+        ksnprintf(msg, sizeof(msg), "%s -> %s", en->name,
+                  fe_state.rename_buf);
+        notify_show("File Explorer", msg, FE_COLOR_OK);
+        fe_refresh(&fe_state);
+    } else {
+        char msg[128];
+        ksnprintf(msg, sizeof(msg), "Rename failed: %s", en->name);
+        notify_show("File Explorer", msg, FE_COLOR_ERR);
+    }
+    fe_cancel_rename();
+}
+
+/* Handle a key while the rename modal is up. Returns 1 if the key was
+ * consumed (always — the modal swallows all keys while active). */
+static int fe_handle_rename_key(struct event* e) {
+    if (!fe_state.rename_active) return 0;
+    if (e->type != EV_KEY_DOWN) return 1;  /* swallow non-key events too */
+
+    /* Esc (scancode 0x01) — cancel. keyboard.c pushes ASCII 27 (0x1B)
+     * for Esc, so we must drain it to keep the buffer in sync. */
+    if (e->key.scancode == KEY_ESC) {
+        if (keyboard_has_key()) (void)keyboard_getchar();
+        fe_cancel_rename();
+        return 1;
+    }
+    /* Enter — confirm. keyboard.c pushes '\n' for Enter, drain it. */
+    if (e->key.scancode == KEY_ENTER) {
+        if (keyboard_has_key()) (void)keyboard_getchar();
+        fe_confirm_rename();
+        return 1;
+    }
+
+    /* All other keys come through the keyboard buffer as ASCII. */
+    if (!keyboard_has_key()) return 1;
+    char c = keyboard_getchar();
+
+    if (c == '\b' || c == 127) {
+        if (fe_state.rename_len > 0) {
+            fe_state.rename_len--;
+            fe_state.rename_buf[fe_state.rename_len] = '\0';
+        }
+        return 1;
+    }
+    /* Accept printable ASCII, but reject '/' and '\0' (path separators
+     * would let the user "rename" a file into a different directory,
+     * which the simple join_path below doesn't handle correctly). */
+    if (c >= 0x20 && c < 0x7F && c != '/' &&
+        fe_state.rename_len < FE_NAME_MAX - 1) {
+        fe_state.rename_buf[fe_state.rename_len++] = c;
+        fe_state.rename_buf[fe_state.rename_len] = '\0';
+    }
+    return 1;
+}
+
 static void fe_on_event(struct widget* w, struct event* e) {
+    /* Rename modal swallows all input while active. */
+    if (fe_state.rename_active) {
+        fe_handle_rename_key(e);
+        return;
+    }
+
     if (e->type == EV_MOUSE_SCROLL) {
         /* Wheel up (scroll > 0) views earlier entries, so list_scroll
          * moves toward 0. Wheel down moves toward n_entries. Each tick
@@ -325,12 +588,21 @@ static void fe_on_event(struct widget* w, struct event* e) {
                         fe_state.cwd[sizeof(fe_state.cwd) - 1] = '\0';
                         fe_refresh(&fe_state);
                     } else {
-                        pr_info("file_explorer: open %s\n", en->name);
+                        /* Open the file in the editor (W1-F fix). Build
+                         * the full VFS path, lazily create the editor
+                         * widget if needed, bring it to front, and
+                         * load the file contents into its buffer. */
+                        char path[MAX_PATH_LEN];
+                        fe_join_path(fe_state.cwd, en->name, path, sizeof(path));
+                        fe_launch_editor_with_file(path);
                     }
                 } else if (sel == 1) {
-                    pr_info("file_explorer: delete %s (stub)\n", en->name);
+                    /* Delete — vfs_unlink + refresh + toast (W1-F fix). */
+                    fe_delete_current_target();
                 } else if (sel == 2) {
-                    pr_info("file_explorer: rename %s (stub)\n", en->name);
+                    /* Rename — open the inline modal (W1-F fix). The
+                     * actual vfs_rename happens on Enter. */
+                    fe_begin_rename();
                 }
             }
             fe_state.ctx_open = 0;

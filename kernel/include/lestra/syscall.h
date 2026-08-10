@@ -62,7 +62,23 @@
 #define SYS_RECV             50
 #define SYS_POLL             51
 #define SYS_SELECT           52
-#define SYS_MAX             53
+/* W3-B: POSIX gap fillers — dup, fcntl, truncate, chown, symlink, link,
+ * readlink, chroot, fchdir, umask, setpriority, getpriority, nice. */
+#define SYS_DUP              53
+#define SYS_FCNTL            54
+#define SYS_TRUNCATE         55
+#define SYS_FTRUNCATE        56
+#define SYS_CHOWN            57
+#define SYS_SYMLINK          58
+#define SYS_LINK             59
+#define SYS_READLINK         60
+#define SYS_CHROOT           61
+#define SYS_FCHDIR           62
+#define SYS_UMASK            63
+#define SYS_SETPRIORITY      64
+#define SYS_GETPRIORITY      65
+#define SYS_NICE             66
+#define SYS_MAX             67
 
 /* Syscall handler */
 void syscall_init(void);

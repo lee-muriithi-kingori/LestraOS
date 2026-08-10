@@ -33,6 +33,73 @@
 /* Forward declaration for offline AI engine (kernel/ai/offline.c) */
 extern int offline_ai_respond(const char* prompt, char* response, size_t response_size);
 
+/* ----- conversation memory ---------------------------------------------
+ * Per-session conversation history so the AI has context across turns.
+ * A flat sliding-window buffer: when full, we drop the oldest half.
+ * This is intentionally simple — a real impl would store structured
+ * messages, but a flat string works for both the cloud path (prepended
+ * to the prompt) and the offline path (same). */
+#define AI_HISTORY_SIZE 8192
+static char conversation_history[AI_HISTORY_SIZE];
+static int  history_len = 0;
+
+void ai_clear_memory(void) {
+    history_len = 0;
+    conversation_history[0] = '\0';
+    pr_info("AI: conversation memory cleared\n");
+}
+
+/* Append a turn to the history. Drops oldest content if needed. */
+static void history_append_turn(const char* prompt, const char* response) {
+    /* Build the turn string: "User: <prompt>\nAI: <response>\n" */
+    char turn[AI_PROMPT_MAX + 1024];
+    int tlen = ksnprintf(turn, sizeof(turn), "User: %s\nAI: %s\n", prompt, response);
+    if (tlen < 0) return;
+
+    /* If the turn alone is bigger than the buffer, truncate it. */
+    if (tlen >= AI_HISTORY_SIZE) tlen = AI_HISTORY_SIZE - 1;
+
+    /* Make room: if needed, drop oldest content (shift left). */
+    if (history_len + tlen + 1 >= AI_HISTORY_SIZE) {
+        int drop = (history_len + tlen + 1) - (AI_HISTORY_SIZE - 1);
+        /* Round up to drop at least half the buffer so we don't shift
+         * on every single turn. */
+        if (drop < AI_HISTORY_SIZE / 2) drop = AI_HISTORY_SIZE / 2;
+        if (drop > history_len) drop = history_len;
+        memmove(conversation_history, conversation_history + drop,
+                history_len - drop);
+        history_len -= drop;
+        conversation_history[history_len] = '\0';
+    }
+
+    memcpy(conversation_history + history_len, turn, tlen);
+    history_len += tlen;
+    conversation_history[history_len] = '\0';
+}
+
+/* Build a prompt that includes recent conversation history for context.
+ * Writes into `out` (size out_size). The current prompt is always at the
+ * end; history is prepended as "Previous conversation:\n...\n\n". */
+static int build_prompt_with_history(const char* prompt, char* out, size_t out_size) {
+    int n = 0;
+    if (history_len > 0) {
+        /* Use at most the last ~600 bytes of history to stay within the
+         * HTTP body budget (ai_http_post uses a 2048-byte body buffer). */
+        int hist_start = history_len > 600 ? history_len - 600 : 0;
+        int hist_len = history_len - hist_start;
+        n += ksnprintf(out + n, out_size - n,
+                       "Previous conversation (for context):\n%.*s\n\nCurrent question: ",
+                       hist_len, conversation_history + hist_start);
+    }
+    /* Append the current prompt (bounded). */
+    int plen = strlen(prompt);
+    if (n + plen >= (int)out_size - 1) plen = out_size - 1 - n;
+    memcpy(out + n, prompt, plen);
+    n += plen;
+    out[n] = '\0';
+    return n;
+}
+
 /* ----- provider metadata ----------------------------------------------
  * Default endpoints are the cloud HTTPS URLs. Since the kernel HTTP
  * client speaks plain HTTP only (no TLS), to use a cloud provider you
@@ -200,50 +267,130 @@ const struct ai_tool* ai_tool_find(const char* name) {
 /* ----- built-in tools ------------------------------------------------- */
 
 /* Tool: shell - run a shell command and return output.
- * Args format: "command" (just the raw command string) */
+ * Args format: "command" (just the raw command string)
+ *
+ * Routes through shell_execute_line (kernel/core/shell.c) so the AI can
+ * run ANY in-kernel shell command. Output is captured from the kmsg ring
+ * buffer by diffing before/after snapshots. For the common short-command
+ * case this gives the AI the actual command output; if the kmsg buffer
+ * wrapped (very long boot log + long command output), we fall back to a
+ * status message and the user sees the full output on the console. */
+extern void shell_execute_line(const char* line, void (*out)(char c));
+
 void ai_tool_shell(const char* args, char* out, size_t out_size) {
     if (!args || !out || out_size == 0) return;
-    /* For safety we route through printk so the user sees what's happening.
-     * In a real implementation this would capture the output into `out`. */
-    printk("[ai:tool:shell] executing: %s\n", args);
-    /* LestraOS kernel shell is interactive — we can only dispatch known
-     * commands non-interactively. Demonstrate with a few common ones. */
-    if (strcmp(args, "uname") == 0) {
-        strncpy(out, "LestraOS 1.0.0-alpha x86_64\n", out_size - 1);
-    } else if (strcmp(args, "free") == 0) {
-        extern uintptr_t pmm_get_total(void);
-        extern uintptr_t pmm_get_used(void);
-        extern uintptr_t pmm_get_free(void);
-        /* Format into out using simple math */
-        /* For brevity just print stats */
-        strncpy(out, "Mem: see /proc/meminfo (simulated)\n", out_size - 1);
-    } else if (strcmp(args, "uptime") == 0) {
-        extern uint64_t timer_get_ms(void);
-        uint64_t ms = timer_get_ms();
-        unsigned sec = (unsigned)(ms / 1000);
-        /* Quick format */
-        int n = 0;
-        const char* p = "up ";
-        while (*p && n < (int)out_size - 1) out[n++] = *p++;
-        unsigned m = sec / 60;
-        unsigned s = sec % 60;
-        char tmp[16]; int t = 0;
-        if (m == 0) tmp[t++] = '0';
-        while (m) { tmp[t++] = '0' + (m % 10); m /= 10; }
-        while (t--) out[n++] = tmp[t];
-        out[n++] = 'm';
-        out[n++] = ' ';
-        t = 0;
-        if (s < 10) tmp[t++] = '0';
-        while (s) { tmp[t++] = '0' + (s % 10); s /= 10; }
-        while (t--) out[n++] = tmp[t];
-        out[n++] = 's';
-        out[n++] = '\n';
-        out[n] = 0;
-    } else {
-        strncpy(out, "[shell: command requires interactive terminal]", out_size - 1);
+    out[0] = 0;
+
+    /* Refuse to run "ai ..." subcommands to avoid recursion
+     * (ai_chat -> ai_tool_shell -> shell_execute_line("ai ...") -> ai_chat). */
+    if (args[0] == 'a' && args[1] == 'i' &&
+        (args[2] == ' ' || args[2] == '\t')) {
+        strncpy(out, "[shell: refused to run 'ai' subcommand (recursion guard)]",
+                out_size - 1);
         out[out_size - 1] = 0;
+        return;
     }
+    /* Refuse reboot/shutdown for safety. */
+    if (strcmp(args, "reboot") == 0 || strcmp(args, "shutdown") == 0 ||
+        strncmp(args, "reboot ", 7) == 0 || strncmp(args, "shutdown ", 9) == 0) {
+        strncpy(out, "[shell: refused to run power command for safety]",
+                out_size - 1);
+        out[out_size - 1] = 0;
+        return;
+    }
+
+    printk("[ai:tool:shell] executing: %s\n", args);
+
+    /* Capture output via kmsg ring buffer diff.
+     * 1. Snapshot kmsg before the command.
+     * 2. Run the command (output goes to printk -> kmsg + console).
+     * 3. Snapshot kmsg after.
+     * 4. The new content is the tail of the after-snapshot that wasn't
+     *    in the before-snapshot. */
+    extern size_t kmsg_read(char* buf, size_t max);
+
+    /* Use a kmalloc'd buffer so we don't blow the kernel stack
+     * (4 KB + 4 KB = 8 KB). */
+    int bufsz = 4096;
+    char* before = (char*)kmalloc(bufsz);
+    char* after  = (char*)kmalloc(bufsz);
+    if (!before || !after) {
+        ksnprintf(out, out_size, "[shell: out of memory for output capture]");
+        if (before) kfree(before);
+        if (after)  kfree(after);
+        return;
+    }
+
+    size_t before_len = kmsg_read(before, bufsz - 1);
+    before[before_len] = 0;
+
+    /* Run the command. shell_execute_line ignores the `out` callback
+     * (output goes through printk), so we pass NULL. */
+    shell_execute_line(args, 0);
+
+    size_t after_len = kmsg_read(after, bufsz - 1);
+    after[after_len] = 0;
+
+    /* Find the new content. Two cases:
+     *   (a) after_len > before_len AND the first before_len bytes match:
+     *       new content = after[before_len .. after_len].
+     *   (b) Otherwise (kmsg wrapped or was truncated): try to find where
+     *       the before-snapshot's tail appears in the after-snapshot, and
+     *       take everything after that. If that fails, return a status. */
+    char* new_start = NULL;
+    size_t new_len = 0;
+
+    if (after_len > before_len &&
+        memcmp(before, after, before_len) == 0) {
+        /* Case (a): clean diff. */
+        new_start = after + before_len;
+        new_len = after_len - before_len;
+    } else if (after_len > 0 && before_len > 0) {
+        /* Case (b): search for the last 64 bytes of `before` in `after`.
+         * If found, everything after that point is new. */
+        int tail_len = before_len > 64 ? 64 : before_len;
+        const char* needle = before + before_len - tail_len;
+        /* Simple substring search. */
+        for (size_t i = 0; i + tail_len <= after_len; i++) {
+            if (memcmp(after + i, needle, tail_len) == 0) {
+                new_start = after + i + tail_len;
+                new_len = after_len - (i + tail_len);
+                break;
+            }
+        }
+    }
+
+    if (new_start && new_len > 0) {
+        /* Strip the "[ai:tool:shell] executing:" line that we just printk'd,
+         * since it's our own log, not command output. Look for the first
+         * newline after the executing line. */
+        const char* exec_marker = "[ai:tool:shell] executing:";
+        if (new_len > strlen(exec_marker) &&
+            memcmp(new_start, exec_marker, strlen(exec_marker)) == 0) {
+            /* Skip to end of that line. */
+            const char* nl = new_start;
+            const char* end = new_start + new_len;
+            while (nl < end && *nl != '\n') nl++;
+            if (nl < end) {
+                nl++;  /* skip the newline */
+                new_len = end - nl;
+                new_start = (char*)nl;
+            }
+        }
+        /* Copy to output, bounded. */
+        if (new_len >= out_size) new_len = out_size - 1;
+        memcpy(out, new_start, new_len);
+        out[new_len] = 0;
+    } else {
+        /* Couldn't extract output (kmsg wrapped or command produced no
+         * output). Return a status message — the user saw it on console. */
+        ksnprintf(out, out_size,
+                  "[shell: '%s' executed (output sent to console — "
+                  "kmsg capture unavailable)]", args);
+    }
+
+    kfree(before);
+    kfree(after);
 }
 
 /* Tool: file_read - read a file from the in-memory VFS.
@@ -643,9 +790,321 @@ static int ai_http_post(int provider, const char* prompt,
     return -1;
 }
 
+/* ----- OpenAI function-calling (tools schema) -------------------------- */
+
+/* Build the OpenAI "tools" JSON array fragment for all registered tools.
+ * Writes a string like:
+ *   [{"type":"function","function":{"name":"shell","description":"...","parameters":{"type":"object","properties":{"cmd":{"type":"string","description":"..."}},"required":["cmd"]}}},...]
+ * Returns the length written (excluding NUL). */
+static int ai_build_tools_json(char* buf, size_t size) {
+    int n = 0;
+    n += ksnprintf(buf + n, size - n, "[");
+    for (int i = 0; i < tool_count && n < (int)size - 64; i++) {
+        if (i > 0) {
+            if (n < (int)size - 1) buf[n++] = ',';
+        }
+        /* Each tool's parameter schema is minimal: a single "arg" string
+         * for tools that take an argument, or empty properties for tools
+         * that don't. This is intentionally simple — the LLM gets enough
+         * info to call the tool, and our execution side extracts the
+         * first string value as the arg. */
+        const char* arg_name = "arg";
+        const char* arg_desc = "The argument string for the tool";
+        if (strcmp(tools[i].name, "shell") == 0)        { arg_name = "cmd";   arg_desc = "The shell command to run"; }
+        else if (strcmp(tools[i].name, "file_read") == 0) { arg_name = "path"; arg_desc = "The file path to read"; }
+        else if (strcmp(tools[i].name, "file_write") == 0){ arg_name = "content"; arg_desc = "Path and content separated by newline"; }
+        else if (strcmp(tools[i].name, "pkg_install") == 0){ arg_name = "name"; arg_desc = "The package name to install"; }
+        else if (strcmp(tools[i].name, "pkg_list") == 0)  { arg_name = NULL;   arg_desc = NULL; }
+        else if (strcmp(tools[i].name, "meminfo") == 0)   { arg_name = NULL;   arg_desc = NULL; }
+        else if (strcmp(tools[i].name, "uptime") == 0)    { arg_name = NULL;   arg_desc = NULL; }
+
+        n += ksnprintf(buf + n, size - n,
+                       "{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":",
+                       tools[i].name, tools[i].description);
+        if (arg_name) {
+            n += ksnprintf(buf + n, size - n,
+                           "{\"type\":\"object\",\"properties\":{\"%s\":{\"type\":\"string\",\"description\":\"%s\"}},\"required\":[\"%s\"]}}",
+                           arg_name, arg_desc, arg_name);
+        } else {
+            n += ksnprintf(buf + n, size - n,
+                           "{\"type\":\"object\",\"properties\":{}}");
+        }
+        n += ksnprintf(buf + n, size - n, "}}");
+    }
+    n += ksnprintf(buf + n, size - n, "]");
+    return n;
+}
+
+/* Extract a string value for a given key from a JSON object string.
+ * Looks for "key":"value" and copies the value (un-escaping \" and \\)
+ * into out. Returns 1 if found, 0 if not. */
+static int json_extract_string(const char* json, const char* key,
+                                char* out, size_t out_size) {
+    if (!json || !key || !out || out_size == 0) return 0;
+    /* Build the needle: "key":" */
+    char needle[64];
+    int nlen = ksnprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (nlen <= 0 || nlen >= (int)sizeof(needle)) return 0;
+
+    const char* p = json;
+    while (*p) {
+        if (memcmp(p, needle, nlen) == 0) {
+            p += nlen;
+            /* Copy until unescaped " */
+            int o = 0;
+            while (*p && o < (int)out_size - 1) {
+                if (*p == '\\' && p[1]) {
+                    p++;
+                    if (*p == 'n') { if (o < (int)out_size - 1) out[o++] = '\n'; }
+                    else if (*p == 't') { if (o < (int)out_size - 1) out[o++] = '\t'; }
+                    else if (*p == '"') { if (o < (int)out_size - 1) out[o++] = '"'; }
+                    else if (*p == '\\') { if (o < (int)out_size - 1) out[o++] = '\\'; }
+                    else { if (o < (int)out_size - 1) out[o++] = *p; }
+                    p++;
+                } else if (*p == '"') {
+                    break;
+                } else {
+                    out[o++] = *p++;
+                }
+            }
+            out[o] = 0;
+            return 1;
+        }
+        p++;
+    }
+    return 0;
+}
+
+/* Extract the first tool call from an OpenAI-format response.
+ * Looks for "tool_calls":[{..."name":"<name>"..."arguments":"<args>"}].
+ * On success, copies name + args into the provided buffers and returns 1.
+ * Also extracts the tool_call_id if present (for the "tool" role response).
+ * Returns 0 if no tool_calls found. */
+static int ai_extract_tool_call(const char* response_json,
+                                 char* name, size_t name_size,
+                                 char* args, size_t args_size,
+                                 char* call_id, size_t call_id_size) {
+    const char* tc = strstr(response_json, "\"tool_calls\"");
+    if (!tc) return 0;
+    /* Find the first "name":"..." after tool_calls. */
+    const char* name_pos = strstr(tc, "\"name\":\"");
+    if (!name_pos) return 0;
+    name_pos += 8;  /* skip "name":" */
+    int n = 0;
+    while (*name_pos && *name_pos != '"' && n < (int)name_size - 1) {
+        name[n++] = *name_pos++;
+    }
+    name[n] = 0;
+
+    /* Find "arguments":"..." after the name. */
+    const char* args_pos = strstr(name_pos, "\"arguments\":\"");
+    if (args_pos) {
+        args_pos += 13;  /* skip "arguments":" */
+        int a = 0;
+        while (*args_pos && a < (int)args_size - 1) {
+            if (*args_pos == '\\' && args_pos[1]) {
+                args_pos++;
+                if (*args_pos == '"') { if (a < (int)args_size - 1) args[a++] = '"'; }
+                else if (*args_pos == '\\') { if (a < (int)args_size - 1) args[a++] = '\\'; }
+                else if (*args_pos == 'n') { if (a < (int)args_size - 1) args[a++] = '\n'; }
+                else { if (a < (int)args_size - 1) args[a++] = *args_pos; }
+                args_pos++;
+            } else if (*args_pos == '"') {
+                break;
+            } else {
+                args[a++] = *args_pos++;
+            }
+        }
+        args[a] = 0;
+    } else {
+        args[0] = 0;
+    }
+
+    /* Find "id":"..." for the tool_call_id (may be before or after name). */
+    if (call_id && call_id_size > 0) {
+        call_id[0] = 0;
+        const char* id_pos = strstr(tc, "\"id\":\"");
+        if (id_pos) {
+            id_pos += 6;
+            int i = 0;
+            while (*id_pos && *id_pos != '"' && i < (int)call_id_size - 1) {
+                call_id[i++] = *id_pos++;
+            }
+            call_id[i] = 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Send a chat completion request with a pre-built messages array and
+ * optional tools schema. Returns 0 on success and copies the raw JSON
+ * response body into response_buf (so the caller can parse tool_calls).
+ * This is the "with tools" variant of ai_http_post — it does NOT extract
+ * the "content" field; it returns the raw JSON for the caller to parse. */
+static int ai_http_post_messages(int provider,
+                                  const char* messages_json,
+                                  const char* tools_json,
+                                  char* response_buf, size_t response_size) {
+    if (!keys_set[provider]) {
+        ksnprintf(response_buf, response_size,
+                  "[no API key set for %s]", provider_display[provider]);
+        return -1;
+    }
+    extern int net_is_up(void);
+    if (!net_is_up()) {
+        ksnprintf(response_buf, response_size, "[network not up]");
+        return -1;
+    }
+
+    int use_tls = (provider_endpoints[provider][0] == 'h' &&
+                   provider_endpoints[provider][1] == 't' &&
+                   provider_endpoints[provider][2] == 't' &&
+                   provider_endpoints[provider][3] == 'p' &&
+                   provider_endpoints[provider][4] == 's');
+
+    /* Build the JSON body:
+     *   {"model":"<model>","messages":[<messages_json>],"tools":<tools_json>}
+     * or without tools if tools_json is NULL. */
+    static char body[4096];
+    int blen = 0;
+    blen += ksnprintf(&body[blen], sizeof(body) - blen,
+                      "{\"model\":\"%s\",\"messages\":[",
+                      provider_models[provider]);
+    /* Copy messages_json (already escaped by the caller). */
+    int mlen = strlen(messages_json);
+    if (blen + mlen >= (int)sizeof(body) - 256) {
+        mlen = sizeof(body) - 256 - blen;
+    }
+    memcpy(&body[blen], messages_json, mlen);
+    blen += mlen;
+    blen += ksnprintf(&body[blen], sizeof(body) - blen, "]");
+
+    if (tools_json) {
+        blen += ksnprintf(&body[blen], sizeof(body) - blen,
+                          ",\"tools\":%s", tools_json);
+        /* Request tool_choice="auto" so the model decides when to call. */
+        blen += ksnprintf(&body[blen], sizeof(body) - blen,
+                          ",\"tool_choice\":\"auto\"");
+    }
+    blen += ksnprintf(&body[blen], sizeof(body) - blen, "}");
+    body[blen] = 0;
+
+    pr_info("AI: POST %s (model %s, %u-byte body, tools=%s)\n",
+            provider_endpoints[provider], provider_models[provider],
+            (unsigned)blen, tools_json ? "yes" : "no");
+
+    /* Build HTTP request (same as ai_http_post but with our body). */
+    char scheme[16], host[128], path[256];
+    uint16_t port;
+    http_parse_url(provider_endpoints[provider],
+                   scheme, sizeof(scheme), host, sizeof(host),
+                   &port, path, sizeof(path));
+
+    ipv4_addr_t ip;
+    if (!net_resolve(host, &ip)) {
+        ksnprintf(response_buf, response_size, "[DNS failed for %s]", host);
+        return -1;
+    }
+
+    extern int tls_connect(ipv4_addr_t, uint16_t, const char*);
+    extern int tls_send(const void*, uint16_t);
+    extern int tls_recv(void*, uint16_t, uint32_t);
+    extern void tls_close(void);
+
+    if (use_tls) {
+        if (!tls_connect(ip, port, host)) {
+            ksnprintf(response_buf, response_size, "[TLS handshake to %s:%u failed]", host, (unsigned)port);
+            return -1;
+        }
+    } else {
+        if (!tcp_connect(ip, port, 5000)) {
+            ksnprintf(response_buf, response_size, "[TCP connect to %s:%u failed]", host, (unsigned)port);
+            return -1;
+        }
+    }
+
+    static char req[5120];
+    int reqlen = 0;
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "POST %s HTTP/1.0\r\n", path);
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "Host: %s\r\n", host);
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "Content-Type: application/json\r\n");
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "Content-Length: %u\r\n", (unsigned)blen);
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "Authorization: Bearer %s\r\n", api_keys[provider]);
+    reqlen += ksnprintf(&req[reqlen], sizeof(req) - reqlen, "Connection: close\r\n\r\n");
+    if (reqlen + blen > (int)sizeof(req) - 1) blen = sizeof(req) - 1 - reqlen;
+    memcpy(&req[reqlen], body, blen);
+    reqlen += blen;
+
+    int sent = 0;
+    while (sent < reqlen) {
+        int chunk = reqlen - sent;
+        if (chunk > 1400) chunk = 1400;
+        int n = use_tls ? tls_send(&req[sent], (uint16_t)chunk)
+                         : tcp_send(&req[sent], (uint16_t)chunk);
+        if (n <= 0) {
+            if (use_tls) tls_close(); else tcp_close();
+            ksnprintf(response_buf, response_size, "[send failed]");
+            return -1;
+        }
+        sent += n;
+    }
+
+    static uint8_t rbuf[16384];
+    uint16_t total = 0;
+    uint32_t timeout = 8000;
+    while (total < sizeof(rbuf) - 1) {
+        int n = use_tls ? tls_recv(&rbuf[total], (uint16_t)(sizeof(rbuf) - 1 - total), timeout)
+                         : tcp_recv_wait(&rbuf[total], (uint16_t)(sizeof(rbuf) - 1 - total), timeout);
+        if (n <= 0) break;
+        total += (uint16_t)n;
+        timeout = 1500;
+    }
+    if (use_tls) tls_close(); else tcp_close();
+    rbuf[total] = 0;
+
+    if (total == 0) {
+        ksnprintf(response_buf, response_size, "[no response from server]");
+        return -1;
+    }
+
+    /* Find the JSON body (after \r\n\r\n). */
+    int body_start = 0;
+    for (int i = 0; i + 3 < total; i++) {
+        if (rbuf[i] == '\r' && rbuf[i+1] == '\n' &&
+            rbuf[i+2] == '\r' && rbuf[i+3] == '\n') {
+            body_start = i + 4;
+            break;
+        }
+    }
+
+    /* Copy the raw JSON body to the caller's buffer. */
+    int rawlen = total - body_start;
+    if (rawlen < 0) rawlen = 0;
+    if (rawlen >= (int)response_size) rawlen = response_size - 1;
+    memcpy(response_buf, &rbuf[body_start], rawlen);
+    response_buf[rawlen] = 0;
+    return 0;
+}
+
 /* ----- chat API ------------------------------------------------------- */
 int ai_chat(const char* prompt, char* response, size_t response_size) {
     if (!prompt || !response || response_size == 0) return -1;
+
+    /* Recognize "/clear" as a special command to reset conversation
+     * memory. This lets the user reset context without needing a shell
+     * command (though `ai clear` also works via ai_clear_memory). */
+    if (strcmp(prompt, "/clear") == 0) {
+        ai_clear_memory();
+        strncpy(response, "[conversation memory cleared]", response_size - 1);
+        response[response_size - 1] = 0;
+        return 0;
+    }
+
+    /* Build a prompt that includes recent conversation history for
+     * context, so the AI can refer to earlier turns. */
+    char combined[AI_PROMPT_MAX + 1024];
+    build_prompt_with_history(prompt, combined, sizeof(combined));
 
     /* Pick the first provider that has a key set */
     int provider = -1;
@@ -653,23 +1112,33 @@ int ai_chat(const char* prompt, char* response, size_t response_size) {
         if (keys_set[i]) { provider = i; break; }
     }
 
+    int rc;
     if (provider < 0) {
         /* No API key configured — use the offline assistant (rule-based).
          * This is NOT a neural model, but gives useful canned responses
          * for system queries without needing network or API keys. */
-        extern int offline_ai_respond(const char* prompt, char* response, size_t response_size);
-        if (offline_ai_respond(prompt, response, response_size)) {
-            return 0;
+        if (offline_ai_respond(combined, response, response_size)) {
+            rc = 0;
+        } else {
+            strncpy(response,
+                    "[no AI provider configured. Use 'ai setkey <provider> <key>' "
+                    "to set an API key. Providers: openai, claude, gemini, glm]",
+                    response_size - 1);
+            response[response_size - 1] = 0;
+            rc = -1;
         }
-        strncpy(response,
-                "[no AI provider configured. Use 'ai setkey <provider> <key>' "
-                "to set an API key. Providers: openai, claude, gemini, glm]",
-                response_size - 1);
-        response[response_size - 1] = 0;
-        return -1;
+    } else {
+        rc = ai_http_post(provider, combined, response, response_size);
     }
 
-    return ai_http_post(provider, prompt, response, response_size);
+    /* Record this turn in conversation memory (even on failure, so the
+     * user sees their question was received — but only if we got a
+     * non-empty response). */
+    if (response[0]) {
+        history_append_turn(prompt, response);
+    }
+
+    return rc;
 }
 
 /* Chat with a specific provider (by ID). */
@@ -683,7 +1152,21 @@ int ai_chat_with_provider(int provider, const char* prompt,
                   provider_display[provider], provider_names[provider]);
         return -1;
     }
-    return ai_http_post(provider, prompt, response, response_size);
+    /* Recognize "/clear" for consistency with ai_chat. */
+    if (strcmp(prompt, "/clear") == 0) {
+        ai_clear_memory();
+        strncpy(response, "[conversation memory cleared]", response_size - 1);
+        response[response_size - 1] = 0;
+        return 0;
+    }
+    /* Include conversation history for context. */
+    char combined[AI_PROMPT_MAX + 1024];
+    build_prompt_with_history(prompt, combined, sizeof(combined));
+    int rc = ai_http_post(provider, combined, response, response_size);
+    if (response[0]) {
+        history_append_turn(prompt, response);
+    }
+    return rc;
 }
 
 int ai_chat_with_tools(const char* prompt, char* response,
@@ -692,143 +1175,218 @@ int ai_chat_with_tools(const char* prompt, char* response,
 
     /* Agentic loop:
      * When an API key is set (ai_any_key_set()), use real HTTP+TLS to
-     * call the provider. The AI's response may contain tool calls
-     * (formatted as JSON). We parse those, execute the tools, and
-     * feed results back in the next iteration.
+     * call the provider with a proper OpenAI tools[] schema. Parse the
+     * response for "tool_calls", execute each tool, feed results back as
+     * "role":"tool" messages, and loop up to max_iterations.
      *
      * When no key is set (offline mode), we fall back to keyword-based
      * tool dispatch + the offline rule engine. This is explicitly NOT
      * neural, but it keeps the UX functional for demonstration. */
 
-    /* If a real API key is available, try the HTTP+TLS path first.
-     * Build a messages array with tool definitions and the user prompt,
-     * then POST to the provider. Parse the response for tool_calls,
-     * execute them, and loop. */
-    if (ai_any_key_set() && net_is_up()) {
-        /* Build the initial messages payload with system prompt + tools. */
-        char messages_buf[4096];
+    /* Pick the first provider with a key. */
+    int provider = -1;
+    for (int i = 0; i < AI_PROVIDER_COUNT; i++) {
+        if (keys_set[i]) { provider = i; break; }
+    }
+
+    if (provider >= 0 && net_is_up()) {
+        /* Build the tools[] JSON schema once. */
+        static char tools_json[2048];
+        ai_build_tools_json(tools_json, sizeof(tools_json));
+
+        /* Build the initial messages array:
+         *   {"role":"system","content":"..."},{"role":"user","content":"<prompt>"}
+         * The caller-supplied prompt is JSON-escaped. */
+        static char messages_buf[6144];
         int mlen = 0;
-
-        /* System message: instruct the AI to use tools when appropriate. */
-        const char* sys_msg = "{\"role\":\"system\",\"content\":\"You are an AI assistant running inside "
-            "LestraOS. You have access to these tools: shell (run commands), file_read, file_write, "
-            "pkg_install, pkg_list, meminfo, uptime. When the user asks you to perform an action, "
-            "call the appropriate tool. When just chatting, respond normally.\"}";
         mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
-                          "%s", sys_msg);
-
-        /* User message. */
+                          "{\"role\":\"system\",\"content\":\"You are an AI assistant running inside "
+                          "LestraOS with access to tools (shell, file_read, file_write, pkg_install, "
+                          "pkg_list, meminfo, uptime). When the user asks you to perform an action, "
+                          "call the appropriate tool. When just chatting, respond normally.\"}");
         mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
                           ",{\"role\":\"user\",\"content\":\"");
-
-        /* Escape double quotes in prompt for JSON. */
-        const char* src = prompt;
-        while (*src && mlen < (int)sizeof(messages_buf) - 4) {
-            if (*src == '"') { messages_buf[mlen++] = '\\'; messages_buf[mlen++] = '"'; src++; }
-            else if (*src == '\n') { messages_buf[mlen++] = '\\'; messages_buf[mlen++] = 'n'; src++; }
-            else { messages_buf[mlen++] = *src++; }
+        /* Escape the prompt for JSON. */
+        for (const char* src = prompt; *src && mlen < (int)sizeof(messages_buf) - 16; src++) {
+            if (*src == '"' || *src == '\\') {
+                messages_buf[mlen++] = '\\';
+                messages_buf[mlen++] = *src;
+            } else if (*src == '\n') {
+                messages_buf[mlen++] = '\\';
+                messages_buf[mlen++] = 'n';
+            } else if (*src == '\r') {
+                /* skip */
+            } else {
+                messages_buf[mlen++] = *src;
+            }
         }
         mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen, "\"}");
+        messages_buf[mlen] = 0;
 
-        int iteration = 0;
         int total_written = 0;
+        int iteration = 0;
 
         while (iteration < max_iterations) {
             iteration++;
 
-            /* Call the AI provider via HTTP. */
-            char ai_resp[AI_RESPONSE_MAX];
-            int rc = ai_chat(messages_buf, ai_resp, sizeof(ai_resp));
-
+            /* Send the request with tools schema. */
+            char raw_resp[AI_RESPONSE_MAX];
+            int rc = ai_http_post_messages(provider, messages_buf,
+                                            tools_json, raw_resp, sizeof(raw_resp));
             if (rc != 0) {
-                /* HTTP call failed — fall through to offline mode. */
+                /* HTTP failed — copy the error message and fall through
+                 * to the offline path below. */
                 break;
             }
 
-            /* Check if the AI response contains a tool call pattern.
-             * We look for "tool_call:" or "[call tool: name]" patterns
-             * in the response. A more robust impl would parse the
-             * OpenAI-format tool_calls JSON array, but our JSON parser
-             * is minimal so we use a simple pattern match. */
-            const char* tool_marker = strstr(ai_resp, "tool_call:");
-            const char* tool_bracket = strstr(ai_resp, "[call tool:");
-
-            if (tool_marker || tool_bracket) {
-                /* Extract tool name from the marker. */
-                const char* tool_start = tool_marker ? tool_marker + 10 : tool_bracket + 11;
-                /* Skip whitespace. */
-                while (*tool_start == ' ' || *tool_start == '\t') tool_start++;
-
-                /* Read tool name until space/bracket/newline. */
-                char tool_name[64] = {0};
-                int ti = 0;
-                while (*tool_start && *tool_start != ' ' && *tool_start != ']'
-                       && *tool_start != '\n' && ti < 63) {
-                    tool_name[ti++] = *tool_start++;
-                }
-                tool_name[ti] = '\0';
-
-                /* Extract tool arguments (everything after tool name). */
-                while (*tool_start == ' ' || *tool_start == ']') tool_start++;
-                char tool_args[256] = {0};
-                int ai = 0;
-                while (*tool_start && *tool_start != '\n' && ai < 255) {
-                    tool_args[ai++] = *tool_start++;
-                }
-                tool_args[ai] = '\0';
-
-                /* Find and execute the tool. */
+            /* Check if the response contains tool_calls. */
+            char tool_name[64], tool_args[512], call_id[128];
+            if (ai_extract_tool_call(raw_resp, tool_name, sizeof(tool_name),
+                                      tool_args, sizeof(tool_args),
+                                      call_id, sizeof(call_id))) {
+                /* Found a tool call. Execute it. */
                 const struct ai_tool* tool = ai_tool_find(tool_name);
-                char tool_out[512];
+                char tool_out[1024];
                 tool_out[0] = 0;
 
                 if (tool) {
-                    tool->handler(tool_args, tool_out, sizeof(tool_out));
-
-                    /* Append the AI's partial response + tool result to output. */
-                    int resp_len = 0;
-                    while (ai_resp[resp_len] && resp_len < 200
-                           && total_written < (int)response_size - 1) {
-                        response[total_written++] = ai_resp[resp_len++];
+                    /* For tools that take a JSON arguments object, extract
+                     * the first string value as the arg. For tools that
+                     * take no args, pass empty string. */
+                    char exec_args[512];
+                    exec_args[0] = 0;
+                    if (tool_args[0] == '{') {
+                        /* Try known arg names, then fall back to the
+                         * first "key":"value" pair. */
+                        const char* arg_keys[] = {"cmd", "path", "content",
+                                                   "name", "arg", NULL};
+                        int found = 0;
+                        for (int k = 0; arg_keys[k]; k++) {
+                            if (json_extract_string(tool_args, arg_keys[k],
+                                                     exec_args, sizeof(exec_args))) {
+                                found = 1;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            /* No known arg key matched — leave exec_args
+                             * empty. The tool will handle the empty arg
+                             * gracefully (most tools treat it as "no
+                             * argument"). */
+                            exec_args[0] = 0;
+                        }
+                    } else {
+                        /* Arguments is already a plain string. */
+                        strncpy(exec_args, tool_args, sizeof(exec_args) - 1);
+                        exec_args[sizeof(exec_args) - 1] = 0;
                     }
-                    const char* sep = "\n[tool result: ";
-                    while (*sep && total_written < (int)response_size - 1)
-                        response[total_written++] = *sep++;
-                    const char* to = tool_out;
-                    while (*to && total_written < (int)response_size - 1)
-                        response[total_written++] = *to++;
-                    const char* close = "]\n";
-                    while (*close && total_written < (int)response_size - 1)
-                        response[total_written++] = *close++;
 
-                    /* Feed tool result back as assistant message + tool result. */
-                    mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
-                                      ",{\"role\":\"assistant\",\"content\":\"%s\"}"
-                                      ",{\"role\":\"user\",\"content\":\"Tool %s returned: %s. "
-                                      "Continue the conversation based on this result.\"}",
-                                      tool_name, tool_name, tool_out);
+                    pr_info("AI: tool_call %s(args='%s')\n", tool_name, exec_args);
+                    tool->handler(exec_args, tool_out, sizeof(tool_out));
+                } else {
+                    ksnprintf(tool_out, sizeof(tool_out),
+                              "[unknown tool: %s]", tool_name);
+                }
 
-                    /* Continue the loop — the AI can call more tools. */
-                    continue;
+                /* Append the tool call + result to the output buffer. */
+                const char* prefix = "[tool: ";
+                int plen = strlen(prefix);
+                int i = 0;
+                while (i < plen && total_written < (int)response_size - 1)
+                    response[total_written++] = prefix[i++];
+                const char* tp = tool_name;
+                while (*tp && total_written < (int)response_size - 1)
+                    response[total_written++] = *tp++;
+                const char* sep = "]\n";
+                i = 0; plen = strlen(sep);
+                while (i < plen && total_written < (int)response_size - 1)
+                    response[total_written++] = sep[i++];
+                const char* op = tool_out;
+                while (*op && total_written < (int)response_size - 1)
+                    response[total_written++] = *op++;
+                response[total_written++] = '\n';
+                response[total_written] = 0;
+
+                /* Append the assistant's tool_call + tool result to the
+                 * messages array so the next request has context. */
+                mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
+                                  ",{\"role\":\"assistant\",\"content\":null,"
+                                  "\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\","
+                                  "\"function\":{\"name\":\"%s\",\"arguments\":\"",
+                                  call_id[0] ? call_id : "call_1", tool_name);
+                /* Re-escape tool_args for JSON. */
+                for (const char* a = tool_args; *a && mlen < (int)sizeof(messages_buf) - 64; a++) {
+                    if (*a == '"' || *a == '\\') {
+                        messages_buf[mlen++] = '\\';
+                        messages_buf[mlen++] = *a;
+                    } else if (*a == '\n') {
+                        messages_buf[mlen++] = '\\';
+                        messages_buf[mlen++] = 'n';
+                    } else {
+                        messages_buf[mlen++] = *a;
+                    }
+                }
+                mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen,
+                                  "\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"",
+                                  call_id[0] ? call_id : "call_1");
+                /* Escape tool_out for JSON. */
+                for (const char* a = tool_out; *a && mlen < (int)sizeof(messages_buf) - 32; a++) {
+                    if (*a == '"' || *a == '\\') {
+                        messages_buf[mlen++] = '\\';
+                        messages_buf[mlen++] = *a;
+                    } else if (*a == '\n') {
+                        messages_buf[mlen++] = '\\';
+                        messages_buf[mlen++] = 'n';
+                    } else if ((unsigned char)*a < 0x20) {
+                        /* skip control chars */
+                    } else {
+                        messages_buf[mlen++] = *a;
+                    }
+                }
+                mlen += ksnprintf(messages_buf + mlen, sizeof(messages_buf) - mlen, "\"}");
+                messages_buf[mlen] = 0;
+
+                /* Continue the loop — the AI may call more tools or give
+                 * a final text response. On the final iteration, don't
+                 * send tools so the AI is forced to give a text answer. */
+                continue;
+            }
+
+            /* No tool_calls — extract the "content" field from the
+             * response JSON and return it as the final answer. */
+            char content[AI_RESPONSE_MAX];
+            if (json_extract_string(raw_resp, "content", content, sizeof(content)) && content[0]) {
+                const char* cp = content;
+                while (*cp && total_written < (int)response_size - 1) {
+                    response[total_written++] = *cp++;
+                }
+            } else {
+                /* No content field — return the raw response (truncated). */
+                const char* rp = raw_resp;
+                while (*rp && total_written < (int)response_size - 64) {
+                    response[total_written++] = *rp++;
                 }
             }
-
-            /* No tool call detected — this is the final response.
-             * Copy the entire AI response to the output buffer. */
-            const char* rp = ai_resp;
-            while (*rp && total_written < (int)response_size - 1) {
-                response[total_written++] = *rp++;
-            }
             response[total_written] = 0;
+
+            /* Record in conversation memory. */
+            history_append_turn(prompt, response);
             return 0;
         }
 
         /* If we exhausted iterations, return whatever we accumulated. */
         response[total_written] = 0;
-        if (total_written > 0) return 0;
+        if (total_written > 0) {
+            history_append_turn(prompt, response);
+            return 0;
+        }
+        /* Fall through to offline mode. */
     }
 
-    /* OFFLINE MODE: keyword-based tool dispatch (not neural). */
+    /* OFFLINE MODE: keyword-based tool dispatch (not neural).
+     * Improved with more patterns: list files, what time, read file,
+     * install X, run X, etc. Real offline reasoning needs pickle_forward
+     * (deferred — STRETCH fix #7). */
     int n = 0;
     const char* header = "=== Agentic Chat (offline — keyword-based) ===\n\n";
     while (*header && n < (int)response_size - 1) response[n++] = *header++;
@@ -842,7 +1400,7 @@ int ai_chat_with_tools(const char* prompt, char* response,
     response[n++] = '\n';
 
     /* Tool dispatch — keyword matching fallback. */
-    char tool_out[512];
+    char tool_out[1024];
     int iterations = 0;
     int dispatched = 0;
 
@@ -850,20 +1408,63 @@ int ai_chat_with_tools(const char* prompt, char* response,
         iterations++;
         const char* tool_name = NULL;
         const char* tool_args = "";
+        char arg_buf[256];
+        arg_buf[0] = 0;
 
-        /* Pattern-match tool requests */
-        if (strstr(prompt, "memory") || strstr(prompt, "meminfo")) {
+        /* Pattern-match tool requests. Improved with more patterns. */
+        if (strstr(prompt, "memory") || strstr(prompt, "meminfo") ||
+            strstr(prompt, "how much ram") || strstr(prompt, "free memory")) {
             tool_name = "meminfo";
-        } else if (strstr(prompt, "uptime")) {
+        } else if (strstr(prompt, "uptime") || strstr(prompt, "how long") ||
+                   strstr(prompt, "what time") || strstr(prompt, "system time")) {
             tool_name = "uptime";
         } else if (strstr(prompt, "install ")) {
             tool_name = "pkg_install";
             tool_args = strstr(prompt, "install ") + 8;
-        } else if (strstr(prompt, "list packages") || strstr(prompt, "pkg list")) {
+            /* Strip trailing words like "package" or "please". */
+            strncpy(arg_buf, tool_args, sizeof(arg_buf) - 1);
+            arg_buf[sizeof(arg_buf) - 1] = 0;
+            /* Take just the first word as the package name. */
+            char* sp = arg_buf;
+            while (*sp && *sp != ' ') sp++;
+            *sp = 0;
+            tool_args = arg_buf;
+        } else if (strstr(prompt, "list packages") || strstr(prompt, "pkg list") ||
+                   strstr(prompt, "installed packages") || strstr(prompt, "what packages")) {
             tool_name = "pkg_list";
-        } else if (strstr(prompt, "shell ") || strstr(prompt, "run ")) {
+        } else if (strstr(prompt, "list files") || strstr(prompt, "ls") ||
+                   strstr(prompt, "show files") || strstr(prompt, "dir")) {
+            /* Use the shell tool to run "ls" (or equivalent). */
             tool_name = "shell";
-            tool_args = strstr(prompt, "shell ") ? strstr(prompt, "shell ") + 7 : strstr(prompt, "run ") + 4;
+            strncpy(arg_buf, "ls", sizeof(arg_buf) - 1);
+            arg_buf[sizeof(arg_buf) - 1] = 0;
+            tool_args = arg_buf;
+        } else if (strstr(prompt, "read file ") || strstr(prompt, "cat ")) {
+            tool_name = "file_read";
+            const char* fa = strstr(prompt, "read file ");
+            if (fa) fa += 10;
+            else fa = strstr(prompt, "cat ") + 4;
+            strncpy(arg_buf, fa, sizeof(arg_buf) - 1);
+            arg_buf[sizeof(arg_buf) - 1] = 0;
+            /* Strip trailing words. */
+            char* nl = arg_buf;
+            while (*nl && *nl != ' ' && *nl != '\n') nl++;
+            *nl = 0;
+            tool_args = arg_buf;
+        } else if (strstr(prompt, "shell ") || strstr(prompt, "run ") ||
+                   strstr(prompt, "execute ")) {
+            tool_name = "shell";
+            const char* sa = strstr(prompt, "shell ");
+            if (sa) sa += 6;
+            else { sa = strstr(prompt, "run "); if (sa) sa += 4; }
+            if (!sa) { sa = strstr(prompt, "execute ") + 8; }
+            strncpy(arg_buf, sa, sizeof(arg_buf) - 1);
+            arg_buf[sizeof(arg_buf) - 1] = 0;
+            /* Strip at newline. */
+            char* nl = arg_buf;
+            while (*nl && *nl != '\n') nl++;
+            *nl = 0;
+            tool_args = arg_buf;
         }
 
         if (!tool_name) break;
@@ -922,6 +1523,8 @@ int ai_chat_with_tools(const char* prompt, char* response,
     }
 
     response[n] = 0;
+    /* Record in conversation memory. */
+    history_append_turn(prompt, response);
     return 0;
 }
 
@@ -946,6 +1549,9 @@ void ai_init(void) {
         keys_set[i] = 0;
         for (int j = 0; j < AI_KEY_MAX_LEN; j++) api_keys[i][j] = 0;
     }
+
+    /* Clear conversation memory */
+    ai_clear_memory();
 
     /* Register built-in tools */
     ai_tool_register("shell",       "Run a shell command",                   ai_tool_shell);

@@ -7,6 +7,10 @@
 #define MAX_SIGNALS     32
 #define MAX_FD_PER_PROC 128
 
+/* Per-process path buffer length (matches VFS MAX_PATH_LEN — duplicated
+ * here to avoid a circular include between sched.h and vfs.h). */
+#define SCHED_PATH_MAX  256
+
 /* Priority scheduling (lower value = higher priority, Unix nice-style).
  * Range 0..39; PRIO_DEFAULT (20) is the midpoint — every newly allocated
  * process starts here unless task_set_priority() changes it. */
@@ -82,7 +86,13 @@ struct process {
     uint64_t fs_base;
     int is_linux_process;
     char exe_path[256];
-    uint64_t brk;
+    uint64_t brk;                         /* current program break (top of heap, exclusive) */
+    uint64_t brk_base;                    /* initial brk base (set on first sys_brk; lower bound of heap) */
+    uint64_t mmap_next_addr;              /* next free vaddr for mmap bump allocator (per-process) */
+    char cwd[SCHED_PATH_MAX];               /* per-process current working directory */
+    char root[SCHED_PATH_MAX];              /* per-process root directory (for chroot) */
+    uint32_t umask;                       /* per-process file-creation mask (POSIX umask) */
+    int needs_kstack_free;                /* deferred kstack free flag for proc_exit/proc_reap */
     uint64_t stack_bottom;               /* bottom of mapped stack region (grows downward) */
     uint64_t wake_tick;                  /* timer_get_ms() deadline while sleeping in task_sleep; 0 = not sleeping */
     int priority;                         /* scheduling priority 0..39 (lower = higher priority, PRIO_DEFAULT=20) */

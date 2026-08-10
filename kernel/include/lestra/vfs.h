@@ -151,6 +151,7 @@ off_t vfs_lseek(int fd, off_t offset, int whence);
 int vfs_unlink(const char* path);
 int vfs_chmod(const char* path, uint32_t mode);
 int vfs_rmdir(const char* path);
+int vfs_rename(const char* oldpath, const char* newpath);
 void vfs_selftest(void);
 void vfs_register_fs(struct filesystem* fs);
 struct mount* vfs_get_mount(int idx);

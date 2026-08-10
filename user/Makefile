@@ -7,10 +7,10 @@
 
 CC ?= gcc
 CFLAGS ?= -ffreestanding -O2 -Wall -Wextra \
-          -nostartfiles -nodefaultlibs -nostdlib \
-          -fno-pie -fno-stack-protector \
-          -mno-red-zone -mcmodel=large \
-          -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer
+	  -nostartfiles -nodefaultlibs -nostdlib \
+	  -fno-pie -fno-stack-protector \
+	  -mno-red-zone -mcmodel=large \
+	  -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer
 
 # KE-33: Build with `make FORK_TEST=1` to enable the fork() exercise
 # test in user/init/init.c (defines INIT_FORK_TEST). Off by default so
@@ -26,7 +26,7 @@ endif
 # which doesn't exist on LestraOS. This causes ldso_load_and_run to
 # crash when trying to load a "dynamic" /init that references glibc.
 LDFLAGS ?= -nostdlib -nostartfiles -nodefaultlibs -no-pie -static \
-           -Wl,--no-dynamic-linker -Wl,--build-id=none -Wl,-z,max-page-size=0x1000
+	   -Wl,--no-dynamic-linker -Wl,--build-id=none -Wl,-z,max-page-size=0x1000
 BUILD_DIR ?= ../build/user
 LIBC_DIR ?= ../build/libc
 

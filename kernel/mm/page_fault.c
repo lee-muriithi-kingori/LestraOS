@@ -244,7 +244,48 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
     }
 
     /* ================================================================
-     * Unhandled fault → kernel panic with full diagnostics
+     * 4. brk-heap demand paging (W3-B / W1-D #1)
+     *
+     * libc malloc() calls sbrk() which calls SYS_BRK. sys_brk now
+     * eagerly maps the new pages between old_brk and new_brk, but
+     * for safety we ALSO handle a fault anywhere in [brk_base, brk)
+     * that wasn't mapped (e.g. if brk shrank and re-grew past an
+     * unmapped page, or if a race left a hole). Map a zeroed
+     * user-RW-NX page and resume.
+     * ================================================================ */
+    if (user && write && cur && cur->brk_base != 0 &&
+        fault_addr >= cur->brk_base && fault_addr < cur->brk) {
+        /* Make sure the page isn't already present (avoid masking
+         * a protection violation on an existing brk page). */
+        uint64_t* pte = get_pte_in_pml4(cur->pml4, fault_addr);
+        if (!pte || !(*pte & PAGE_PRESENT)) {
+            phys_addr_t phys = pmm_alloc_page();
+            if (phys) {
+                memset((void*)(uintptr_t)phys, 0, PAGE_SIZE);
+                uint64_t page_addr = ALIGN_DOWN(fault_addr, PAGE_SIZE);
+                vmm_map_page(cur->pml4, page_addr, phys,
+                             PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX);
+                pr_info("PF: brk demand-page at 0x%x (PID %d, brk 0x%x..0x%x)\n",
+                        (unsigned)page_addr, cur->pid,
+                        (unsigned)cur->brk_base, (unsigned)cur->brk);
+                return;
+            }
+            /* OOM: fall through to SIGSEGV below — don't panic. */
+            pr_err("PF: brk demand-page OOM at 0x%x (PID %d)\n",
+                   (unsigned)fault_addr, cur->pid);
+        }
+    }
+
+    /* ================================================================
+     * Unhandled fault → kernel panic (kernel-mode) OR SIGSEGV
+     * delivery to the offending process (user-mode).
+     *
+     * W1-C #1 / W1-D #6: A user-mode fault we can't resolve (NULL
+     * deref, write to read-only page, NX-execute attempt, unmapped
+     * address) must NOT bring down the whole kernel. We deliver
+     * SIGSEGV (signal 11) to the current process; if no handler is
+     * installed, the default SIG_DFL action terminates the process
+     * via proc_exit(128 + 11). Only KERNEL-mode faults panic.
      * ================================================================ */
     /* SMAP diagnostic: if CR4.SMAP is enabled and the faulting address
      * is in user space (below 0x8000_0000_0000) while the fault came from
@@ -279,6 +320,48 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
                (void*)frame->rip, (void*)frame->rsp);
     }
 
+    /* USER-mode unhandled fault → deliver SIGSEGV to the process.
+     * signal_kill is in signals.c; SIGSEGV is 11. If the process
+     * has no SIGSEGV handler installed, signal_check_and_deliver()
+     * will run the SIG_DFL action which calls proc_exit(128+11).
+     * We can't call signal_check_and_deliver() directly from here
+     * because we're in IRQ context, not syscall context — the
+     * saved_state pointer on the process struct may not be the
+     * user-return state. Instead we just set the pending bit; the
+     * next syscall return OR timer-tick preemption path will
+     * deliver it. For a fault that occurred OUTSIDE a syscall,
+     * we need to terminate immediately — call proc_exit directly
+     * if no handler is installed. */
+    if (user && cur) {
+        extern int64_t signal_kill(int pid, int sig);
+        /* Set SIGSEGV pending. */
+        signal_kill(cur->pid, 11 /* SIGSEGV */);
+
+        /* If the process has no SIGSEGV handler installed, terminate
+         * it now (SIG_DFL for SIGSEGV is "terminate + core"). The
+         * 0-th sa_handler means "default" (no user handler). */
+        uint64_t segv_handler = cur->sigactions[11].sa_handler;
+        if (segv_handler == 0) {
+            pr_err("PF: terminating PID %d (SIGSEGV, no handler)\n",
+                   cur->pid);
+            /* proc_exit will schedule() the next task and never return. */
+            extern void proc_exit(int);
+            proc_exit(128 + 11);   /* 139 = 128 + SIGSEGV */
+            /* proc_exit doesn't return; if it did, halt. */
+            while (1) { __asm__ volatile("hlt"); }
+        }
+        /* A handler IS installed — the pending SIGSEGV will be
+         * delivered when we return through the IRQ path (the next
+         * sched_tick or syscall return calls signal_check_and_deliver).
+         * For now, return so the faulting instruction is retried,
+         * which will re-fault if the handler didn't fix the mapping.
+         * NOTE: this is a known limitation — without wiring
+         * signal_check_and_deliver into the IRQ return path, the
+         * signal may not be delivered until the next syscall. */
+        return;
+    }
+
+    /* KERNEL-mode unhandled fault → real panic. */
     panicf("Unhandled page fault at 0x%x (err 0x%x, RIP 0x%p)",
             (unsigned)fault_addr, (unsigned)error_code,
             frame ? (void*)frame->rip : NULL);

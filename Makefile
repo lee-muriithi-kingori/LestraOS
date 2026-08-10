@@ -38,10 +38,10 @@ done)
 
 # Flags
 CFLAGS := -ffreestanding -O$(OPTIMIZE) -Wall -Wextra \
-	          -nostdlib -nostartfiles -nodefaultlibs \
-	          -I$(CURDIR)/kernel/include -I$(CURDIR)/libc/include -m64 -mno-red-zone -mcmodel=large \
-	          -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer -fstack-protector-strong \
-	          -DPICKLE_KERNEL
+		  -nostdlib -nostartfiles -nodefaultlibs \
+		  -I$(CURDIR)/kernel/include -I$(CURDIR)/libc/include -m64 -mno-red-zone -mcmodel=large \
+		  -mno-mmx -mno-sse -mno-sse2 -fomit-frame-pointer -fstack-protector-strong \
+		  -DPICKLE_KERNEL
 
 ifeq ($(DEBUG),1)
 	CFLAGS += -g -DDEBUG -DLESTRA_DEBUG
@@ -78,7 +78,6 @@ UI_SRCS := $(wildcard kernel/ui/*.c)
 PKG_SRCS := $(wildcard pkg/*.c) $(wildcard kernel/pkg/*.c)
 GUI_SRCS := $(wildcard kernel/gui/*.c)
 INPUT_SRCS := kernel/input.c
-DESKTOP_SRCS := $(wildcard desktop/*.c)
 AI_SRCS := $(wildcard kernel/ai/*.c)
 NET_SRCS := $(wildcard kernel/net/*.c)
 EXEC_SRCS := $(wildcard kernel/exec/*.c)
@@ -99,25 +98,24 @@ ACPI_SRCS := $(wildcard kernel/acpi/*.c)
 BOOT_OBJS := $(patsubst boot/%.asm,$(BUILD_DIR)/boot/%.o,$(filter-out boot/stage1.asm,$(BOOT_SRCS)))
 STAGE1_BIN := $(BUILD_DIR)/boot/stage1.bin
 ARCH_OBJS := $(patsubst kernel/arch/$(ARCH)/%.c,$(BUILD_DIR)/arch/%.o,$(filter %.c,$(ARCH_SRCS))) \
-	                 $(patsubst kernel/arch/$(ARCH)/%.asm,$(BUILD_DIR)/arch/%.o,$(filter %.asm,$(ARCH_SRCS)))
+			 $(patsubst kernel/arch/$(ARCH)/%.asm,$(BUILD_DIR)/arch/%.o,$(filter %.asm,$(ARCH_SRCS)))
 CORE_OBJS := $(patsubst kernel/core/%.c,$(BUILD_DIR)/core/%.o,$(CORE_SRCS))
 MM_OBJS := $(patsubst kernel/mm/%.c,$(BUILD_DIR)/mm/%.o,$(MM_SRCS))
 SCHED_OBJS := $(patsubst kernel/sched/%.c,$(BUILD_DIR)/sched/%.o,$(SCHED_SRCS)) \
-	                   $(patsubst kernel/sched/%.asm,$(BUILD_DIR)/sched/%.o,$(SCHED_ASM))
+			   $(patsubst kernel/sched/%.asm,$(BUILD_DIR)/sched/%.o,$(SCHED_ASM))
 DRIVER_OBJS := $(patsubst kernel/drivers/char/%.c,$(BUILD_DIR)/drivers/char/%.o,$(wildcard kernel/drivers/char/*.c)) \
-	                   $(patsubst kernel/drivers/block/%.c,$(BUILD_DIR)/drivers/block/%.o,$(wildcard kernel/drivers/block/*.c)) \
-	                   $(patsubst kernel/drivers/audio/%.c,$(BUILD_DIR)/drivers/audio/%.o,$(wildcard kernel/drivers/audio/*.c)) \
-	                   $(patsubst kernel/drivers/pci/%.c,$(BUILD_DIR)/drivers/pci/%.o,$(wildcard kernel/drivers/pci/*.c)) \
-	                   $(patsubst kernel/drivers/net/%.c,$(BUILD_DIR)/drivers/net/%.o,$(wildcard kernel/drivers/net/*.c)) \
-	                   $(patsubst kernel/drivers/apic/%.c,$(BUILD_DIR)/drivers/apic/%.o,$(wildcard kernel/drivers/apic/*.c))
+			   $(patsubst kernel/drivers/block/%.c,$(BUILD_DIR)/drivers/block/%.o,$(wildcard kernel/drivers/block/*.c)) \
+			   $(patsubst kernel/drivers/audio/%.c,$(BUILD_DIR)/drivers/audio/%.o,$(wildcard kernel/drivers/audio/*.c)) \
+			   $(patsubst kernel/drivers/pci/%.c,$(BUILD_DIR)/drivers/pci/%.o,$(wildcard kernel/drivers/pci/*.c)) \
+			   $(patsubst kernel/drivers/net/%.c,$(BUILD_DIR)/drivers/net/%.o,$(wildcard kernel/drivers/net/*.c)) \
+			   $(patsubst kernel/drivers/apic/%.c,$(BUILD_DIR)/drivers/apic/%.o,$(wildcard kernel/drivers/apic/*.c))
 SYSCALL_OBJS := $(patsubst kernel/syscall/%.c,$(BUILD_DIR)/syscall/%.o,$(filter %.c,$(SYSCALL_SRCS))) \
-	                        $(patsubst kernel/syscall/%.asm,$(BUILD_DIR)/syscall/%.o,$(filter %.asm,$(SYSCALL_SRCS)))
+				$(patsubst kernel/syscall/%.asm,$(BUILD_DIR)/syscall/%.o,$(filter %.asm,$(SYSCALL_SRCS)))
 UI_OBJS := $(patsubst kernel/ui/%.c,$(BUILD_DIR)/ui/%.o,$(UI_SRCS))
 PKG_OBJS := $(patsubst pkg/%.c,$(BUILD_DIR)/pkg/%.o,$(filter pkg/%.c,$(PKG_SRCS))) \
-	                   $(patsubst kernel/pkg/%.c,$(BUILD_DIR)/kpkg/%.o,$(filter kernel/pkg/%.c,$(PKG_SRCS)))
+			   $(patsubst kernel/pkg/%.c,$(BUILD_DIR)/kpkg/%.o,$(filter kernel/pkg/%.c,$(PKG_SRCS)))
 GUI_OBJS := $(patsubst kernel/gui/%.c,$(BUILD_DIR)/gui/%.o,$(GUI_SRCS))
 INPUT_OBJS := $(patsubst kernel/%.c,$(BUILD_DIR)/%.o,$(INPUT_SRCS))
-DESKTOP_OBJS := $(patsubst desktop/%.c,$(BUILD_DIR)/desktop/%.o,$(DESKTOP_SRCS))
 AI_OBJS := $(patsubst kernel/ai/%.c,$(BUILD_DIR)/ai/%.o,$(AI_SRCS))
 NET_OBJS := $(patsubst kernel/net/%.c,$(BUILD_DIR)/net/%.o,$(NET_SRCS))
 EXEC_OBJS := $(patsubst kernel/exec/%.c,$(BUILD_DIR)/exec/%.o,$(EXEC_SRCS)) $(BUILD_DIR)/exec/elf_jump_to_user.o
@@ -127,15 +125,15 @@ POWER_OBJS := $(patsubst kernel/drivers/power/%.c,$(BUILD_DIR)/drivers/power/%.o
 CLOCK_OBJS := $(patsubst kernel/drivers/clock/%.c,$(BUILD_DIR)/drivers/clock/%.o,$(CLOCK_SRCS))
 SENSOR_OBJS := $(patsubst kernel/drivers/sensor/%.c,$(BUILD_DIR)/drivers/sensor/%.o,$(SENSOR_SRCS))
 FS_OBJS := $(patsubst kernel/fs/%.c,$(BUILD_DIR)/fs/%.o,$(filter-out kernel/fs/ext2/%.c,$(filter kernel/fs/%.c,$(FS_SRCS)))) \
-	                   $(patsubst kernel/fs/ext2/%.c,$(BUILD_DIR)/fs/ext2/%.o,$(filter kernel/fs/ext2/%.c,$(FS_SRCS)))
+			   $(patsubst kernel/fs/ext2/%.c,$(BUILD_DIR)/fs/ext2/%.o,$(filter kernel/fs/ext2/%.c,$(FS_SRCS)))
 SPLASH_OBJS := $(patsubst kernel/%.c,$(BUILD_DIR)/%.o,$(SPLASH_SRCS))
 ACPI_OBJS := $(patsubst kernel/acpi/%.c,$(BUILD_DIR)/acpi/%.o,$(ACPI_SRCS))
 
 ALL_KERNEL_OBJS := $(BOOT_OBJS) $(ARCH_OBJS) $(CORE_OBJS) $(MM_OBJS) \
-	                           $(SCHED_OBJS) $(FS_OBJS) $(DRIVER_OBJS) $(SYSCALL_OBJS) $(UI_OBJS) \
-	                           $(PKG_OBJS) $(DESKTOP_OBJS) $(AI_OBJS) $(NET_OBJS) \
-	                           $(GUI_OBJS) $(INPUT_OBJS) $(SPLASH_OBJS) $(EXEC_OBJS) \
-	                           $(SYS_OBJS) $(POWER_OBJS) $(CLOCK_OBJS) $(SENSOR_OBJS) $(TTS_OBJS) $(ACPI_OBJS)
+				   $(SCHED_OBJS) $(FS_OBJS) $(DRIVER_OBJS) $(SYSCALL_OBJS) $(UI_OBJS) \
+				   $(PKG_OBJS) $(AI_OBJS) $(NET_OBJS) \
+				   $(GUI_OBJS) $(INPUT_OBJS) $(SPLASH_OBJS) $(EXEC_OBJS) \
+				   $(SYS_OBJS) $(POWER_OBJS) $(CLOCK_OBJS) $(SENSOR_OBJS) $(TTS_OBJS) $(ACPI_OBJS)
 
 # Phony targets
 .PHONY: all clean run run-debug run-kernel smoke test iso kernel libc userspace initrd img install docs help
@@ -150,7 +148,7 @@ $(BUILD_DIR)/drivers/char $(BUILD_DIR)/drivers/block $(BUILD_DIR)/drivers/pci \
 $(BUILD_DIR)/drivers/net $(BUILD_DIR)/drivers/audio $(BUILD_DIR)/drivers/power \
 $(BUILD_DIR)/drivers/clock $(BUILD_DIR)/drivers/sensor $(BUILD_DIR)/drivers/apic \
 $(BUILD_DIR)/syscall $(BUILD_DIR)/libc $(BUILD_DIR)/user $(BUILD_DIR)/ui \
-$(BUILD_DIR)/pkg $(BUILD_DIR)/kpkg $(BUILD_DIR)/desktop $(BUILD_DIR)/ai \
+$(BUILD_DIR)/pkg $(BUILD_DIR)/kpkg $(BUILD_DIR)/ai \
 $(BUILD_DIR)/net $(BUILD_DIR)/audio $(BUILD_DIR)/gui $(BUILD_DIR)/exec \
 $(BUILD_DIR)/acpi \
 $(BUILD_DIR)/sys $(GRUB_DIR):
@@ -228,11 +226,6 @@ $(BUILD_DIR)/ui/%.o: kernel/ui/%.c | $(BUILD_DIR)/ui
 
 # Package manager objects
 $(BUILD_DIR)/pkg/%.o: pkg/%.c | $(BUILD_DIR)/pkg
-	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -c $< -o $@
-
-# Desktop objects
-$(BUILD_DIR)/desktop/%.o: desktop/%.c | $(BUILD_DIR)/desktop
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
@@ -326,7 +319,7 @@ $(BUILD_DIR)/%.o: kernel/%.c | $(BUILD_DIR)
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 # Link kernel
-# FIX: include $(PKG_OBJS) $(DESKTOP_OBJS) $(AI_OBJS) in link
+# FIX: include $(PKG_OBJS) $(AI_OBJS) in link
 $(KERNEL_BIN): $(ALL_KERNEL_OBJS) kernel/arch/$(ARCH)/linker.ld | $(BUILD_DIR)
 	@echo "  LD      $@"
 	@$(LD) -T kernel/arch/$(ARCH)/linker.ld -e _start $(LDFLAGS) -o $@ $(ALL_KERNEL_OBJS) $(BUILD_DIR)/libc/libc.a
@@ -359,11 +352,11 @@ iso: kernel initrd | $(GRUB_DIR)
 	@cp boot/grub.cfg $(GRUB_DIR)/grub.cfg
 	@if [ -n "$(GRUB_MODULES_DIR)" ]; then \
 	grub-mkrescue -d "$(GRUB_MODULES_DIR)" -o $(KERNEL_ISO) $(ISO_DIR); \
-	        elif command -v grub2-mkrescue >/dev/null 2>&1; then \
+		elif command -v grub2-mkrescue >/dev/null 2>&1; then \
 	grub2-mkrescue -o $(KERNEL_ISO) $(ISO_DIR); \
-	        else \
+		else \
 	echo "  WARNING: grub-mkrescue / grub2-mkrescue not found, ISO not built"; \
-	        fi
+		fi
 	@echo "  ISO build complete: $(KERNEL_ISO)"
 
 # Raw-disk image (bootable on bare metal / USB stick without GRUB).
@@ -387,17 +380,17 @@ img: kernel initrd $(STAGE1_BIN) $(KERNEL_RAW)
 run: all
 	@echo "  Starting Lestra OS in QEMU..."
 	@qemu-system-x86_64 -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64 \
-	         -nographic -boot d -no-reboot \
-	         -netdev user,id=net0 -device e1000,netdev=net0 \
-	         -name "Lestra OS"
+		 -nographic -boot d -no-reboot \
+		 -netdev user,id=net0 -device e1000,netdev=net0 \
+		 -name "Lestra OS"
 
 run-cloud: all
 	@echo "  Starting Lestra OS in QEMU (cloud/serial mode)..."
 	@qemu-system-x86_64 -cdrom $(KERNEL_ISO) -m 512M -cpu qemu64 \
-	         -nographic -boot d -no-reboot \
-	         -serial stdio -monitor none \
-	         -netdev user,id=net0 -device e1000,netdev=net0 \
-	         -name "Lestra OS [cloud]"
+		 -nographic -boot d -no-reboot \
+		 -serial stdio -monitor none \
+		 -netdev user,id=net0 -device e1000,netdev=net0 \
+		 -name "Lestra OS [cloud]"
 
 # QEMU firmware (SeaBIOS) lookup dir. The devtools prefix is created by
 # scripts/setup-devtools.sh; fall back to the system path if absent.
@@ -420,11 +413,11 @@ $(BUILD_DIR)/lestraos-test.iso: kernel initrd boot/grub-test.cfg | $(GRUB_DIR)
 smoke: $(BUILD_DIR)/lestraos-test.iso
 	@echo "  Running cloud-mode smoke test (20s)..."
 	@timeout 20 qemu-system-x86_64 -L $(QEMU_FW_DIR) \
-	         -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
-	         -nographic -boot d -no-reboot \
-	         -serial stdio -monitor none \
-	         -netdev user,id=net0 -device e1000,netdev=net0 \
-	         -name "Lestra OS [smoke]" > /tmp/lestra-smoke.log 2>&1 || true
+		 -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
+		 -nographic -boot d -no-reboot \
+		 -serial stdio -monitor none \
+		 -netdev user,id=net0 -device e1000,netdev=net0 \
+		 -name "Lestra OS [smoke]" > /tmp/lestra-smoke.log 2>&1 || true
 	@echo "  Smoke log: /tmp/lestra-smoke.log ($$(wc -l < /tmp/lestra-smoke.log) lines)"
 	@grep -q "kernel initialized successfully" /tmp/lestra-smoke.log && echo "  PASS: kernel reached init" || echo "  FAIL: kernel did not reach init"
 	@grep -q "pickle: selftest OK" /tmp/lestra-smoke.log && echo "  PASS: in-kernel pickle selftest" || echo "  FAIL: pickle selftest not seen"
@@ -437,11 +430,11 @@ smoke: $(BUILD_DIR)/lestraos-test.iso
 test: $(BUILD_DIR)/lestraos-test.iso
 	@echo "  Running strict boot test (20s)..."
 	@timeout 20 qemu-system-x86_64 -L $(QEMU_FW_DIR) \
-	         -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
-	         -nographic -boot d -no-reboot \
-	         -serial stdio -monitor none \
-	         -netdev user,id=net0 -device e1000,netdev=net0 \
-	         -name "Lestra OS [test]" > /tmp/lestra-test.log 2>&1 || true
+		 -cdrom $(BUILD_DIR)/lestraos-test.iso -m 512M -cpu qemu64 \
+		 -nographic -boot d -no-reboot \
+		 -serial stdio -monitor none \
+		 -netdev user,id=net0 -device e1000,netdev=net0 \
+		 -name "Lestra OS [test]" > /tmp/lestra-test.log 2>&1 || true
 	@echo "  Test log: /tmp/lestra-test.log"
 	@fail=0; \
 	grep -q "kernel initialized successfully" /tmp/lestra-test.log || { echo "  FAIL: kernel did not reach init"; fail=1; }; \
@@ -453,13 +446,13 @@ test: $(BUILD_DIR)/lestraos-test.iso
 run-debug: all
 	@echo "  Starting QEMU with GDB server..."
 	@qemu-system-x86_64 -cdrom $(KERNEL_ISO) -m 4096M -cpu qemu64 \
-	         -vga std -serial stdio -boot d -no-reboot -no-shutdown \
-	         -s -S -name "Lestra OS [DEBUG]"
+		 -vga std -serial stdio -boot d -no-reboot -no-shutdown \
+		 -s -S -name "Lestra OS [DEBUG]"
 
 run-kernel: kernel
 	@echo "  Starting kernel directly in QEMU..."
 	@qemu-system-x86_64 -kernel $(KERNEL_BIN) -m 4096M -cpu qemu64 \
-	         -vga std -serial stdio -append "debug" -no-reboot -no-shutdown
+		 -vga std -serial stdio -append "debug" -no-reboot -no-shutdown
 
 # Clean
 clean:

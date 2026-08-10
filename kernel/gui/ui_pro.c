@@ -39,6 +39,7 @@
 #include <lestra/assets/icon_settings.h>
 #include <lestra/assets/icon_help.h>
 #include <lestra/assets/icon_about.h>
+#include <lestra/vfs.h>
 #include <string.h>
 
 /* Forward declaration */
@@ -705,18 +706,171 @@ void ui_render_notifications(void) {
     }
 }
 
-/* ===== SETTINGS STATE ===== */
+/* ===== SETTINGS STATE (with on-disk persistence) =====
+ *
+ * The four settings (brightness, volume, adblock, dark_mode) used to
+ * be in-memory only — every reboot reset them to the defaults below.
+ * They now persist to a flat key=value file at /etc/settings.conf on
+ * the VFS. On any settings_set_*() call we rewrite the whole file
+ * (it's tiny — 4 lines). On first access (lazy via settings_load()),
+ * we read the file back and call the setters to restore state.
+ *
+ * NOTE: /etc is memfs (volatile) in the default boot, so this does
+ * NOT survive a reboot YET — but the mechanism is in place so when
+ * an ext2/disk fs is mounted at / (or /etc is bind-mounted onto a
+ * disk-backed fs), persistence Just Works. The file format is plain
+ * text on purpose so it can be inspected / edited by hand. */
 static int settings_brightness = 80;  /* 0-100 */
 static int settings_volume = 75;      /* 0-100 */
 static int settings_adblock = 1;
 static int settings_dark_mode = 1;
 
-int settings_get_brightness(void) { return settings_brightness; }
-int settings_get_volume(void) { return settings_volume; }
-int settings_get_adblock(void) { return settings_adblock; }
-int settings_get_dark_mode(void) { return settings_dark_mode; }
+#define SETTINGS_PATH  "/etc/settings.conf"
+static int settings_loaded = 0;
 
-void settings_set_brightness(int v) { settings_brightness = v; if (v < 10) settings_brightness = 10; if (v > 100) settings_brightness = 100; }
-void settings_set_volume(int v) { settings_volume = v; if (v < 0) settings_volume = 0; if (v > 100) settings_volume = 100; }
-void settings_set_adblock(int v) { settings_adblock = v; }
-void settings_set_dark_mode(int v) { settings_dark_mode = v; }
+/* Parse one "key=value\n" line and apply it via the appropriate
+ * setter. Tolerates trailing whitespace / missing newline. */
+static void settings_apply_line(char* line) {
+    /* Strip trailing newline / CR. */
+    int len = (int)strlen(line);
+    while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' ||
+                       line[len-1] == ' '  || line[len-1] == '\t')) {
+        line[--len] = '\0';
+    }
+    if (len == 0) return;
+
+    /* Split on '='. */
+    char* eq = strchr(line, '=');
+    if (!eq) return;
+    *eq = '\0';
+    const char* key = line;
+    const char* val = eq + 1;
+    if (!*key || !*val) return;
+
+    /* atoi-equivalent (libc isn't linked into the kernel). */
+    int v = 0;
+    int sign = 1;
+    const char* p = val;
+    if (*p == '-') { sign = -1; p++; }
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
+        p++;
+    }
+    v *= sign;
+
+    if (strcmp(key, "brightness") == 0) {
+        settings_brightness = v;
+        if (settings_brightness < 10) settings_brightness = 10;
+        if (settings_brightness > 100) settings_brightness = 100;
+    } else if (strcmp(key, "volume") == 0) {
+        settings_volume = v;
+        if (settings_volume < 0) settings_volume = 0;
+        if (settings_volume > 100) settings_volume = 100;
+    } else if (strcmp(key, "adblock") == 0) {
+        settings_adblock = v ? 1 : 0;
+    } else if (strcmp(key, "dark_mode") == 0) {
+        settings_dark_mode = v ? 1 : 0;
+    }
+    /* Unknown keys are silently ignored — forward-compat. */
+}
+
+/* Read /etc/settings.conf (if it exists) and apply each line. Called
+ * lazily on the first settings_get_*() call so we don't pay the VFS
+ * cost at boot until the GUI actually needs a setting. */
+static void settings_load(void) {
+    if (settings_loaded) return;
+    settings_loaded = 1;
+
+    int fd = vfs_open(SETTINGS_PATH, O_RDONLY);
+    if (fd < 0) {
+        /* File doesn't exist yet — defaults stay. This is the normal
+         * first-boot path; the first settings_set_*() will create it. */
+        return;
+    }
+    static char buf[512];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buf) - 1) {
+        ssize_t n = vfs_read(fd, buf + total, sizeof(buf) - 1 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    vfs_close(fd);
+    buf[total] = '\0';
+
+    /* Walk line-by-line. */
+    char* p = buf;
+    while (p && *p) {
+        char* nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        settings_apply_line(p);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    pr_info("settings: loaded %s (brightness=%d volume=%d adblock=%d dark_mode=%d)\n",
+            SETTINGS_PATH, settings_brightness, settings_volume,
+            settings_adblock, settings_dark_mode);
+}
+
+/* Write the current settings to /etc/settings.conf as flat key=value
+ * lines. Creates /etc if missing (vfs_open with O_CREAT will fail if
+ * the parent dir doesn't exist, so we vfs_mkdir it first as a best
+ * effort — memfs allows mkdir of an existing dir to fail silently). */
+static void settings_persist(void) {
+    /* Build the file contents in a stack buffer (always small). */
+    char buf[256];
+    int len = 0;
+    len += ksnprintf(buf + len, sizeof(buf) - len,
+                     "brightness=%d\n", settings_brightness);
+    len += ksnprintf(buf + len, sizeof(buf) - len,
+                     "volume=%d\n", settings_volume);
+    len += ksnprintf(buf + len, sizeof(buf) - len,
+                     "adblock=%d\n", settings_adblock);
+    len += ksnprintf(buf + len, sizeof(buf) - len,
+                     "dark_mode=%d\n", settings_dark_mode);
+
+    /* Make sure /etc exists (best effort — ignore EEXIST). */
+    vfs_mkdir("/etc", 0755);
+
+    int fd = vfs_open(SETTINGS_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        pr_info("settings: cannot open %s for write (rc=%d)\n",
+                SETTINGS_PATH, fd);
+        return;
+    }
+    ssize_t wrote = vfs_write(fd, buf, len);
+    vfs_close(fd);
+    if (wrote < 0) {
+        pr_info("settings: write to %s failed (rc=%d)\n",
+                SETTINGS_PATH, (int)wrote);
+    }
+}
+
+int settings_get_brightness(void) { settings_load(); return settings_brightness; }
+int settings_get_volume(void)     { settings_load(); return settings_volume; }
+int settings_get_adblock(void)    { settings_load(); return settings_adblock; }
+int settings_get_dark_mode(void)  { settings_load(); return settings_dark_mode; }
+
+void settings_set_brightness(int v) {
+    settings_load();
+    settings_brightness = v;
+    if (settings_brightness < 10) settings_brightness = 10;
+    if (settings_brightness > 100) settings_brightness = 100;
+    settings_persist();
+}
+void settings_set_volume(int v) {
+    settings_load();
+    settings_volume = v;
+    if (settings_volume < 0) settings_volume = 0;
+    if (settings_volume > 100) settings_volume = 100;
+    settings_persist();
+}
+void settings_set_adblock(int v) {
+    settings_load();
+    settings_adblock = v ? 1 : 0;
+    settings_persist();
+}
+void settings_set_dark_mode(int v) {
+    settings_load();
+    settings_dark_mode = v ? 1 : 0;
+    settings_persist();
+}

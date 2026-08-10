@@ -5,7 +5,7 @@ AR ?= ar
 CFLAGS ?= -ffreestanding -O2 -Wall -Wextra
 BUILD_DIR ?= ../build/libc
 
-SRCS := src/string.c src/stdio.c src/stdlib.c src/unistd.c
+SRCS := src/string.c src/stdio.c src/stdlib.c src/unistd.c src/errno.c
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 all: $(BUILD_DIR)/libc.a
