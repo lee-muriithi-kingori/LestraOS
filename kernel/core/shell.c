@@ -275,9 +275,20 @@ static void cmd_help(void) {
     printk("  Hardware:\n");
     printk("    lspci        List PCI devices\n");
     printk("    sysinfo      Show full system information\n");
+    printk("    netstat      Network status (IP, MAC, gateway, DNS, IPv6, firewall)\n");
+    printk("    battery      Battery status\n");
+    printk("    temp         Thermal sensors\n");
+    printk("\n");
+    printk("  System:\n");
+    printk("    services     List registered services (alias: lee status)\n");
+    printk("    packages     List available packages (alias: pkg list)\n");
+    printk("    lee          Sandbox and service manager\n");
+    printk("    firewall     Firewall management\n");
+    printk("    cron         Cron daemon\n");
+    printk("    whoami       Print current user (root — single-user mode)\n");
+    printk("    hostname     Print system hostname\n");
     printk("\n");
     printk("  Other:\n");
-    printk("    lee          Sandbox and service manager\n");
     printk("    install      Show installer instructions\n");
     printk("    exit         Exit shell (halt)\n");
     printk("\n");
@@ -2457,6 +2468,55 @@ static void execute_command(void) {
         cli();
         while (1) hlt();
     }
+    else if (strcmp(cmd, "netstat") == 0) {
+        /* Concise network status — IP, MAC, gateway, DNS, IPv6, link, firewall. */
+        printk("\n=== Network Status ===\n");
+        if (!net_is_up()) {
+            printk("Link:      DOWN\n");
+            printk("======================\n\n");
+            return;
+        }
+        printk("Link:      UP (e1000)\n");
+        ipv4_addr_t ip = net_get_ip();
+        printk("IP:        %u.%u.%u.%u\n", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+        ipv4_addr_t gw = net_get_gateway();
+        ipv4_addr_t dns = net_get_dns();
+        mac_addr_t mac = net_get_mac();
+        printk("Gateway:   %u.%u.%u.%u\n", gw.bytes[0], gw.bytes[1], gw.bytes[2], gw.bytes[3]);
+        printk("DNS:       %u.%u.%u.%u\n", dns.bytes[0], dns.bytes[1], dns.bytes[2], dns.bytes[3]);
+        printk("MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
+               mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5]);
+        if (net_ipv6_is_valid()) {
+            ipv6_addr_t ip6 = net_get_ipv6();
+            char addr_str[40];
+            ipv6_addr_to_str(ip6, addr_str, sizeof(addr_str));
+            printk("IPv6:      %s\n", addr_str);
+        }
+        if (wifi_is_connected()) {
+            printk("WiFi:      connected to %s\n", wifi_get_connected_ssid());
+        } else {
+            printk("WiFi:      not connected\n");
+        }
+        printk("Firewall:  (run 'firewall status' for details)\n");
+        printk("======================\n\n");
+    }
+    else if (strcmp(cmd, "services") == 0) {
+        /* Alias: 'services' → 'lee status' (shows all registered services) */
+        char* new_argv[3] = { "lee", "status", NULL };
+        cmd_lee(2, new_argv);
+    }
+    else if (strcmp(cmd, "packages") == 0) {
+        /* Alias: 'packages' → 'pkg list' (lists 110 packages across 5 repos) */
+        char* new_argv[3] = { "pkg", "list", NULL };
+        cmd_pkg(2, new_argv);
+    }
+    else if (strcmp(cmd, "whoami") == 0) {
+        /* LestraOS is single-user — the kernel shell always runs as root. */
+        printk("root\n");
+    }
+    else if (strcmp(cmd, "hostname") == 0) {
+        printk("lestraos\n");
+    }
     else {
         printk("Unknown command: %s\n", cmd);
         printk("Type 'help' for available commands.\n");
@@ -2495,7 +2555,8 @@ static const char* const shell_builtins[] = {
     "ping", "ping6", "wget", "claude", "glm", "gemini", "openai", "uai",
     "disk", "mount", "exec", "save", "play", "speak", "date", "time",
     "battery", "temp", "wifi", "cron", "lee", "firewall", "sysinfo",
-    "lspci", "exit", NULL
+    "lspci", "exit", "netstat", "services", "packages", "whoami", "hostname",
+    NULL
 };
 
 /* Erase `old_len` chars from the line, then print `buf` (which is

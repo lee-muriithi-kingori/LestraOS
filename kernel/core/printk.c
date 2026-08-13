@@ -179,15 +179,15 @@ int vprintk(const char* fmt, va_list args) {
         /* Parse format specifier */
         bool alternate = false;
         bool zero_pad = false;
+        bool left_align = false;
         int width = 0;
         int length = 0; /* 0=none, 1=l, 2=ll */
-        
-        if (*fmt == '#') {
-            alternate = true;
-            fmt++;
-        }
-        if (*fmt == '0') {
-            zero_pad = true;
+
+        /* Flags: '-' (left-align), '#' (alternate), '0' (zero-pad) */
+        while (*fmt == '-' || *fmt == '#' || *fmt == '0' || *fmt == ' ') {
+            if (*fmt == '-') left_align = true;
+            else if (*fmt == '#') alternate = true;
+            else if (*fmt == '0') zero_pad = true;
             fmt++;
         }
         while (*fmt >= '0' && *fmt <= '9') {
@@ -202,8 +202,8 @@ int vprintk(const char* fmt, va_list args) {
                 length = 2;
             }
         }
-        
-        (void)width; (void)zero_pad; (void)length; /* unused for now */
+
+        (void)alternate; (void)zero_pad; (void)left_align; (void)length; /* width/flags noted but padding not implemented */
         
         switch (*fmt) {
             case 'c': {
