@@ -1,0 +1,142 @@
+/*
+ * Lestra OS - Battery / ACPI Power Driver
+ * Copyright (c) 2026 lestramk.org
+ *
+ * Reads battery status via ACPI when available. On QEMU (which has no
+ * real battery device by default) we fall back to a simulated "always
+ * full, always plugged in" battery so userland power tools still work.
+ *
+ * On real hardware this is where we'd walk the ACPI DSDT/FADT, find the
+ * Power Management device (PIIX4 / similar), enable the Embedded
+ * Controller, and read the _BST (battery status) / _BIF (battery info)
+ * objects. LestraOS doesn't yet ship an AML interpreter, so we probe
+ * for the ACPI PCI device and report a simulated battery either way.
+ */
+
+#include <lestra/types.h>
+#include <lestra/printk.h>
+#include <lestra/power.h>
+#include <lestra/pci.h>
+
+/* Intel PIIX4 ACPI PM device (QEMU's default southbridge). */
+#define PIIX4_ACPI_VENDOR  0x8086
+#define PIIX4_ACPI_DEVICE  0x7000
+
+/* ACPI PCI base class 0x06 (Bridge), subclass 0x01 (ISA). The PIIX4
+ * sits here and provides the ACPI PM function; we use it as a hint
+ * that ACPI is wired up on this platform. */
+#define PCI_CLASS_BRIDGE    0x06
+#define PCI_SUBCLASS_ISA    0x01
+
+/* QEMU simulated battery — VMs are effectively always plugged in. */
+#define SIM_PERCENT   100
+#define SIM_CHARGING  0
+#define SIM_STATUS    "Full"
+
+/* Internal state. */
+static int battery_present = 0;   /* Real battery detected            */
+static int acpi_present    = 0;   /* ACPI PM device detected          */
+static int initialized     = 0;
+
+/*
+ * Scan the PCI bus for the ACPI PM device and any known battery
+ * controllers. We scan bus 0, devices 0-31, functions 0-7 which is
+ * plenty for QEMU and most real firmware layouts.
+ */
+static int scan_for_acpi(void) {
+    for (uint16_t dev = 0; dev < 32; dev++) {
+        for (uint8_t func = 0; func < 8; func++) {
+            uint32_t vd = pci_config_read32(0, (uint8_t)dev, func, 0x00);
+            uint16_t vendor = (uint16_t)(vd & 0xFFFF);
+            uint16_t device = (uint16_t)(vd >> 16);
+            if (vendor == 0xFFFF || vendor == 0x0000) {
+                continue;
+            }
+
+            uint32_t class_code = pci_config_read32(0, (uint8_t)dev, func, 0x08);
+            uint8_t baseclass = (uint8_t)((class_code >> 24) & 0xFF);
+            uint8_t subclass  = (uint8_t)((class_code >> 16) & 0xFF);
+
+            /* Intel PIIX4 ACPI PM — QEMU's default. */
+            if (vendor == PIIX4_ACPI_VENDOR && device == PIIX4_ACPI_DEVICE) {
+                pr_info("battery: Intel PIIX4 ACPI PM at PCI 0:%u:%u\n",
+                        (unsigned)dev, (unsigned)func);
+                return 1;
+            }
+            /* Generic ACPI-capable ISA bridge hint. */
+            if (baseclass == PCI_CLASS_BRIDGE && subclass == PCI_SUBCLASS_ISA) {
+                pr_info("battery: ACPI-capable ISA bridge at PCI 0:%u:%u "
+                        "(vendor=%04x device=%04x)\n",
+                        (unsigned)dev, (unsigned)func,
+                        (unsigned)vendor, (unsigned)device);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int battery_init(void) {
+    pr_info("battery: scanning PCI for ACPI / battery devices...\n");
+
+    acpi_present = scan_for_acpi();
+
+    /*
+     * We don't yet have a full ACPI AML interpreter, so even when the
+     * ACPI PM device is present we can't reliably read the
+     * embedded-controller battery registers. We expose a simulated
+     * battery in that case so the system tray and power daemons have
+     * something sensible to show. On real hardware this is where we'd
+     * walk the ACPI DSDT/FADT and read the _BST/_BIF objects.
+     */
+    if (acpi_present) {
+        pr_info("battery: ACPI PM device present, ACPI mode available\n");
+        battery_present = 1;
+    } else {
+        pr_info("battery: no ACPI device found, using QEMU simulated battery\n");
+        battery_present = 0;
+    }
+
+    pr_info("battery: initialised (%s, %d%%, charging=%d)\n",
+            battery_get_status_str(),
+            battery_get_percent(),
+            battery_is_charging());
+
+    initialized = 1;
+    return 0;
+}
+
+int battery_get_percent(void) {
+    /*
+     * HONEST STATUS: We do NOT read ACPI _BST. LestraOS has no AML
+     * interpreter, so we cannot evaluate _BST/_BIF. We return a
+     * simulated "100% Full" value because most test targets (QEMU,
+     * VirtualBox) don't expose a battery anyway. On a real laptop
+     * this number will be WRONG until ACPI AML support lands.
+     */
+    return SIM_PERCENT;
+}
+
+int battery_is_charging(void) {
+    /* See comment in battery_get_percent — this is simulated. */
+    return SIM_CHARGING;
+}
+
+/* New function: lets the UI honestly report "simulated". */
+int battery_is_simulated(void) {
+    /* PIIX4 ACPI device present does not imply we can read _BST.
+     * LestraOS has no AML interpreter, so always simulated for now. */
+    return 1;
+}
+
+const char* battery_get_status_str(void) {
+    /*
+     * On real hardware this would reflect the _BST state field:
+     *   0 = Discharging
+     *   1 = Charging
+     *   2 = Not charging (Full / on AC)
+     *   3 = Unknown
+     * QEMU simulated battery reports "Full".
+     */
+    return SIM_STATUS;
+}

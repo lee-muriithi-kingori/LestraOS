@@ -1,0 +1,729 @@
+/*
+ * Lestra OS - GUI Compositor
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
+ * 60Hz cooperative compositor with widget management, overlays, and input dispatch
+ */
+
+#include <lestra/types.h>
+#include <lestra/fb.h>
+#include <lestra/input.h>
+#include <lestra/keyboard.h>
+#include <lestra/gui.h>
+#include <lestra/ui_pro.h>
+#include <lestra/font.h>
+#include <lestra/printk.h>
+#include <lestra/timer.h>
+#include <lestra/vga.h>
+#include <lestra/net.h>
+#include <lestra/mm.h>
+#include <string.h>
+
+/* ----- widget system ----- */
+#define MAX_WIDGETS 32
+
+/* Forward declarations */
+extern void desktop_icons_render(void);
+extern int  desktop_icons_handle_click(int x, int y);
+
+extern void top_bar_init(void);
+extern void top_bar_render(void);
+extern int  top_bar_handle_click(int x, int y);
+
+extern void app_grid_init(void);
+extern void app_grid_render(void);
+extern int  app_grid_handle_click(int x, int y);
+
+extern void left_drawer_render(void);
+extern int  left_drawer_handle_event(struct event* e);
+extern int  left_drawer_get_width(void);
+
+extern void dock_render(void);
+extern int  dock_handle_event(struct event* e);
+
+/* Overlay subsystems */
+extern void lock_screen_render(void);
+extern int  lock_screen_handle_event(struct event* e);
+extern void lock_screen_show(void);
+
+extern void power_menu_render(void);
+extern int  power_menu_handle_event(struct event* e);
+extern void power_menu_show(void);
+
+extern void screenshot_render(void);
+extern int  screenshot_handle_event(struct event* e);
+extern void screenshot_enter_mode(void);
+
+extern void clipboard_render(void);
+extern int  clipboard_handle_event(struct event* e);
+
+extern int  shortcuts_handle_event(struct event* e);
+
+extern void menu_render(void);
+extern int  menu_handle_event(struct event* e);
+extern void menu_show_desktop_default(int x, int y);
+
+extern void brightness_render(void);
+extern int  brightness_handle_event(struct event* e);
+extern void brightness_show_at(int x, int y);
+extern void brightness_hide(void);
+extern void brightness_apply_post_render(void);
+
+extern void volume_slider_render(void);
+extern int  volume_slider_handle_event(struct event* e);
+extern void volume_slider_show_at(int x, int y);
+extern void volume_slider_hide(void);
+
+/* Top-bar volume-icon hit-rect accessor (gui/top_bar.c). */
+extern int  top_bar_get_volume_icon_rect(int* x, int* y, int* w, int* h);
+
+static struct widget* widgets[MAX_WIDGETS];
+static int n_widgets = 0;
+static int compositor_running = 0;
+
+/* Mouse cursor state */
+static int cursor_x = 512;
+static int cursor_y = 384;
+static int cursor_visible = 1;
+
+/* Drag state */
+static struct widget* drag_widget = NULL;
+static int drag_off_x = 0;
+static int drag_off_y = 0;
+
+/* ----- xorshift32 PRNG for particles ----- */
+static uint32_t xorshift32_state = 0x12345678u;
+static uint32_t xorshift32(void) {
+    uint32_t x = xorshift32_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    xorshift32_state = x;
+    return x;
+}
+
+/* ----- sin lookup table -----
+ * 256-entry table for one full cycle. Returns -1000..1000. */
+static const int16_t sin_table[256] = {
+    0,25,50,74,98,125,150,175,200,224,249,273,297,321,345,369,
+    392,415,438,460,482,504,525,546,566,586,605,624,642,660,676,692,
+    707,721,734,746,757,766,775,782,788,793,797,799,800,800,799,796,
+    792,787,780,772,762,751,739,726,711,695,678,660,640,620,598,575,
+    551,526,500,473,445,417,388,358,327,296,264,232,200,167,134,101,
+    67,34,0,-34,-67,-101,-134,-167,-200,-232,-264,-296,-327,-358,-388,-417,
+    -445,-473,-500,-526,-551,-575,-598,-620,-640,-660,-678,-695,-711,-726,-739,-751,
+    -762,-772,-780,-787,-792,-796,-799,-800,-800,-800,-797,-793,-788,-782,-775,-766,
+    -757,-746,-734,-721,-707,-692,-676,-660,-642,-624,-605,-586,-566,-546,-525,-504,
+    -482,-460,-438,-415,-392,-369,-345,-321,-297,-273,-249,-224,-200,-175,-150,-125,
+    -98,-74,-50,-25,0,25,50,74,98,125,150,175,200,224,249,273,
+    297,321,345,369,392,415,438,460,482,504,525,546,566,586,605,624,
+    642,660,676,692,707,721,734,746,757,766,775,782,788,793,797,799,
+    800,800,799,796,792,787,780,772,762,751,739,726,711,695,678,660,
+    640,620,598,575,551,526,500,473,445,417,388,358,327,296,264,232,
+    200,167,134,101,67,34,0
+};
+
+/* sin(phase) where phase is 0..1000 (0=0rad, 1000=2*pi). Returns -1000..1000. */
+int isin(uint32_t phase_milli) {
+    uint32_t idx = (phase_milli * 256) / 1000;
+    return sin_table[idx & 0xFF];
+}
+
+/* ----- particles ----- */
+#define NUM_PARTICLES 40
+struct particle {
+    int x, y;
+    int vx, vy;
+    int life;
+    int max_life;
+};
+static struct particle particles[NUM_PARTICLES];
+
+static void particles_init(void) {
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        particles[i].x = (int)(xorshift32() % fb_w);
+        particles[i].y = (int)(xorshift32() % fb_h);
+        particles[i].vx = (int)(xorshift32() % 3) - 1;
+        particles[i].vy = (int)(xorshift32() % 3) - 1;
+        particles[i].life = (int)(xorshift32() % 200) + 100;
+        particles[i].max_life = particles[i].life;
+    }
+}
+
+static void particles_update(void) {
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        particles[i].x += particles[i].vx;
+        particles[i].y += particles[i].vy;
+        particles[i].life--;
+        if (particles[i].life <= 0 ||
+            particles[i].x < 0 || particles[i].x >= (int)fb_w ||
+            particles[i].y < 0 || particles[i].y >= (int)fb_h) {
+            particles[i].x = (int)(xorshift32() % fb_w);
+            particles[i].y = (int)(xorshift32() % fb_h);
+            particles[i].vx = (int)(xorshift32() % 3) - 1;
+            particles[i].vy = (int)(xorshift32() % 3) - 1;
+            particles[i].life = (int)(xorshift32() % 200) + 100;
+            particles[i].max_life = particles[i].life;
+        }
+    }
+}
+
+/* ----- background rendering ----- */
+static void background_render(void) {
+    /* Vertical gradient: top (0x0E1422) -> bottom (0x050608) */
+    for (uint32_t y = 0; y < fb_h; y++) {
+        uint32_t t = y * 256 / fb_h;
+        uint8_t r = (uint8_t)((0x0E * (256 - t) + 0x05 * t) / 256);
+        uint8_t g = (uint8_t)((0x14 * (256 - t) + 0x06 * t) / 256);
+        uint8_t b = (uint8_t)((0x22 * (256 - t) + 0x08 * t) / 256);
+        uint32_t color = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        uint32_t* row = &fb_back[y * fb_w];
+        for (uint32_t x = 0; x < fb_w; x++) row[x] = color;
+    }
+
+    /* Particles */
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        int alpha = particles[i].life * 128 / particles[i].max_life;
+        if (alpha < 0) alpha = 0;
+        if (alpha > 128) alpha = 128;
+        uint32_t color = ((uint32_t)alpha << 24) | 0x00475569u;
+        fb_set_pixel(particles[i].x, particles[i].y,
+                     fb_blend(fb_get_pixel(particles[i].x, particles[i].y), color));
+    }
+
+    /* Breathing radial glow under FAB */
+    uint64_t now = timer_get_ms();
+    /* 8-second cycle: phase = (now % 8000) * 1000 / 8000 = 0..999 */
+    uint32_t phase = (uint32_t)((now % 8000) * 1000 / 8000);
+    int glow_alpha = 10 + (4 * isin(phase)) / 1000;
+    if (glow_alpha < 6) glow_alpha = 6;
+    if (glow_alpha > 14) glow_alpha = 14;
+    int gx = (int)fb_w - 128;
+    int gy = (int)fb_h - 128;
+    for (int dy = -80; dy <= 80; dy++) {
+        for (int dx = -80; dx <= 80; dx++) {
+            int dist_sq = dx * dx + dy * dy;
+            if (dist_sq > 6400) continue;
+            int falloff = 6400 - dist_sq;
+            int a = (glow_alpha * falloff) / 6400;
+            uint32_t src = ((uint32_t)a << 24) | 0x0067E8F9u;
+            int px = gx + dx;
+            int py = gy + dy;
+            if (px >= 0 && px < (int)fb_w && py >= 0 && py < (int)fb_h) {
+                fb_set_pixel(px, py, fb_blend(fb_get_pixel(px, py), src));
+            }
+        }
+    }
+}
+
+/* ----- status pill ----- */
+static void status_pill_render(void) {
+    char buf[256];
+    int len = 0;
+
+    /* Real time from RTC */
+    extern void rtc_get_time(uint8_t*, uint8_t*, uint8_t*);
+    extern void rtc_get_date(uint16_t*, uint8_t*, uint8_t*);
+    uint8_t hour, min, sec;
+    uint16_t year;
+    uint8_t month, day;
+    rtc_get_time(&hour, &min, &sec);
+    rtc_get_date(&year, &month, &day);
+    len += ksnprintf(&buf[len], sizeof(buf) - len,
+                     "%u:%02u:%02u", (unsigned)hour, (unsigned)min, (unsigned)sec);
+
+    /* Battery */
+    extern int battery_get_percent(void);
+    extern int battery_is_charging(void);
+    extern const char* battery_get_status_str(void);
+    int bat_pct = battery_get_percent();
+    if (bat_pct >= 0) {
+        len += ksnprintf(&buf[len], sizeof(buf) - len,
+                         "  BAT %u%%", (unsigned)bat_pct);
+        if (battery_is_charging()) {
+            len += ksnprintf(&buf[len], sizeof(buf) - len, "+");
+        }
+    }
+
+    /* CPU temperature */
+    extern int temp_get_cpu(void);
+    int cpu_temp = temp_get_cpu();
+    if (cpu_temp >= 0) {
+        len += ksnprintf(&buf[len], sizeof(buf) - len,
+                         "  CPU %uC", (unsigned)cpu_temp);
+    }
+
+    /* Memory */
+    len += ksnprintf(&buf[len], sizeof(buf) - len,
+                     "  MEM %u/%u MB",
+                     (unsigned)(pmm_get_free() / (1024 * 1024)),
+                     (unsigned)(pmm_get_total() / (1024 * 1024)));
+
+    /* Network */
+    if (net_is_up()) {
+        extern int wifi_is_connected(void);
+        if (wifi_is_connected()) {
+            extern const char* wifi_get_connected_ssid(void);
+            const char* ssid = wifi_get_connected_ssid();
+            if (ssid) {
+                len += ksnprintf(&buf[len], sizeof(buf) - len,
+                                 "  WiFi: %s", ssid);
+            } else {
+                len += ksnprintf(&buf[len], sizeof(buf) - len, "  NET: up");
+            }
+        } else {
+            len += ksnprintf(&buf[len], sizeof(buf) - len, "  ETH: up");
+        }
+    } else {
+        len += ksnprintf(&buf[len], sizeof(buf) - len, "  NET: down");
+    }
+
+    int text_w = fb_text_width(buf);
+    int pill_w = text_w + 32;
+    int pill_x = (int)fb_w / 2 - pill_w / 2;
+    int pill_y = 16;
+    int pill_h = 28;
+
+    fb_draw_rounded(pill_x, pill_y, pill_w, pill_h, 14,
+                    UI_NEUTRAL_PILL, UI_NEUTRAL_PILL);
+    fb_draw_string(pill_x + 16, pill_y + 6, buf, UI_TEXT_PRIMARY);
+}
+
+/* ----- mouse cursor ----- */
+static void cursor_render(void) {
+    if (!cursor_visible) return;
+    int x = cursor_x;
+    int y = cursor_y;
+    for (int i = 0; i < 12; i++) {
+        if (x + i < (int)fb_w) {
+            fb_set_pixel(x + i, y, 0xFF000000);
+            fb_set_pixel(x + i, y + 1, 0xFFFFFFFF);
+        }
+        if (y + i < (int)fb_h) {
+            fb_set_pixel(x, y + i, 0xFF000000);
+            fb_set_pixel(x + 1, y + i, 0xFFFFFFFF);
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        if (x + i < (int)fb_w && y + i < (int)fb_h) {
+            fb_set_pixel(x + i, y + i, 0xFF000000);
+        }
+    }
+    fb_set_pixel(x, y, UI_ACCENT);
+}
+
+/* ----- FAB ----- */
+static int fab_hovered = 0;
+
+static void fab_render(void) {
+    int fab_size = 64;
+    int fab_x = (int)fb_w - 96 - fab_size;
+    int fab_y = (int)fb_h - 96 - fab_size;
+
+    uint64_t now = timer_get_ms();
+    /* 2.5s pulse cycle: phase = (now % 2500) * 1000 / 2500 = 0..999 */
+    uint32_t phase = (uint32_t)((now % 2500) * 1000 / 2500);
+    int scale_milli = 1000 + (40 * isin(phase)) / 1000;  /* 0.96..1.04 */
+    int rendered_size = (fab_size * scale_milli) / 1000;
+
+    fb_draw_circle(fab_x + fab_size/2, fab_y + fab_size/2,
+                   rendered_size/2,
+                   fab_hovered ? UI_ACCENT_HOT : UI_FAB_CORE);
+    fb_draw_circle(fab_x + fab_size/2, fab_y + fab_size/2,
+                   rendered_size/2 - 6, UI_FAB_SPARK);
+    fb_draw_circle(fab_x + fab_size/2, fab_y + fab_size/2,
+                   rendered_size/2 - 8, UI_FAB_CORE);
+
+    int cx = fab_x + fab_size/2;
+    int cy = fab_y + fab_size/2;
+    fb_draw_circle(cx, cy, 12, 0xFF000000);
+    fb_draw_circle(cx, cy, 10, UI_FAB_CORE);
+    fb_set_pixel(cx, cy, 0xFFFFFFFF);
+}
+
+int fab_contains(int x, int y) {
+    int fab_size = 64;
+    int fab_x = (int)fb_w - 96 - fab_size;
+    int fab_y = (int)fb_h - 96 - fab_size;
+    int dx = x - (fab_x + fab_size/2);
+    int dy = y - (fab_y + fab_size/2);
+    return dx * dx + dy * dy <= (fab_size/2) * (fab_size/2);
+}
+
+/* ----- widget management ----- */
+void compositor_add(struct widget* w) {
+    if (!w) return;
+    /* Deduplicate: if the widget is already in the array, leave it
+     * alone. The editor / file_explorer / etc. are singletons (one
+     * static struct widget per app), so two launchers calling
+     * editor_create() + compositor_add() would otherwise register
+     * the same pointer twice — which makes find_widget_at / event
+     * dispatch route the same event to the widget twice per frame. */
+    for (int i = 0; i < n_widgets; i++) {
+        if (widgets[i] == w) {
+            w->z = i;
+            return;
+        }
+    }
+    if (n_widgets >= MAX_WIDGETS) return;
+    w->z = n_widgets;
+    widgets[n_widgets++] = w;
+}
+
+void compositor_remove(struct widget* w) {
+    for (int i = 0; i < n_widgets; i++) {
+        if (widgets[i] == w) {
+            for (int j = i; j < n_widgets - 1; j++)
+                widgets[j] = widgets[j + 1];
+            n_widgets--;
+            return;
+        }
+    }
+}
+
+void compositor_bring_to_front(struct widget* w) {
+    for (int i = 0; i < n_widgets; i++) {
+        widgets[i]->focused = 0;
+    }
+    w->focused = 1;
+    for (int i = 0; i < n_widgets; i++) {
+        if (widgets[i] == w) {
+            for (int j = i; j < n_widgets - 1; j++)
+                widgets[j] = widgets[j + 1];
+            widgets[n_widgets - 1] = w;
+            break;
+        }
+    }
+}
+
+/* ----- event dispatch ----- */
+static struct widget* find_widget_at(int x, int y) {
+    for (int i = n_widgets - 1; i >= 0; i--) {
+        if (!widgets[i]->visible) continue;
+        struct widget* w = widgets[i];
+        if (x >= w->x && x < w->x + w->w &&
+            y >= w->y && y < w->y + w->h) {
+            return w;
+        }
+    }
+    return NULL;
+}
+
+static void dispatch_events(void) {
+    struct event e;
+    /* External: drawer event handler (gui/drawer.c) */
+    extern int drawer_handle_event(struct event* e);
+    while (input_poll(&e)) {
+        /* ---- Modal overlays (swallow everything when active) ----
+         * Checked first so a locked / power-menu / screenshot session
+         * intercepts all input before any other handler sees it. */
+        if (lock_screen_handle_event(&e)) continue;
+        if (power_menu_handle_event(&e)) continue;
+        if (screenshot_handle_event(&e)) continue;
+
+        /* ---- Global keyboard shortcuts (Alt+Tab, Alt+F4, Super, Esc) ----
+         * Wiring this changes the Super key from press-toggle (drawer's
+         * legacy behaviour) to release-toggle (shortcuts' designed
+         * behaviour). The drawer still toggles on Super — just on key
+         * release instead of key press. See worklog FIX-OVERLAYS. */
+        if (shortcuts_handle_event(&e)) continue;
+
+        /* ---- Custom overlay triggers (keyboard shortcuts) ---- */
+        if (e.type == EV_KEY_DOWN) {
+            uint8_t mods = e.key.mods;
+            uint8_t sc   = e.key.scancode;
+            /* Ctrl+Alt+L — lock the session. */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_L) {
+                lock_screen_show();
+                continue;
+            }
+            /* Ctrl+Alt+P — power menu. */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_P) {
+                power_menu_show();
+                continue;
+            }
+            /* Ctrl+Alt+B — brightness flyout (top-right). */
+            if ((mods & MOD_CTRL) && (mods & MOD_ALT) && sc == KEY_B) {
+                volume_slider_hide();
+                brightness_show_at((int)fb_w - 280, 60);
+                continue;
+            }
+        }
+
+        /* ---- Popups (swallow mouse events when open) ---- */
+        if (clipboard_handle_event(&e)) continue;
+        if (menu_handle_event(&e)) continue;
+        if (brightness_handle_event(&e)) continue;
+        if (volume_slider_handle_event(&e)) continue;
+
+        /* ---- Existing desktop / window handlers ---- */
+        /* Drawer gets first crack at FAB clicks, Super key, Esc */
+        if (drawer_handle_event(&e)) continue;
+
+        /* Left app drawer gets next crack */
+        if (left_drawer_handle_event(&e)) continue;
+
+        /* Pro dock gets next crack at mouse events */
+        if (ui_dock_handle_event(&e)) continue;
+
+        if (e.type == EV_MOUSE_MOVE) {
+            cursor_x = e.mouse.x;
+            cursor_y = e.mouse.y;
+            fab_hovered = fab_contains(cursor_x, cursor_y);
+            /* Update desktop icon hover state */
+            ui_desktop_icons_handle_move(cursor_x, cursor_y);
+            if (drag_widget) {
+                drag_widget->x = cursor_x - drag_off_x;
+                drag_widget->y = cursor_y - drag_off_y;
+                if (drag_widget->x < 0) drag_widget->x = 0;
+                if (drag_widget->y < 0) drag_widget->y = 0;
+                if (drag_widget->x + drag_widget->w > (int)fb_w)
+                    drag_widget->x = fb_w - drag_widget->w;
+                if (drag_widget->y + drag_widget->h > (int)fb_h)
+                    drag_widget->y = fb_h - drag_widget->h;
+            }
+        } else if (e.type == EV_MOUSE_DOWN) {
+            /* Right-click anywhere → desktop context menu (which in
+             * turn wires into lock / power / screenshot / brightness /
+             * volume overlays). */
+            if (e.mouse.buttons & MOUSE_BTN_RIGHT) {
+                menu_show_desktop_default(cursor_x, cursor_y);
+                continue;
+            }
+            if (fab_contains(cursor_x, cursor_y)) {
+                continue;
+            }
+            /* Top floating bar gets first crack (mic button, search box). */
+            if (top_bar_handle_click(cursor_x, cursor_y)) {
+                continue;
+            }
+            /* Volume icon click → pop up the volume slider flyout
+             * (anchored top-right, just below the top bar). Dismiss
+             * the brightness flyout so only one is open at a time. */
+            {
+                int vx, vy, vw, vh;
+                if (top_bar_get_volume_icon_rect(&vx, &vy, &vw, &vh) &&
+                    cursor_x >= vx && cursor_x < vx + vw &&
+                    cursor_y >= vy && cursor_y < vy + vh) {
+                    brightness_hide();
+                    volume_slider_show_at((int)fb_w - 56, 60);
+                    continue;
+                }
+            }
+            struct widget* w = find_widget_at(cursor_x, cursor_y);
+            if (w) {
+                /* Check if click is on the close button (top-right of title bar) */
+                int close_x = w->x + w->w - 24;
+                int close_y = w->y + 10;
+                if (cursor_x >= close_x && cursor_x < close_x + 16 &&
+                    cursor_y >= close_y && cursor_y < close_y + 16) {
+                    /* Close button clicked — hide the widget */
+                    w->visible = 0;
+                    w->focused = 0;
+                    continue;
+                }
+
+                compositor_bring_to_front(w);
+                int title_h = 36;
+                if (cursor_y - w->y < title_h && w->draggable) {
+                    drag_widget = w;
+                    drag_off_x = cursor_x - w->x;
+                    drag_off_y = cursor_y - w->y;
+                }
+                if (w->on_event) w->on_event(w, &e);
+            } else {
+                /* No widget under cursor — check the new Material app grid
+                 * first (it covers most of the desktop), then fall back to
+                 * the legacy left-column desktop icons. */
+                if (!app_grid_handle_click(cursor_x, cursor_y)) {
+                    ui_desktop_icons_handle_click(cursor_x, cursor_y);
+                }
+            }
+        } else if (e.type == EV_MOUSE_UP) {
+            drag_widget = NULL;
+            struct widget* w = find_widget_at(cursor_x, cursor_y);
+            if (w && w->on_event) w->on_event(w, &e);
+        } else if (e.type == EV_MOUSE_SCROLL) {
+            /* Scroll wheel: route to whatever widget is under the cursor.
+             * Update cursor position from the event itself so the hit
+             * test matches where the wheel was actually rolled (the
+             * compositor only updates cursor_x/y on EV_MOUSE_MOVE, so
+             * without this, a wheel rolled while the mouse is still
+             * would test against the last reported position — usually
+             * fine, but the explicit sync avoids subtle drift). */
+            cursor_x = e.mouse.x;
+            cursor_y = e.mouse.y;
+            struct widget* w = find_widget_at(cursor_x, cursor_y);
+            if (w && w->on_event) w->on_event(w, &e);
+        } else if (e.type == EV_KEY_DOWN || e.type == EV_KEY_UP) {
+            for (int i = n_widgets - 1; i >= 0; i--) {
+                if (widgets[i]->visible && widgets[i]->focused && widgets[i]->on_event) {
+                    widgets[i]->on_event(widgets[i], &e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* ----- compositor API ----- */
+void compositor_init(void) {
+    /* Initialize the new top floating bar (animated, with STT) and
+     * the Material-Design app grid before the run loop starts. */
+    top_bar_init();
+    app_grid_init();
+    /* The 8 overlay subsystems (lock_screen, power_menu, screenshot,
+     * clipboard, shortcuts, context_menu, brightness, volume_slider)
+     * use static zero-initialised state and do not require explicit
+     * _init() calls. They are wired into the render loop and event
+     * dispatch — see compositor_run() and dispatch_events(). */
+}
+
+void compositor_run(void);
+
+/* External: drawer functions (gui/drawer.c) */
+extern void drawer_render(void);
+extern int  drawer_is_open(void);
+extern int  drawer_handle_event(struct event* e);
+
+/* External: desktop icons (gui/desktop_icons.c) */
+extern void desktop_icons_render(void);
+int desktop_icons_handle_click(int x, int y);
+
+void compositor_run(void) {
+    if (!fb_available) {
+        pr_warn("compositor: no framebuffer, falling back to shell\n");
+        return;
+    }
+
+    particles_init();
+    compositor_running = 1;
+
+    uint64_t last_ms = timer_get_ms();
+    pr_info("compositor: running (fb %ux%u, %d widgets)\n",
+            (unsigned)fb_w, (unsigned)fb_h, n_widgets);
+
+    while (compositor_running) {
+        dispatch_events();
+        particles_update();
+
+        /* Render the real wallpaper image (replaces the old gradient) */
+        ui_render_wallpaper();
+
+        /* Render particles on top of wallpaper */
+        for (int i = 0; i < NUM_PARTICLES; i++) {
+            int alpha = particles[i].life * 128 / particles[i].max_life;
+            if (alpha < 0) alpha = 0;
+            if (alpha > 128) alpha = 128;
+            uint32_t color = ((uint32_t)alpha << 24) | 0x00475569u;
+            fb_set_pixel(particles[i].x, particles[i].y,
+                         fb_blend(fb_get_pixel(particles[i].x, particles[i].y), color));
+        }
+
+        /* Render collapsible left app drawer */
+        left_drawer_render();
+
+        /* Render the Material-Design app grid (Writer, Calc, Impress,
+         * Kdenlive, OBS, VLC, Browser, Mail, Calendar, Photos, Music,
+         * Terminal, AI Lab, Editor, Media, Files, Settings). Each
+         * icon is clickable — see app_grid_handle_click. */
+        app_grid_render();
+
+        /* Render the enhanced desktop icons (left column: Terminal,
+         * AI Lab, Editor, Media, Files, Settings, Help, About). These
+         * use the real 48x48 RGB bitmap assets with proper transparency. */
+        ui_render_desktop_icons();
+
+        for (int i = 0; i < n_widgets; i++) {
+            if (widgets[i]->visible && widgets[i]->draw) {
+                widgets[i]->draw(widgets[i]);
+            }
+        }
+
+        /* Professional status bar */
+        ui_render_status_bar();
+        fab_render();
+
+        /* Animated top floating bar (overrides the old status pill —
+         * rendered on top of widgets so the mic button is always
+         * clickable even when a window is maximized). */
+        top_bar_render();
+
+        /* Professional dock */
+        ui_render_dock();
+
+        /* Mini music player (if playing) */
+        ui_render_mini_player();
+
+        /* Notifications (top-right) */
+        ui_render_notifications();
+
+        /* Render drawer on top of widgets (below cursor) */
+        if (drawer_is_open()) {
+            drawer_render();
+        }
+
+        /* ---- Overlay subsystems ----
+         * Drawn on top of the main UI but below the cursor. Order
+         * matters: small popups first (lower z), full-screen modals
+         * last (top z), so a modal overlay paints over everything. */
+        brightness_render();
+        volume_slider_render();
+        clipboard_render();
+        menu_render();             /* right-click context menu */
+        screenshot_render();       /* full-screen region-select */
+        power_menu_render();       /* full-screen power overlay */
+        lock_screen_render();      /* full-screen lock (most modal) */
+
+        /* Global brightness dimming — multiply the final composited
+         * frame by the user's brightness setting (no-op at 100%). */
+        brightness_apply_post_render();
+
+        cursor_render();
+        fb_swap();
+
+        uint64_t now = timer_get_ms();
+        if (now - last_ms < 16) {
+            while (timer_get_ms() - last_ms < 16) {
+                hlt();
+            }
+        }
+        last_ms = timer_get_ms();
+    }
+}
+
+void compositor_quit(void) {
+    compositor_running = 0;
+}
+
+/* ----- z-order focus tracking ----- */
+static int focus_idx = -1;  /* index into widgets[] of the focused widget */
+
+/* Find the next visible widget after the current focus, wrapping around. */
+void compositor_focus_next(void) {
+    if (n_widgets == 0) { focus_idx = -1; return; }
+    int start = (focus_idx >= 0) ? focus_idx : 0;
+    for (int i = 1; i <= n_widgets; i++) {
+        int idx = (start + i) % n_widgets;
+        if (widgets[idx] && widgets[idx]->visible) {
+            focus_idx = idx;
+            pr_info("compositor: focus -> widget %d '%s'\n", idx, widgets[idx]->title);
+            return;
+        }
+    }
+    focus_idx = -1;
+}
+
+/* Close/destroy the currently focused widget, then focus the next one. */
+void compositor_close_focused(void) {
+    if (focus_idx < 0 || focus_idx >= n_widgets || !widgets[focus_idx]) return;
+    pr_info("compositor: closing focused widget %d '%s'\n", focus_idx, widgets[focus_idx]->title);
+    /* Mark the widget as invisible (it stays in the array but won't render). */
+    widgets[focus_idx]->visible = 0;
+    /* Shift remaining widgets down to fill the gap (maintains z-order). */
+    for (int i = focus_idx; i < n_widgets - 1; i++) {
+        widgets[i] = widgets[i + 1];
+    }
+    n_widgets--;
+    /* Focus the next widget. */
+    compositor_focus_next();
+}

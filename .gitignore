@@ -1,0 +1,56 @@
+# ===== Build artifacts =====
+build/
+iso/
+*.o
+*.a
+*.iso
+*.img
+*.bin
+*.elf
+!boot/stage1.bin      # hand-assembled boot sector, needed at build time
+
+# ===== Runtime / generated =====
+fat32.img
+qemu-data             # local symlink to dev toolchain (leaks home path)
+*.disabled            # disabled-source backups (signals.c.disabled etc.)
+*.bak
+*.orig
+*.rej
+
+# ===== Logs =====
+logs/
+*.log
+
+# ===== Screenshots (keep only ones referenced by README) =====
+screenshots/*
+!screenshots/boot-cloud-mode.png
+!screenshots/boot-gui-mode.png
+!screenshots/boot-legacy-shell.png
+
+# ===== Dev notes / planning artifacts (kept in /home/z/my-project mirror only) =====
+MEMORY.md
+AUDIT_FIXES.md
+WIRING_NOTES.md
+ALPHA*.md
+BETA*.md
+PLANNING*.md
+
+# ===== Secrets — NEVER commit =====
+.env
+.env.*
+!.env.example
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+upload/
+
+# ===== Editor / OS =====
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
