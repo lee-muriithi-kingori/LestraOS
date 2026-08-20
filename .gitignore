@@ -26,6 +26,7 @@ screenshots/*
 !screenshots/boot-cloud-mode.png
 !screenshots/boot-gui-mode.png
 !screenshots/boot-legacy-shell.png
+!screenshots/photo_2026-08-20_09-01-59.jpg
 
 # ===== Dev notes / planning artifacts (kept in /home/z/my-project mirror only) =====
 MEMORY.md

@@ -17,6 +17,12 @@
 
 ---
 
+![Meet the Yugi family — LestraOS on real hardware](./screenshots/photo_2026-08-20_09-01-59.jpg)
+
+*Meet the Yugi family — LestraOS booting on real hardware.*
+
+---
+
 > *Building an OS from scratch: kernel, drivers, libc, userspace, networking, crypto, AI — and a cloud/VPS mode that boots headless and serves SSH + HTTP over a real E1000 NIC. Every layer of the stack, understood.*
 
 ## 🎯 What is LestraOS?
