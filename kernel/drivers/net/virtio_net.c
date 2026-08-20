@@ -1051,11 +1051,20 @@ static int vnet_nic_send(const void *data, uint16_t len) { return virtio_net_sen
 static int vnet_nic_recv(void *buf, uint16_t bufsz)     { return virtio_net_recv(buf, bufsz); }
 static mac_addr_t vnet_nic_get_mac(void) { return virtio_net_get_mac(); }
 
+/* VirtIO-net doesn't support runtime MAC change in hardware.
+ * Update the software copy only. Returns -1 to indicate hardware
+ * wasn't changed. */
+static int vnet_nic_set_mac(mac_addr_t mac) {
+    vnet_mac = mac;
+    return 0;  /* software update succeeded */
+}
+
 const struct nic_ops virtio_net_ops = {
     .name    = "virtio_net",
     .init    = vnet_nic_init,
     .send    = vnet_nic_send,
     .recv    = vnet_nic_recv,
     .get_mac = vnet_nic_get_mac,
+    .set_mac = vnet_nic_set_mac,
     .flush   = NULL,  /* VirtIO doesn't need post-batch flush */
 };

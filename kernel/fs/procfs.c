@@ -52,6 +52,7 @@ enum procfs_kind {
     PROC_CMDLINE,   /* /proc/cmdline — boot command line */
     PROC_INTERRUPTS, /* /proc/interrupts — IRQ counts */
     PROC_MOUNTS,    /* /proc/mounts — mounted filesystems */
+    PROC_MACHINE_ID, /* /proc/machine-id — random device identifier */
 };
 
 struct procfs_open {
@@ -446,6 +447,14 @@ static size_t gen_mounts(struct procfs_open* o) {
     return (size_t)off;
 }
 
+/* Generate /proc/machine-id — random 32-char hex device identifier. */
+static size_t gen_machine_id(struct procfs_open* o) {
+    extern const char* device_id_get_string(void);
+    const char* id = device_id_get_string();
+    int n = ksnprintf(o->buf, sizeof(o->buf), "%s\n", id);
+    return (size_t)n;
+}
+
 /* ----- open / read / close ----- */
 
 static enum procfs_kind classify_path(const char* path) {
@@ -465,6 +474,7 @@ static enum procfs_kind classify_path(const char* path) {
     if (strcmp(path, "/proc/cmdline")      == 0) return PROC_CMDLINE;
     if (strcmp(path, "/proc/interrupts")   == 0) return PROC_INTERRUPTS;
     if (strcmp(path, "/proc/mounts")       == 0) return PROC_MOUNTS;
+    if (strcmp(path, "/proc/machine-id")   == 0) return PROC_MACHINE_ID;
     return PROC_NONE;
 }
 
@@ -494,6 +504,7 @@ int procfs_open(const char* path) {
                 case PROC_CMDLINE:      o->size = gen_cmdline(o);      break;
                 case PROC_INTERRUPTS:   o->size = gen_interrupts(o);   break;
                 case PROC_MOUNTS:       o->size = gen_mounts(o);       break;
+                case PROC_MACHINE_ID:   o->size = gen_machine_id(o);   break;
                 default: o->used = 0; return -1;
             }
             return i + PROCFS_FD_BASE;

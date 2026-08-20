@@ -150,6 +150,9 @@ void net_set_mask(ipv4_addr_t mask);
 void net_set_gw(ipv4_addr_t gw);
 void net_set_dns(ipv4_addr_t dns);
 
+/* MAC address control (for MAC randomization) */
+int net_set_mac(mac_addr_t mac);
+
 /* ICMP */
 int net_ping(ipv4_addr_t target, uint16_t seq, uint32_t timeout_ms);
 

@@ -326,4 +326,8 @@ struct security_status {
 };
 extern struct security_status g_security;
 
+/* CSPRNG: fill buffer with cryptographically secure random bytes.
+ * Implemented in kernel/net/csprng.c. */
+void get_random_bytes(void* buf, size_t len);
+
 #endif /* LESTRA_TYPES_H */

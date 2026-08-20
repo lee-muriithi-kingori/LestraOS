@@ -166,6 +166,7 @@ int e1000_is_present(void);
 mac_addr_t e1000_get_mac(void);
 int e1000_send(const void* data, uint16_t len);
 int e1000_recv(void* buf, uint16_t bufsz);
+int e1000_set_mac(mac_addr_t mac);
 
 int e1000_init(void) {
     struct pci_device *pdev = e1000_find_pci();
@@ -314,6 +315,27 @@ int e1000_recv(void* buf, uint16_t bufsz) {
     return len;
 }
 
+/* Set a new MAC address on the E1000. Updates both the software copy
+ * and the hardware Receive Address registers. */
+int e1000_set_mac(mac_addr_t mac) {
+    if (!e1000_present) return -1;
+
+    e1000_mac = mac;
+
+    /* Reprogram RAL/RAH hardware receive filter */
+    uint32_t ral = (mac.bytes[0])
+                 | ((uint32_t)mac.bytes[1] << 8)
+                 | ((uint32_t)mac.bytes[2] << 16)
+                 | ((uint32_t)mac.bytes[3] << 24);
+    uint32_t rah = ((uint32_t)mac.bytes[4])
+                 | ((uint32_t)mac.bytes[5] << 8)
+                 | (1u << 31);  /* AV bit - Address Valid */
+    ew32(E1000_RA + 0, ral);
+    ew32(E1000_RA + 4, rah);
+
+    return 0;
+}
+
 /* ========================================================================
  * KE-14: NIC driver vtable
  * ======================================================================== */
@@ -322,6 +344,7 @@ static int e1000_nic_init(void)       { return e1000_init(); }
 static int e1000_nic_send(const void *data, uint16_t len) { return e1000_send(data, len); }
 static int e1000_nic_recv(void *buf, uint16_t bufsz)     { return e1000_recv(buf, bufsz); }
 static mac_addr_t e1000_nic_get_mac(void) { return e1000_get_mac(); }
+static int e1000_nic_set_mac(mac_addr_t mac) { return e1000_set_mac(mac); }
 
 const struct nic_ops e1000_ops = {
     .name    = "e1000",
@@ -329,5 +352,6 @@ const struct nic_ops e1000_ops = {
     .send    = e1000_nic_send,
     .recv    = e1000_nic_recv,
     .get_mac = e1000_nic_get_mac,
+    .set_mac = e1000_nic_set_mac,
     .flush   = NULL,  /* E1000 doesn't need post-batch flush */
 };

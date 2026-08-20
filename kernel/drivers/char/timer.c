@@ -50,6 +50,15 @@ static void timer_irq_handler(struct interrupt_frame* frame) {
         extern void service_tick(void);
         service_tick();
     }
+
+    /* MAC address changer -- check every 10 minutes */
+    static uint64_t last_mac_tick = 0;
+    uint64_t mac_interval = (uint64_t)frequency * 600;  /* 10 minutes in ticks */
+    if (ticks - last_mac_tick >= mac_interval) {
+        last_mac_tick = ticks;
+        extern void mac_changer_tick(void);
+        mac_changer_tick();
+    }
 }
 
 void timer_init(uint32_t freq) {

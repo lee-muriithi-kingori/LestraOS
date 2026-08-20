@@ -45,6 +45,11 @@ struct nic_ops {
     /* Get the MAC address of this NIC. */
     mac_addr_t (*get_mac)(void);
 
+    /* Set the MAC address of this NIC (for MAC randomization).
+     * Returns 0 on success, -1 if not supported.
+     * May be NULL if the driver doesn't support runtime MAC changes. */
+    int  (*set_mac)(mac_addr_t mac);
+
     /* Optional: flush/cleanup after draining a batch of RX packets.
      * Called once after net_tick() finishes its RX drain loop.
      * May be NULL if the driver doesn't need it. */

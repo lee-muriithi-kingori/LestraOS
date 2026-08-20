@@ -417,6 +417,14 @@ void kernel_main(void* mb2_info) {
     pr_info("Initializing network stack...\n");
     net_init();
 
+    /* Initialize device ID (random machine-id for privacy) */
+    extern void device_id_init(void);
+    device_id_init();
+
+    /* Initialize MAC address changer (10-minute rotation for privacy) */
+    extern void mac_changer_init(void);
+    mac_changer_init();
+
     /* Initialize AHCI/SATA driver (for persistent storage).
      * Non-fatal if no AHCI HBA or no drive - kernel still runs. */
     pr_info("Initializing disk subsystem...\n");

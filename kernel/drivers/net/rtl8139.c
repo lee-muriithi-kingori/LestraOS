@@ -286,6 +286,18 @@ void rtl8139_recv_flush(void) {
      * the actual read position independently. */
 }
 
+/* RTL8139 doesn't support runtime MAC change in hardware.
+ * Update the software copy only. */
+static int rtl8139_set_mac(mac_addr_t mac) {
+    rtl_mac[0] = mac.bytes[0];
+    rtl_mac[1] = mac.bytes[1];
+    rtl_mac[2] = mac.bytes[2];
+    rtl_mac[3] = mac.bytes[3];
+    rtl_mac[4] = mac.bytes[4];
+    rtl_mac[5] = mac.bytes[5];
+    return 0;
+}
+
 /* ========================================================================
  * KE-14: NIC driver vtable
  * ======================================================================== */
@@ -295,6 +307,7 @@ static int rtl8139_nic_send(const void *data, uint16_t len) { return rtl8139_sen
 static int rtl8139_nic_recv(void *buf, uint16_t bufsz)     { return rtl8139_recv(buf, bufsz); }
 static mac_addr_t rtl8139_nic_get_mac(void) { return rtl8139_get_mac(); }
 static void rtl8139_nic_flush(void)      { rtl8139_recv_flush(); }
+static int rtl8139_nic_set_mac(mac_addr_t mac) { return rtl8139_set_mac(mac); }
 
 const struct nic_ops rtl8139_ops = {
     .name    = "rtl8139",
@@ -302,5 +315,6 @@ const struct nic_ops rtl8139_ops = {
     .send    = rtl8139_nic_send,
     .recv    = rtl8139_nic_recv,
     .get_mac = rtl8139_nic_get_mac,
+    .set_mac = rtl8139_nic_set_mac,
     .flush   = rtl8139_nic_flush,
 };

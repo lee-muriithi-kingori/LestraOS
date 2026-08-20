@@ -1670,6 +1670,18 @@ void net_set_mask(ipv4_addr_t mask) { my_mask = mask; }
 void net_set_gw(ipv4_addr_t gw)     { my_gw = gw; }
 void net_set_dns(ipv4_addr_t dns)   { my_dns = dns; }
 
+/* Set the MAC address on the active NIC (for MAC randomization).
+ * Updates both the hardware driver and the software copy used by
+ * the networking stack. Returns 0 on success, -1 if not supported. */
+int net_set_mac(mac_addr_t mac) {
+    if (!active_nic_ops || !active_nic_ops->set_mac) return -1;
+    int ret = active_nic_ops->set_mac(mac);
+    if (ret == 0) {
+        my_mac = mac;
+    }
+    return ret;
+}
+
 /* ----- IPv6 public API ----- */
 int net_ipv6_is_valid(void) { return ipv6_valid; }
 ipv6_addr_t net_get_ipv6(void) { return my_ip6; }
