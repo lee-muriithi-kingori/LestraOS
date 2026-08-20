@@ -180,7 +180,7 @@ static uint64_t* split_2mb_huge_page(uint64_t* pd, int pd_idx, uint64_t old_pd_e
     return pt;
 }
 
-static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64_t flags) {
+void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64_t flags) {
     uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
     uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
     uint64_t pd_idx   = (vaddr >> 21) & 0x1FF;
@@ -274,7 +274,7 @@ static void user_map_page(uintptr_t* pml4, uint64_t vaddr, uint64_t phys, uint64
     clac();
 }
 
-static void user_map_data(uintptr_t* pml4, uint64_t vaddr, const void* data,
+void user_map_data(uintptr_t* pml4, uint64_t vaddr, const void* data,
                           size_t data_len, int writable, int executable) {
     uint64_t flags = PAGE_PRESENT | PAGE_USER;
     if (writable) flags |= PAGE_WRITABLE;

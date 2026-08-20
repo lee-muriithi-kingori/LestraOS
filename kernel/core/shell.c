@@ -1037,7 +1037,7 @@ static void cmd_test(void) {
 /* ----- pkg subcommands ------------------------------------------------ */
 static void cmd_pkg(int argc, char** argv) {
     if (argc < 2) {
-        printk("Usage: pkg <install|remove|list|installed|search|info|repo|update> [args]\n");
+        printk("Usage: pkg <install|remove|list|installed|search|info|repo|update|deb> [args]\n");
         printk("  pkg list                   List all available packages\n");
         printk("  pkg installed              List installed packages\n");
         printk("  pkg install <name>         Install a package\n");
@@ -1048,6 +1048,9 @@ static void cmd_pkg(int argc, char** argv) {
         printk("  pkg repo list              List configured repos\n");
         printk("  pkg repo add <name> <url>  Add a repository\n");
         printk("  pkg repo remove <name>     Remove a repository\n");
+        printk("  pkg deb install <file>     Install a .deb package\n");
+        printk("  pkg deb list               List installed .deb packages\n");
+        printk("  pkg deb remove <name>      Remove a .deb package\n");
         printk("\nRepos: core, websec, devtools, multimedia, lestra\n");
         return;
     }
@@ -1088,6 +1091,28 @@ static void cmd_pkg(int argc, char** argv) {
             pkg_repo_remove(argv[3]);
         } else {
             printk("Unknown repo subcommand: %s\n", argv[2]);
+        }
+    } else if (strcmp(argv[1], "deb") == 0) {
+        if (argc < 3) {
+            printk("Usage: pkg deb <install|list|remove> [args]\n");
+            printk("  pkg deb install <file>     Install a .deb package\n");
+            printk("  pkg deb list               List installed .deb packages\n");
+            printk("  pkg deb remove <name>      Remove a .deb package\n");
+            return;
+        }
+        if (strcmp(argv[2], "install") == 0) {
+            if (argc < 4) { printk("Usage: pkg deb install <file>\n"); return; }
+            extern int deb_install(const char* path);
+            deb_install(argv[3]);
+        } else if (strcmp(argv[2], "list") == 0) {
+            extern void deb_list_installed(void);
+            deb_list_installed();
+        } else if (strcmp(argv[2], "remove") == 0) {
+            if (argc < 4) { printk("Usage: pkg deb remove <name>\n"); return; }
+            extern int deb_remove(const char* name);
+            deb_remove(argv[3]);
+        } else {
+            printk("Unknown deb subcommand: %s\n", argv[2]);
         }
     } else {
         printk("Unknown pkg subcommand: %s\n", argv[1]);
@@ -2192,17 +2217,26 @@ static void execute_command(void) {
     else if (strcmp(cmd, "mount") == 0) cmd_mount(argc, argv);
     else if (strcmp(cmd, "exec") == 0) {
         if (argc < 2) {
-            printk("Usage: exec <elf-path>\n");
+            printk("Usage: exec <elf-or-pe-path>\n");
             printk("Example: exec /hello.elf\n");
             printk("         exec /opt/libreoffice/program/soffice.bin\n");
+            printk("         exec /programs/app.exe\n");
             return;
         }
         extern int elf_exec(const char* path);
+        extern int pe_exec(const char* path);
         extern int ldso_is_dynamic(const char* path);
         extern int ldso_load_and_run(const char* exe_path, int argc,
                                       char** argv, char** envp);
         printk("Executing %s...\n", argv[1]);
-        if (ldso_is_dynamic(argv[1])) {
+        
+        /* Check if it's a PE executable */
+        size_t path_len = strlen(argv[1]);
+        if (path_len >= 4 && strcmp(argv[1] + path_len - 4, ".exe") == 0) {
+            printk("  (PE executable — using pe_exec)\n");
+            int rc = pe_exec(argv[1]);
+            printk("pe_exec returned: %d\n", rc);
+        } else if (ldso_is_dynamic(argv[1])) {
             printk("  (dynamic ELF — using ldso dynamic linker)\n");
             int rc = ldso_load_and_run(argv[1], argc - 1, &argv[1], NULL);
             printk("ldso returned: %d\n", rc);

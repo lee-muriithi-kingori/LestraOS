@@ -385,3 +385,127 @@ uint32_t fb_blend(uint32_t dst, uint32_t src) {
 
     return 0xFF000000u | ((uint32_t)out_r << 16) | ((uint32_t)out_g << 8) | out_b;
 }
+
+/* Filled circle using scanline algorithm */
+void fb_fill_circle(int cx, int cy, int r, uint32_t color) {
+    if (!fb_back || r <= 0) return;
+    for (int y = -r; y <= r; y++) {
+        int half = 0;
+        /* Calculate horizontal extent using Pythagorean theorem */
+        int r2 = r * r;
+        int y2 = y * y;
+        if (r2 >= y2) {
+            int dx2 = r2 - y2;
+            /* Approximate sqrt using integer math */
+            half = 0;
+            for (int d = 1; d <= r; d++) {
+                if (d * d >= dx2) { half = d; break; }
+            }
+        }
+        if (half > 0) {
+            fb_fill_rect(cx - half, cy + y, half * 2 + 1, 1, color);
+        }
+    }
+}
+
+/* Filled triangle using scanline rasterization */
+void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t color) {
+    /* Sort vertices by y coordinate */
+    if (y0 > y1) { int t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    if (y0 > y2) { int t; t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t; }
+    if (y1 > y2) { int t; t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
+
+    if (y2 == y0) return;
+
+    for (int y = y0; y <= y2; y++) {
+        int xa, xb;
+        if (y < y1) {
+            /* Interpolate from y0 to y1 */
+            if (y1 != y0) {
+                xa = x0 + (x1 - x0) * (y - y0) / (y1 - y0);
+            } else {
+                xa = x1;
+            }
+            /* Interpolate from y0 to y2 */
+            xb = x0 + (x2 - x0) * (y - y0) / (y2 - y0);
+        } else {
+            /* Interpolate from y1 to y2 */
+            if (y2 != y1) {
+                xa = x1 + (x2 - x1) * (y - y1) / (y2 - y1);
+            } else {
+                xa = x2;
+            }
+            /* Interpolate from y0 to y2 */
+            xb = x0 + (x2 - x0) * (y - y0) / (y2 - y0);
+        }
+        if (xa > xb) { int t = xa; xa = xb; xb = t; }
+        fb_fill_rect(xa, y, xb - xa + 1, 1, color);
+    }
+}
+
+/* Blit a sprite with optional transparency key */
+void fb_blit(int x, int y, int w, int h, const uint32_t* data, uint32_t trans_key) {
+    if (!fb_back || !data) return;
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= (int)fb_h) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= (int)fb_w) continue;
+            uint32_t pixel = data[row * w + col];
+            if (pixel != trans_key) {
+                fb_back[dy * fb_w + dx] = pixel;
+            }
+        }
+    }
+}
+
+/* Blit with per-sprite alpha modulation */
+void fb_blit_alpha(int x, int y, int w, int h, const uint32_t* data,
+                   uint32_t trans_key, uint8_t alpha) {
+    if (!fb_back || !data) return;
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= (int)fb_h) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= (int)fb_w) continue;
+            uint32_t pixel = data[row * w + col];
+            if (pixel == trans_key) continue;
+            /* Apply alpha modulation */
+            uint8_t a = alpha;
+            uint32_t mod_pixel = (pixel & 0x00FFFFFF) | ((uint32_t)a << 24);
+            uint32_t dst = fb_back[dy * fb_w + dx];
+            fb_back[dy * fb_w + dx] = fb_blend(dst, mod_pixel);
+        }
+    }
+}
+
+/* Alpha-filled rectangle */
+void fb_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha) {
+    if (!fb_back) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)fb_w) w = fb_w - x;
+    if (y + h > (int)fb_h) h = fb_h - y;
+    if (w <= 0 || h <= 0) return;
+
+    uint8_t sr = (color >> 16) & 0xFF;
+    uint8_t sg = (color >> 8) & 0xFF;
+    uint8_t sb = color & 0xFF;
+
+    for (int row = 0; row < h; row++) {
+        uint32_t* p = &fb_back[(y + row) * fb_w + x];
+        for (int col = 0; col < w; col++) {
+            uint32_t dst = *p;
+            uint8_t dr = (dst >> 16) & 0xFF;
+            uint8_t dg = (dst >> 8) & 0xFF;
+            uint8_t db = dst & 0xFF;
+            uint8_t out_r = (sr * alpha + dr * (255 - alpha)) / 255;
+            uint8_t out_g = (sg * alpha + dg * (255 - alpha)) / 255;
+            uint8_t out_b = (sb * alpha + db * (255 - alpha)) / 255;
+            *p++ = 0xFF000000u | ((uint32_t)out_r << 16) |
+                   ((uint32_t)out_g << 8) | out_b;
+        }
+    }
+}

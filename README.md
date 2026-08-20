@@ -171,6 +171,7 @@ make run-cloud
 - Static ELF64 loader: parses headers, maps PT_LOAD segments, jumps to ring 3 via IRETQ
 - Dynamic linker (`ldso.c`, 1067 lines): parses PT_INTERP/PT_DYNAMIC, loads DT_NEEDED recursively, symbol resolution, relocations (RELATIVE, 64, GLOB_DAT, JUMP_SLOT), runs DT_INIT_ARRAY
 - Linux ELF compatibility layer (`linux_compat.c`): 50+ Linux syscall number translations
+- PE/COFF loader (`pe.c`): Windows EXE support — loads PE32+ x86_64 executables
 - Deep copy + huge page split for user address space (KE-13)
 - Per-process page tables with SMEP/SMAP isolation
 
@@ -358,7 +359,8 @@ make run-cloud
 - 5 repos, 128 max packages, 32 max installed
 - Install/remove/search/update with dependency tracking
 - 110 packages across 5 repos (LibreOffice, Kdenlive, OBS, etc.)
-- Shell commands: `pkg install`, `pkg list`, `pkg search`
+- .deb package support: install/extract Debian packages
+- Shell commands: `pkg install`, `pkg list`, `pkg search`, `pkg deb install`
 
 ## Userspace
 
@@ -384,7 +386,7 @@ make run-cloud
 | Files | `file` (ls/mkdir/cat/cp/mv/rmdir/rm/chmod/stat), `mount`, `save`, `exec` |
 | Hardware | `lspci`, `battery`, `temp`, `wifi`, `disk` |
 | Services | `services`, `lee` (service manager + sandbox), `cron` |
-| Packages | `packages`, `pkg` (install/list/search) |
+| Packages | `packages`, `pkg` (install/list/search), `pkg deb` (install/list/remove .deb packages) |
 | AI | `ai`, `claude`, `glm`, `gemini`, `openai`, `uai` |
 | UI | `ui`, `theme`, `clear`, `date`, `time`, `play`, `speak` |
 

@@ -60,7 +60,18 @@ int      fb_text_width(const char *s);
 void     fb_set_pixel(int x, int y, uint32_t color);
 uint32_t fb_get_pixel(int x, int y);
 void     fb_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
-void     fb_draw_circle(int cx, int cy, int r, uint32_t color);
+void fb_draw_circle(int cx, int cy, int r, uint32_t color);
+
+/* Filled shapes */
+void fb_fill_circle(int cx, int cy, int r, uint32_t color);
+void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t color);
+
+/* Sprite blitting (with optional transparency key) */
+void fb_blit(int x, int y, int w, int h, const uint32_t* data, uint32_t trans_key);
+void fb_blit_alpha(int x, int y, int w, int h, const uint32_t* data, uint32_t trans_key, uint8_t alpha);
+
+/* Alpha-filled rectangle */
+void fb_fill_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha);
 
 /* alpha blend src over dst (src has alpha channel in high byte) */
 uint32_t fb_blend(uint32_t dst, uint32_t src);
