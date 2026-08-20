@@ -360,3 +360,8 @@ struct widget* settings_app_create(int x, int y) {
     memcpy(set_widget.title, "Settings", 9);
     return &set_widget;
 }
+
+/* Alias for app_grid compatibility */
+struct widget* settings_create(int x, int y) {
+    return settings_app_create(x, y);
+}

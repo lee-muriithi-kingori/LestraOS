@@ -703,7 +703,7 @@ void ui_render_notifications(void) {
  * an ext2/disk fs is mounted at / (or /etc is bind-mounted onto a
  * disk-backed fs), persistence Just Works. The file format is plain
  * text on purpose so it can be inspected / edited by hand. */
-static int settings_brightness = 80;  /* 0-100 */
+static int settings_brightness = 100;  /* 0-100 */
 static int settings_volume = 75;      /* 0-100 */
 static int settings_adblock = 1;
 static int settings_dark_mode = 1;

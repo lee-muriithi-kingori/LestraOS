@@ -334,12 +334,6 @@ static void cmd_theme(int argc, char** argv) {
 }
 
 /* ----- install -------------------------------------------------------- */
-/* The in-OS installer (installer/install.c) is still a 17-line stub.
- * Until a real partitioner + ext2-formatter + file-copy pipeline lands
- * in the kernel, this command gives the user an honest picture of the
- * current storage situation (which disk controllers are visible, what
- * is mounted where) and points them at the working host-side installer
- * script (installer/install.sh) that writes a raw image to a device. */
 static void cmd_install(void) {
     printk("\n=== Lestra OS Installer ===\n");
     printk("(in-kernel installer is a stub — uses host-side tools for now)\n\n");
