@@ -6,6 +6,29 @@
 
 **by [Lee Muriithi Kingori](https://github.com/lee-muriithi-kingori)** · founder of [lestramk.org](https://lestramk.org)
 
+<div align="center">
+
+![C](https://img.shields.io/badge/C-00599C?style=for-the-badge&logo=c&logoColor=white)
+![x86 Assembly](https://img.shields.io/badge/x86_Assembly-000000?style=for-the-badge&logo=intel&logoColor=white)
+![GRUB](https://img.shields.io/badge/GRUB2-4A7D2F?style=for-the-badge&logo=gnu&logoColor=white)
+![QEMU](https://img.shields.io/badge/QEMU-FF6600?style=for-the-badge&logo=qemu&logoColor=white)
+![NASM](https://img.shields.io/badge/NASM-000000?style=for-the-badge&logo=assemblyscript&logoColor=white)
+![TCP/IP](https://img.shields.io/badge/TCP/IP-0078D4?style=for-the-badge&logo= internet&logoColor=white)
+![TLS 1.2](https://img.shields.io/badge/TLS_1.2-0F9D58?style=for-the-badge&logo=letsencrypt&logoColor=white)
+![SSH](https://img.shields.io/badge/SSH-2.0-24292E?style=for-the-badge&logo=openssh&logoColor=white)
+![ext2](https://img.shields.io/badge/ext2-FF6600?style=for-the-badge&logo=linux&logoColor=white)
+![FAT32](https://img.shields.io/badge/FAT32-0078D4?style=for-the-badge&logo=microsoft&logoColor=white)
+![AC97](https://img.shields.io/badge/AC97_Audio-9B59B6?style=for-the-badge&logo=creative+technology&logoColor=white)
+![AES-256](https://img.shields.io/badge/AES--256-2ECC71?style=for-the-badge&logo=lock&logoColor=white)
+![ECDHE](https://img.shields.io/badge/ECDHE_P--256-3498DB?style=for-the-badge&logo=keybase&logoColor=white)
+![RSA-2048](https://img.shields.io/badge/RSA--2048-E74C3C?style=for-the-badge&logo=rsa&logoColor=white)
+![X.509](https://img.shields.io/badge/X.509-8E44AD?style=for-the-badge&logo=certificate&logoColor=white)
+![JSON](https://img.shields.io/badge/JSON-000000?style=for-the-badge&logo=json&logoColor=white)
+![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)
+![GitHub Actions](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=for-the-badge&logo=github-actions&logoColor=white)
+
+</div>
+
 | | |
 |---|---|
 | Architecture | x86_64, long mode |
