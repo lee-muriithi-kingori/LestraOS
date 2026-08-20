@@ -490,26 +490,9 @@ void ui_desktop_icons_handle_move(int x, int y) {
 /* ===== WALLPAPER BRANDING ===== */
 /* Draw the real wallpaper image + LestraOS branding text */
 void ui_render_wallpaper(void) {
-    /* The original code blits a 1024x768 RGB bitmap. Since we only ship
-     * a 1x1 placeholder, fall back to a procedural gradient that looks
-     * similar (deep navy at top, fading to near-black at bottom with a
-     * subtle cyan tint). */
-    for (uint32_t y = 0; y < fb_h; y++) {
-        for (uint32_t x = 0; x < fb_w; x++) {
-            /* Vertical gradient with radial highlight near top-center. */
-            int dy = (int)y;
-            int dx = (int)x - (int)(fb_w / 2);
-            int r2 = dx * dx + dy * dy * 2;
-            int r_max = (int)(fb_w * fb_w / 4 + fb_h * fb_h);
-            int factor = 100 - (r2 * 100) / r_max;
-            if (factor < 0) factor = 0;
-            uint8_t r = (uint8_t)(0x0A + (0x0E - 0x0A) * factor / 100);
-            uint8_t g = (uint8_t)(0x0C + (0x14 - 0x0C) * factor / 100);
-            uint8_t b = (uint8_t)(0x12 + (0x22 - 0x12) * factor / 100);
-            uint32_t color = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-            fb_set_pixel(x, y, color);
-        }
-    }
+    /* Use the Meet Yugi wallpaper from wallpaper.c */
+    extern void wallpaper_render(void);
+    wallpaper_render();
 
     /* Draw "lestraOS" branding text on top of wallpaper, faint */
     const char* brand = "lestraOS";

@@ -340,7 +340,7 @@ userspace: libc | $(BUILD_DIR)/user
 # Initrd generation
 initrd: userspace | $(BUILD_DIR)
 	@echo "  Creating initrd..."
-	@python3 scripts/mkinitrd.py $(INITRD) $(BUILD_DIR)/user/init $(BUILD_DIR)/user/shell $(BUILD_DIR)/user/sysinfo 2>/dev/null || \
+	@python3 scripts/mkinitrd.py $(INITRD) $(BUILD_DIR)/user/init $(BUILD_DIR)/user/shell $(BUILD_DIR)/user/sysinfo initrd_content/wallpaper.rgb 2>/dev/null || \
 	echo "  WARNING: Could not create initrd (check python3 and user binaries)"
 
 # ISO generation
