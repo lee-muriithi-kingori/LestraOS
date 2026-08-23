@@ -35,6 +35,7 @@
 #include <lestra/pipe.h>
 #include <lestra/socket.h>
 #include <lestra/uaccess.h>
+#include <lestra/hpet.h>
 #include <string.h>
 
 /* errno constants used by syscalls. The libc errno.h may already define
@@ -908,20 +909,22 @@ static int64_t sys_munmap(void* addr, size_t length) {
 
 static int64_t sys_gettimeofday(void* tv_ptr, void* tz_ptr) {
     /* W3-B / W1-A B: fill a real POSIX struct timeval {tv_sec, tv_usec}.
-     * tv_sec = seconds since boot (no RTC yet, so wall-clock == boot clock);
-     * tv_usec = sub-second milliseconds * 1000.
+     * KE-37: hpet_wall_us() gives microsecond resolution — PIT
+     * milliseconds anchored to HPET microseconds at boot. Without an
+     * HPET it degrades to the old PIT-millisecond behaviour exactly.
+     * tv_sec = seconds since boot (no wall-clock source yet);
      * tz_ptr is accepted but ignored (struct timezone is deprecated in
      * modern POSIX — callers pass NULL). */
     (void)tz_ptr;
     if (tv_ptr) {
         if (!access_ok(tv_ptr, 16)) return -EFAULT;
-        uint64_t ms = timer_get_ms();
+        uint64_t us = hpet_wall_us();
         struct timeval {
             int64_t tv_sec;
             int64_t tv_usec;
         } ktv;
-        ktv.tv_sec  = (int64_t)(ms / 1000);
-        ktv.tv_usec = (int64_t)((ms % 1000) * 1000);
+        ktv.tv_sec  = (int64_t)(us / 1000000);
+        ktv.tv_usec = (int64_t)(us % 1000000);
         if (copy_to_user(tv_ptr, &ktv, sizeof(ktv)) < 0) return -EFAULT;
     }
     return 0;
@@ -1447,26 +1450,29 @@ static int64_t sys_times(void* buf) {
 static int64_t sys_clock_gettime(int clk_id, void* tp) {
     if (!tp) return -EFAULT;
     if (!access_ok(tp, sizeof(struct timespec64))) return -EFAULT;
-    uint64_t ms = timer_get_ms();
+    /* KE-37: use the same microsecond clock as sys_gettimeofday so both
+     * time sources agree exactly (POSIX requires it). hpet_wall_us()
+     * degrades to PIT ms*1000 without an HPET. */
+    uint64_t us = hpet_wall_us();
     struct timespec64 kts;
 
     switch (clk_id) {
         case CLOCK_REALTIME:
-            /* Real-time clock: ms since boot (no RTC yet). */
-            kts.tv_sec  = (int64_t)(ms / 1000);
-            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            /* Real-time clock: us since boot (no RTC yet). */
+            kts.tv_sec  = (int64_t)(us / 1000000);
+            kts.tv_nsec = (int64_t)((us % 1000000) * 1000);
             break;
 
         case CLOCK_MONOTONIC:
             /* Monotonic clock: same as realtime for now (no RTC). */
-            kts.tv_sec  = (int64_t)(ms / 1000);
-            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            kts.tv_sec  = (int64_t)(us / 1000000);
+            kts.tv_nsec = (int64_t)((us % 1000000) * 1000);
             break;
 
         case CLOCK_PROCESS_CPUTIME_ID:
             /* Per-process CPU time: approximate with wall clock. */
-            kts.tv_sec  = (int64_t)(ms / 1000);
-            kts.tv_nsec = (int64_t)((ms % 1000) * 1000000);
+            kts.tv_sec  = (int64_t)(us / 1000000);
+            kts.tv_nsec = (int64_t)((us % 1000000) * 1000);
             break;
 
         default:

@@ -246,6 +246,15 @@ static void parse_hpet(uintptr_t addr) {
     }
 
     const struct acpi_hpet* hpet = (const struct acpi_hpet*)addr;
+    /* Only System Memory (space ID 0) is supported — the HPET driver
+     * accesses the base as identity-mapped MMIO. I/O-port or PCI-
+     * configuration-space HPETs would make the driver read/write
+     * whatever decodes at that "address", so reject them here. */
+    if (hpet->base_address.address_space_id != 0) {
+        pr_warn("acpi: HPET base in address space %u — not memory-mapped, "
+                "ignoring\n", hpet->base_address.address_space_id);
+        return;
+    }
     g_acpi.hpet_found = 1;
     g_acpi.hpet_base = hpet->base_address.address;
     /* event_timer_block_id encodes: bits 0-7 = rev, bits 8-12 = comparators,

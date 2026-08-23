@@ -3,6 +3,40 @@
 > This file is committed inside the repo so it survives any environment reset.
 > ALSO mirrored to /home/z/my-project/worklog.md.
 
+## KE-37: HPET high-resolution timer driver
+
+### What was done
+1. **kernel/drivers/clock/hpet.c** (new, ~230 LOC): HPET driver built on the
+   KE-22 ACPI table discovery (g_acpi.hpet_base).
+   - Reads General Capabilities: counter period (fs) + 32/64-bit width.
+   - Sanity-checks the period (1 fs .. 100 ns), rejects implausible values.
+   - Bring-up: halt → legacy-replacement OFF (PIT keeps IRQ0!) → zero main
+     counter → enable. Counter-frozen detection with clean fallback.
+   - 32-bit counters handled via double-read stabilization.
+   - ticks_to_ns() avoids __int128 division (no libgcc __udivti3):
+     ns = (t/f)*1e9 + (t%f)*1e9/f — remainder*1e9 fits uint64 even at 4 GHz.
+   - hpet_udelay()/hpet_ndelay(): precise busy-spins on the counter,
+     PIT/TSC fallback without an HPET.
+2. **kernel/include/lestra/hpet.h**: public API (init/available/get_ns/
+   wall_us/get_freq_hz/udelay/ndelay).
+3. **kernel_main.c**: hpet_init() right after timer_init(1000) — anchors
+   its timeline on the live PIT ms clock. Non-fatal on failure.
+4. **sys_gettimeofday**: now uses hpet_wall_us() — PIT ms anchored to HPET
+   µs at boot = continuous monotonic µs-resolution gettimeofday. Without
+   an HPET, byte-identical to old behaviour.
+
+### Design decisions
+- The HPET does NOT generate interrupts and does NOT touch IRQ routing —
+  the PIT remains the scheduler tick source (safest incremental step;
+  comparator interrupts are future work). Zero risk to IRQ0 delivery.
+- Legacy-replacement bit explicitly cleared so the HPET can never steal
+  IRQ0/IRQ8 from the PIT/RTC.
+
+### Verification status
+- Build + QEMU boot test PENDING (Windows host; WSL2 toolchain being set up).
+
+---
+
 ## Current State (5 Aug 2026)
 
 ### Completed Security TIERs

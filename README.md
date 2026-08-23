@@ -36,7 +36,7 @@
 | License | MIT |
 | Source | ~40,000 lines C + x86 assembly |
 | Syscalls | 75 (Linux ABI-compatible numbering) |
-| Drivers | 17 (E1000, RTL8139, VirtIO-net, VirtIO-blk, AHCI, AC97, PS/2, serial, PCI, RTC, PIT, battery, temp) |
+| Drivers | 18 (E1000, RTL8139, VirtIO-net, VirtIO-blk, AHCI, AC97, PS/2, serial, PCI, RTC, PIT, HPET, battery, temp) |
 | Filesystems | ext2, FAT32, procfs, devfs, tmpfs, tarfs |
 | Networking | Hand-rolled TCP/IP stack, TLS 1.2, SSH-2.0, HTTP/HTTPS server |
 | GUI | 42-file framebuffer compositor, 60Hz, 16 apps |
@@ -464,11 +464,11 @@ LestraOS/
 - [x] TTS (formant synthesis) + STT (on-device DTW)
 - [x] Linux ELF binary compatibility layer
 - [x] COW fork + auto-growing stack + demand paging
+- [x] HPET high-resolution timer (nanosecond clock + µs delays, PIT stays tick source)
 - [ ] USB host controller (XHCI/UHCI/EHCI)
 - [ ] WiFi driver (ath9k/rtl) — framework exists, no real driver
 - [ ] NVMe storage
 - [ ] Intel HD Audio (HDA)
-- [ ] HPET high-resolution timer
 - [ ] SMP (symmetric multiprocessing)
 - [ ] TLS 1.3
 - [ ] POSIX-complete libc

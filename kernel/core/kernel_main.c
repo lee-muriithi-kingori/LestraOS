@@ -37,6 +37,7 @@
 #include <lestra/serial.h>
 #include <lestra/keyboard.h>
 #include <lestra/timer.h>
+#include <lestra/hpet.h>
 #include <lestra/ui.h>
 #include <lestra/pkg.h>
 #include <lestra/ai.h>
@@ -387,6 +388,13 @@ void kernel_main(void* mb2_info) {
     /* Initialize timer */
     pr_info("Initializing timer (1000 Hz)...\n");
     timer_init(1000);
+
+    /* KE-37: Bring up the HPET high-resolution clock (if the ACPI table
+     * found one). Anchors its nanosecond timeline on the live PIT ms
+     * clock, then sys_gettimeofday()/clock_gettime report microseconds.
+     * Non-fatal: without an HPET the PIT remains the only clock. */
+    pr_info("Initializing HPET...\n");
+    hpet_init();
 
     /* Initialize CSPRNG early so ASLR + canaries have entropy.
      * Must come AFTER timer_init() — collect_entropy() reads timer_get_ms(). */
