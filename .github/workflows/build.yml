@@ -1,0 +1,51 @@
+name: Build LestraOS ISO
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential nasm grub-pc-bin grub-common xorriso mtools
+
+      - name: Build ISO
+        run: |
+          make clean || true
+          make all
+
+      - name: Smoke boot (serial markers)
+        run: |
+          sudo apt-get install -y -qq qemu-system-x86
+          timeout -s KILL 25 qemu-system-x86_64 \
+            -m 512M -cpu qemu64,+smep,+smap \
+            -cdrom build/lestraos.iso -boot d \
+            -display none -no-reboot \
+            -serial file:serial.log || true
+          grep -iE "Shell \(lsh\)|DHCP.*ACK" serial.log && echo "SMOKE PASS"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lestraos-iso
+          path: build/lestraos.iso
+
+      - name: Publish to rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: LestraOS rolling build
+          files: build/lestraos.iso
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
