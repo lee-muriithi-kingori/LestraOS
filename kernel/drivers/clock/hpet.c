@@ -49,12 +49,13 @@
 #define HPET_CAPS_PERIOD_MASK   0xFFFFFFFFULL
 
 /* Plausible counter periods, in femtoseconds.
- * Spec minimum is 1 fs (1 PHz), but we cap at 1 ns (1 GHz): real HPETs
- * run 10-70 fs periods (14-100 MHz+), and keeping freq_hz <= 1e9 makes
- * ticks_to_ns()'s remainder math provably overflow-free in uint64_t.
+ * The HPET spec requires the counter period to be <= 100 ns; real HPETs
+ * run 10-70 ns (14-100 MHz). We additionally require >= 1 ns so that
+ * freq_hz <= 1e9, which keeps ticks_to_ns()'s remainder math provably
+ * overflow-free in uint64_t. QEMU reports 10,000,000 fs (10 ns, 100 MHz).
  * Reject garbage rather than divide by zero later. */
-#define HPET_MIN_PERIOD_FS  1ULL
-#define HPET_MAX_PERIOD_FS  1000000ULL   /* 1 ns */
+#define HPET_MIN_PERIOD_FS  1000000ULL     /* 1 ns — overflow guard */
+#define HPET_MAX_PERIOD_FS  100000000ULL   /* 100 ns — spec maximum */
 
 static volatile uint8_t* hpet_mmio = NULL;
 static uint64_t fs_per_tick = 0;    /* femtoseconds per main-counter tick */
