@@ -33,9 +33,37 @@
   IRQ0/IRQ8 from the PIT/RTC.
 
 ### Verification status
-- Build + QEMU boot test PENDING (Windows host; WSL2 toolchain being set up).
+- **BOOT-VERIFIED on QEMU 8.2.2 (Ubuntu 24.04/WSL2): `hpet: ACTIVE at 0xfed00000 — freq 100000000 Hz (64-bit counter), 2 comparators`**
+- Full chain verified: shell banner, DHCP ACK 10.0.2.15, zero faults
+- Bug found by boot test: period sanity range was [1..1,000,000] fs — rejected QEMU's
+  valid 10,000,000 fs (10ns). Real HPET periods are 10-100 NANOSECONDS (10M-100M fs).
+  Fixed to [1ns..100ns]; commit 722e0c6. Lesson: femtosecond units — 1ns = 1e6 fs.
+
+## Windows build environment (leeki machine, 24 Aug 2026)
+
+This machine's Windows installer stack is BROKEN (SecureRepair 1603 on all MSIs,
+AppX deployment hangs, hollow package registrations). WSL was rebuilt MANUALLY:
+
+- **WSL binaries**: extracted from official MSI via `msiexec /a D:\WSL\wsl.msi /qn TARGETDIR=D:\WSL\x`
+  → live at `D:\WSL\x\PFiles64\WSL\` (wsl.exe, wslservice.exe, wslhost.exe...)
+- **Service**: `sc create WSLService binPath= "D:\WSL\x\PFiles64\WSL\wslservice.exe" type= own start= demand`
+- **COM registration**: `D:\WSL\wsl-com.reg` (LxssUserSession CLSID + AppID→WSLService +
+  proxystub + 27 Interface→ProxyStubClsid32 mappings, generated from package.wix.in)
+- **System32\wsl.exe stub is BROKEN on this machine** — always call
+  `D:\WSL\x\PFiles64\WSL\wsl.exe` directly
+- **Distro**: Ubuntu 24.04, vhdx at `D:\WSL\UbuntuD\ext4.vhdx`, registered as "Ubuntu"
+- **Toolchain in distro**: build-essential gcc 13.3, nasm 2.16, grub-mkrescue 2.12,
+  xorriso, qemu-system-x86 8.2.2, git
+- **Repo clone in distro**: `/root/LestraOS` (build here — native ext4, fast)
+- **Helper scripts**: `D:\WSL\smoke.sh` etc. — ALWAYS `sed -i 's/\r$//'` first (CRLF!)
+- **QEMU boot test**: `timeout -s KILL 25 qemu-system-x86_64 -m 512M -cpu qemu64,+smep,+smap
+  -cdrom build/lestraos.iso -boot d -display none -no-reboot -serial file:/tmp/lestra.log`
+- /tmp does NOT survive WSL VM idle shutdown — use /mnt/d/WSL for persistent artifacts
+- VGA screendump trick for headless debugging: QMP unix socket + screendump → PPM →
+  1-bit PNG via python zlib (see D:\WSL\smoke.sh history)
 
 ---
+
 
 ## Current State (5 Aug 2026)
 
