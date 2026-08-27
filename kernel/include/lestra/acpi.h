@@ -189,6 +189,23 @@ struct acpi_hpet {
     uint8_t  page_protection;         /* Page protection */
 } __packed;  /* 36+4+12+1+2+1 = 56 bytes */
 
+/* ----- MCFG (PCI Express Memory-Mapped Config Space) -----
+ * The MCFG table lists one or more ECAM regions. Each region describes
+ * the physical base of a segment's memory-mapped PCIe configuration
+ * space and the bus range it covers.
+ * A device at (segment, bus, dev, func) has its config registers at:
+ *   base + (bus << 20) + (dev << 15) + (func << 12) + offset
+ */
+#define ACPI_MAX_ECAM_REGIONS  4
+
+struct acpi_mcfg_entry {
+    uint64_t base_addr;      /* Physical base of the ECAM region */
+    uint16_t pci_segment;    /* PCI segment group number */
+    uint8_t  start_bus;
+    uint8_t  end_bus;
+    uint32_t reserved;
+} __packed;
+
 /* ----- Cached ACPI database (populated by acpi_init) ----- */
 
 struct acpi_isa_override {
@@ -227,6 +244,11 @@ struct acpi_info {
     uint64_t hpet_base;          /* HPET MMIO base address */
     uint8_t  hpet_comparators;   /* Number of comparators */
     uint16_t hpet_caps;
+
+    /* MCFG (PCIe ECAM regions) */
+    int     mcfg_found;
+    int     n_ecam;
+    struct acpi_mcfg_entry ecam[ACPI_MAX_ECAM_REGIONS];
 };
 
 /* ----- API ----- */

@@ -268,6 +268,33 @@ static void parse_hpet(uintptr_t addr) {
             hpet->min_tick);
 }
 
+static void parse_mcfg(uintptr_t addr) {
+    const struct acpi_header* hdr = (const struct acpi_header*)addr;
+    if (memcmp(hdr->signature, "MCFG", 4) != 0) return;
+    if (!acpi_checksum_valid(hdr, hdr->length)) {
+        pr_warn("acpi: MCFG checksum invalid\n");
+        return;
+    }
+
+    /* MCFG layout: 36-byte ACPI header + 8 reserved bytes, then an
+     * array of 16-byte allocations. */
+    const struct acpi_mcfg_entry* entries =
+        (const struct acpi_mcfg_entry*)(addr + sizeof(struct acpi_header) + 8);
+    int count = (hdr->length - sizeof(struct acpi_header) - 8) / 16;
+
+    g_acpi.mcfg_found = 1;
+    int n = count < ACPI_MAX_ECAM_REGIONS ? count : ACPI_MAX_ECAM_REGIONS;
+    g_acpi.n_ecam = n;
+
+    for (int i = 0; i < n; i++) {
+        g_acpi.ecam[i] = entries[i];
+        pr_info("acpi: MCFG region: seg=%u bus %u-%u base=0x%llx\n",
+                g_acpi.ecam[i].pci_segment,
+                g_acpi.ecam[i].start_bus, g_acpi.ecam[i].end_bus,
+                (unsigned long long)g_acpi.ecam[i].base_addr);
+    }
+}
+
 /* ----- Dispatch callback for walk_rsdt_xsdt -----
  * Checks signature and routes to the right parser. */
 static void acpi_dispatch_entry(uintptr_t addr, void* user_data) {
@@ -285,6 +312,8 @@ static void acpi_dispatch_entry(uintptr_t addr, void* user_data) {
         parse_madt(addr);
     } else if (memcmp(hdr->signature, "HPET", 4) == 0) {
         parse_hpet(addr);
+    } else if (memcmp(hdr->signature, "MCFG", 4) == 0) {
+        parse_mcfg(addr);
     }
 }
 
@@ -323,10 +352,11 @@ int acpi_init(void) {
     walk_rsdt_xsdt(rsdp, acpi_dispatch_entry, NULL);
 
     /* Summary */
-    pr_info("acpi: discovery complete — FACP=%s, MADT=%s, HPET=%s\n",
+    pr_info("acpi: discovery complete — FACP=%s, MADT=%s, HPET=%s, MCFG=%s\n",
             g_acpi.fadt_found ? "yes" : "no",
             g_acpi.madt_found ? "yes" : "no",
-            g_acpi.hpet_found ? "yes" : "no");
+            g_acpi.hpet_found ? "yes" : "no",
+            g_acpi.mcfg_found ? "yes" : "no");
     if (g_acpi.madt_found) {
         pr_info("acpi: %d ISA interrupt overrides cached\n",
                 g_acpi.n_isa_overrides);

@@ -39,38 +39,34 @@ static int acpi_present    = 0;   /* ACPI PM device detected          */
 static int initialized     = 0;
 
 /*
- * Scan the PCI bus for the ACPI PM device and any known battery
- * controllers. We scan bus 0, devices 0-31, functions 0-7 which is
- * plenty for QEMU and most real firmware layouts.
+ * Scan the PCI device table for the ACPI PM device and any known
+ * battery controllers. Iterates the shared device table (filled by
+ * pci_scan_bus) so devices behind bridges are found too.
  */
 static int scan_for_acpi(void) {
-    for (uint16_t dev = 0; dev < 32; dev++) {
-        for (uint8_t func = 0; func < 8; func++) {
-            uint32_t vd = pci_config_read32(0, (uint8_t)dev, func, 0x00);
-            uint16_t vendor = (uint16_t)(vd & 0xFFFF);
-            uint16_t device = (uint16_t)(vd >> 16);
-            if (vendor == 0xFFFF || vendor == 0x0000) {
-                continue;
-            }
+    int ndevs = pci_get_device_count();
+    for (int i = 0; i < ndevs; i++) {
+        struct pci_device *d = pci_get_device(i);
+        if (!d) continue;
 
-            uint32_t class_code = pci_config_read32(0, (uint8_t)dev, func, 0x08);
-            uint8_t baseclass = (uint8_t)((class_code >> 24) & 0xFF);
-            uint8_t subclass  = (uint8_t)((class_code >> 16) & 0xFF);
+        uint16_t vendor = d->vendor_id;
+        uint16_t device = d->device_id;
+        uint8_t baseclass = d->class_code;
+        uint8_t subclass  = d->subclass;
 
-            /* Intel PIIX4 ACPI PM — QEMU's default. */
-            if (vendor == PIIX4_ACPI_VENDOR && device == PIIX4_ACPI_DEVICE) {
-                pr_info("battery: Intel PIIX4 ACPI PM at PCI 0:%u:%u\n",
-                        (unsigned)dev, (unsigned)func);
-                return 1;
-            }
-            /* Generic ACPI-capable ISA bridge hint. */
-            if (baseclass == PCI_CLASS_BRIDGE && subclass == PCI_SUBCLASS_ISA) {
-                pr_info("battery: ACPI-capable ISA bridge at PCI 0:%u:%u "
-                        "(vendor=%04x device=%04x)\n",
-                        (unsigned)dev, (unsigned)func,
-                        (unsigned)vendor, (unsigned)device);
-                return 1;
-            }
+        /* Intel PIIX4 ACPI PM — QEMU's default. */
+        if (vendor == PIIX4_ACPI_VENDOR && device == PIIX4_ACPI_DEVICE) {
+            pr_info("battery: Intel PIIX4 ACPI PM at PCI %02x:%u.%u\n",
+                    (unsigned)d->bus, (unsigned)d->dev, (unsigned)d->func);
+            return 1;
+        }
+        /* Generic ACPI-capable ISA bridge hint. */
+        if (baseclass == PCI_CLASS_BRIDGE && subclass == PCI_SUBCLASS_ISA) {
+            pr_info("battery: ACPI-capable ISA bridge at PCI %02x:%u.%u "
+                    "(vendor=%04x device=%04x)\n",
+                    (unsigned)d->bus, (unsigned)d->dev, (unsigned)d->func,
+                    (unsigned)vendor, (unsigned)device);
+            return 1;
         }
     }
     return 0;

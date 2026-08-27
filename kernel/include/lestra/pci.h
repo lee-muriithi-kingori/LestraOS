@@ -8,9 +8,14 @@
  * ac97.c, ac97_capture.c, and battery.c (7 files, 7 copies).
  *
  * Usage:  #include <lestra/pci.h>
- *        uint32_t id = pci_config_read32(0, d, f, 0x00);
+ *        uint32_t id = pci_config_read32(bus, d, f, 0x00);
  *
- * All access is via Type 1 configuration mechanism (IO ports 0xCF8/0xCFC).
+ * Config space access transparently uses PCIe ECAM (MMIO, from the ACPI
+ * MCFG table) when a bus falls inside a usable ECAM region, and falls
+ * back to the Type 1 configuration mechanism (IO ports 0xCF8/0xCFC)
+ * otherwise. pci_scan_bus() recursively follows PCI-to-PCI bridges, so
+ * devices behind bridges on multi-bus chipsets are discovered.
+ *
  * No locking needed — all PCI config access in lestraOS happens during init
  * (single-threaded, pre-scheduler).
  */
@@ -69,7 +74,7 @@
 #define PCI_CLASS_SIGNAL      0x11
 
 /* PCI device info — filled by pci_scan_bus() */
-#define PCI_MAX_DEVICES  64
+#define PCI_MAX_DEVICES  256   /* multi-bus hardware easily exceeds 64 */
 #define PCI_MAX_BARS     6
 
 struct pci_device {
@@ -87,7 +92,8 @@ struct pci_device {
     uint32_t bar[PCI_MAX_BARS];
 };
 
-/* Core config space read/write (Type 1 mechanism) */
+/* Core config space read/write — ECAM (MMIO) when the bus is inside a
+ * usable MCFG region, else Type 1 mechanism (IO 0xCF8/0xCFC). */
 uint32_t pci_config_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 uint16_t pci_config_read16(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);
 uint8_t  pci_config_read8 (uint8_t bus, uint8_t dev, uint8_t func, uint8_t off);

@@ -56,17 +56,13 @@ static inline void nam_write16(uint8_t offset, uint16_t val) {
 }
 
 static int ac97_find(uint8_t* bus, uint8_t* dev, uint8_t* func) {
-    for (uint8_t d = 0; d < 32; d++) {
-        for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_config_read32(0, d, f, 0);
-            if (id == 0xFFFFFFFFu) continue;
-            uint32_t class_code = pci_config_read32(0, d, f, 0x08);
-            uint8_t base_class = (class_code >> 24) & 0xFF;
-            uint8_t subclass = (class_code >> 16) & 0xFF;
-            if (base_class == 0x04 && subclass == 0x01) {
-                *bus = 0; *dev = d; *func = f;
-                return 1;
-            }
+    int ndevs = pci_get_device_count();
+    for (int i = 0; i < ndevs; i++) {
+        struct pci_device *d = pci_get_device(i);
+        if (!d) continue;
+        if (d->class_code == 0x04 && d->subclass == 0x01) {
+            *bus = d->bus; *dev = d->dev; *func = d->func;
+            return 1;
         }
     }
     return 0;
@@ -92,8 +88,8 @@ int ac97_init(void) {
     uint32_t cmd = pci_config_read32(bus, dev, func, 0x04);
     pci_config_write32(bus, dev, func, 0x04, cmd | 0x5);
 
-    pr_info("ac97: found at PCI 00:%u.%u, NABM=0x%x, NAM=0x%x\n",
-            (unsigned)dev, (unsigned)func,
+    pr_info("ac97: found at PCI %02x:%u.%u, NABM=0x%x, NAM=0x%x\n",
+            (unsigned)bus, (unsigned)dev, (unsigned)func,
             (unsigned)nabm_base, (unsigned)nam_base);
 
     nabm_write8(NABM_PCM_OUT_CR, CR_RPA);

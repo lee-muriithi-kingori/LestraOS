@@ -372,39 +372,36 @@ static uint64_t vblk_read_config64(uint8_t off) {
  * ======================================================================== */
 
 static int pci_find_virtio_blk(uint8_t* bus, uint8_t* dev, uint8_t* func) {
-    for (uint8_t d = 0; d < 32; d++) {
-        for (uint8_t f = 0; f < 8; f++) {
-            uint32_t id = pci_config_read32(0, d, f, 0);
-            if (id == 0xFFFFFFFFu) continue;
-            uint16_t vendor = id & 0xFFFF;
-            uint16_t device = (id >> 16) & 0xFFFF;
+    int ndevs = pci_get_device_count();
+    for (int i = 0; i < ndevs; i++) {
+        struct pci_device *d = pci_get_device(i);
+        if (!d || d->vendor_id != 0x1AF4) continue;
 
-            if (vendor != 0x1AF4) continue;
-
-            int is_blk = 0;
-            if (device == 0x1001) {
-                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
-                if (subsystem_id == 2) is_blk = 1;
-            } else if (device == 0x1042) {
-                is_blk = 1;
-            } else if (device >= 0x1040 && device <= 0x107F) {
-                uint16_t subsystem_id = pci_config_read16(0, d, f, 0x2E);
-                if (subsystem_id == 2) is_blk = 1;
-            }
-
-            if (!is_blk) continue;
-
-            *bus = 0; *dev = d; *func = f;
-
-            /* Enable device */
-            uint32_t cmd = pci_config_read32(0, d, f, 0x04);
-            cmd |= 0x7;
-            pci_config_write32(0, d, f, 0x04, cmd);
-
-            pr_info("virtio_blk: found at PCI 00:%u.%u, device=0x%x\n",
-                    (unsigned)d, (unsigned)f, (unsigned)device);
-            return 1;
+        uint16_t device = d->device_id;
+        int is_blk = 0;
+        if (device == 0x1001) {
+            uint16_t subsystem_id = pci_config_read16(d->bus, d->dev, d->func, 0x2E);
+            if (subsystem_id == 2) is_blk = 1;
+        } else if (device == 0x1042) {
+            is_blk = 1;
+        } else if (device >= 0x1040 && device <= 0x107F) {
+            uint16_t subsystem_id = pci_config_read16(d->bus, d->dev, d->func, 0x2E);
+            if (subsystem_id == 2) is_blk = 1;
         }
+
+        if (!is_blk) continue;
+
+        *bus = d->bus; *dev = d->dev; *func = d->func;
+
+        /* Enable device */
+        uint32_t cmd = pci_config_read32(d->bus, d->dev, d->func, 0x04);
+        cmd |= 0x7;
+        pci_config_write32(d->bus, d->dev, d->func, 0x04, cmd);
+
+        pr_info("virtio_blk: found at PCI %02x:%u.%u, device=0x%x\n",
+                (unsigned)d->bus, (unsigned)d->dev, (unsigned)d->func,
+                (unsigned)device);
+        return 1;
     }
     return 0;
 }
