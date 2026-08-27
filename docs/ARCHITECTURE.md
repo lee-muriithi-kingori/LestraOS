@@ -97,6 +97,8 @@ Round-robin scheduler with:
 
 ## System Calls
 
+67 syscalls 0-66 — see `USERSSPACE.md` and `kernel/include/lestra/syscall.h` (SYS_EXIT 0 … SYS_NICE 66, SYS_MAX 67).
+
 | Number | Name | Description |
 |--------|------|-------------|
 | 0 | exit | Terminate process |
@@ -109,6 +111,9 @@ Round-robin scheduler with:
 | 13 | sleep | Sleep for milliseconds |
 | 21 | reboot | Reboot or shutdown |
 | 22 | uname | Get system information |
+| 66 | nice | Nice |
+
+NVMe ✅ ticked — `kernel/drivers/block/nvme.c` (polling, single queue pair)
 
 ## License
 

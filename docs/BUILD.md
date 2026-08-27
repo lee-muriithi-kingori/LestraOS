@@ -22,6 +22,14 @@ sudo apt update
 sudo apt install build-essential nasm qemu-system-x86 grub-pc-bin xorriso python3
 ```
 
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Users\leeki\AppData\Local\Temp\opencode\build-kernel.ps1"
+```
+
+This verifies `138 C + 7 asm, LINK OK` without WSL.
+
 ### Build Cross Compiler (recommended)
 
 The cross-compiler ensures the kernel is built without any system libc
@@ -94,7 +102,7 @@ LestraOS/
 │   ├── drivers/       # vga, keyboard, serial, pit
 │   ├── mm/            # PMM, VMM, heap
 │   ├── sched/         # Real preemptive round-robin scheduler + context switch
-│   ├── syscall/       # SYSCALL/SYSRET + dispatch (29 syscalls)
+│   ├── syscall/        # SYSCALL/SYSRET + dispatch (67 syscalls 0-66)
 │   ├── fs/            # VFS + ext2 driver + procfs + devfs + initrd loader
 │   ├── net/           # TCP/IP: ARP, ICMP, UDP, DHCP, DNS, TCP, TLS 1.2 client+server
 │   ├── gui/           # Framebuffer compositor — wired into boot via kernel_main.c
