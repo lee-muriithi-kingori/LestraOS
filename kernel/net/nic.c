@@ -15,15 +15,17 @@
 extern const struct nic_ops virtio_net_ops;
 extern const struct nic_ops e1000_ops;
 extern const struct nic_ops rtl8139_ops;
+extern const struct nic_ops rtl8168_ops;
 
-/* Priority order: VirtIO (KVM/QEMU VPS) > E1000 (Intel) > RTL8139 (real hw) */
+/* Priority order: VirtIO (KVM/QEMU VPS) > E1000 (Intel) > RTL8139 > RTL8168 */
 const struct nic_ops *const nic_driver_table[] = {
     &virtio_net_ops,
     &e1000_ops,
     &rtl8139_ops,
+    &rtl8168_ops,
     NULL
 };
-const int nic_driver_count = 3;
+const int nic_driver_count = 4;
 
 /* Runtime: points to the NIC that won the init race */
 const struct nic_ops *active_nic_ops = NULL;

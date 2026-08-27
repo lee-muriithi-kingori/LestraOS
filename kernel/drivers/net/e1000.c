@@ -148,8 +148,28 @@ static uint16_t eeprom_read(uint8_t addr) {
 
 /* ----- PCI discovery via shared API (KE-14) -----
  * Try known Intel E1000 device IDs using pci_find_device().
- * Falls through each variant until one is found. */
-static const uint16_t e1000_device_ids[] = { 0x100E, 0x100F, 0x10D3, 0 };
+ * Falls through each variant until one is found.
+ *
+ * Only parts using the legacy Microwire serial-EEPROM bit-bang interface
+ * (EECD REQ/GNT + opcode 0b110 in eeprom_read()) belong in this list:
+ * the 8254x family plus the 82571/82572. The newer 82573/82574/82575/
+ * 82576 and all I2xx integrated parts store their MAC in flash NVM that
+ * needs a different access protocol (SPI/flash), so they are NOT added
+ * here - claiming support would be faking. */
+static const uint16_t e1000_device_ids[] = {
+    0x100E,  /* 82540EM (Copper)     */
+    0x100F,  /* 82545EM (Copper)     */
+    0x1010,  /* 82546EB              */
+    0x1012,  /* 82546EB (Copper)     */
+    0x101D,  /* 82546EB              */
+    0x1026,  /* 82545EP (Copper)     */
+    0x10D3,  /* 82574L               */
+    0x10A4,  /* 82571EB              */
+    0x10A5,  /* 82571EB (Copper)     */
+    0x10B9,  /* 82572EI              */
+    0x10BA,  /* 82572EI (Copper)     */
+    0,
+};
 
 static struct pci_device *e1000_find_pci(void) {
     for (int i = 0; e1000_device_ids[i]; i++) {
