@@ -1,15 +1,15 @@
 /*
- * Lestra OS - HTTP/1.0 client (plain HTTP only, no TLS)
+ * Lestra OS - HTTP/1.0 client (supports https via tls_connect)
  * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
- * One-shot GET/POST over the in-kernel TCP stack. Suitable for:
+ * One-shot GET/POST over the in-kernel TCP stack. Supports https://
+ * via tls_connect() (TLS 1.2 ECDHE_RSA AES128_GCM_SHA256 - see tls.c).
+ * Suitable for:
  *   - Downloading packages from a package mirror
  *   - Talking to a local LLM server (Ollama, llama.cpp, vLLM)
- *   - Talking to a local TLS-terminating proxy that forwards to a cloud
- *     HTTPS API (GLM, Claude, Gemini, OpenAI)
- *
- * NOT suitable for direct connection to HTTPS cloud APIs - those need
- * TLS, which is not implemented. See docs/AI.md for proxy setup.
+ *   - Direct HTTPS to cloud APIs (GLM, Claude, Gemini, OpenAI) via TLS,
+ *     or via a local TLS-terminating proxy if needed
+ *     (see docs/AI.md for proxy setup).
  */
 
 #include <lestra/types.h>

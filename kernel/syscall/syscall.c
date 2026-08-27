@@ -1493,13 +1493,13 @@ static int64_t sys_ioctl(int64_t fd_num, uint64_t request, uint64_t arg) {
 }
 
 static int64_t sys_getuid(void) {
-    /* Single-user system: we are root (uid 0). */
-    return 0;
+    struct process* cur = task_current();
+    return cur ? (int64_t)cur->uid : 0;
 }
 
 static int64_t sys_getgid(void) {
-    /* Single-user system: we are root (gid 0). */
-    return 0;
+    struct process* cur = task_current();
+    return cur ? (int64_t)cur->gid : 0;
 }
 
 static int64_t sys_getppid(void) {
@@ -1509,9 +1509,11 @@ static int64_t sys_getppid(void) {
 }
 
 static int64_t sys_setuid(uint32_t uid) {
-    /* Only root (uid 0) can setuid. If caller tries to set uid to
-     * anything non-zero, return -EPERM. Setting to 0 is fine. */
-    if (uid != 0) return -EPERM;
+    struct process* cur = task_current();
+    if (!cur) return -EPERM;
+    /* Root (uid 0) may become anyone; unprivileged may only set to same uid. */
+    if (cur->uid != 0 && (int)uid != cur->uid) return -EPERM;
+    cur->uid = (int)uid;
     return 0;
 }
 
@@ -1713,43 +1715,59 @@ static int64_t sys_accept(int64_t fd, void* addr, void* addrlen) {
 static int64_t sys_send(int64_t fd, const void* buf, size_t len, int flags) {
     if (!buf && len > 0) return -EFAULT;
     if (buf && len > 0 && !access_ok(buf, len)) return -EFAULT;
-    /* Bounce buffer for SMAP safety — socket layer uses the buf
-     * pointer synchronously (verified: tcp_send/pipe_write don't
-     * retain it beyond the call). */
-    size_t chunk = len > 4096 ? 4096 : len;
-    void* kbuf = NULL;
-    if (len > 0) {
-        kbuf = kmalloc(chunk);
-        if (!kbuf) return -ENOMEM;
-        if (copy_from_user(kbuf, buf, chunk) < 0) {
-            kfree(kbuf);
-            return -EFAULT;
+    if (len == 0) return 0;
+    void* kbuf = kmalloc(4096);
+    if (!kbuf) return -ENOMEM;
+    int64_t total = 0;
+    size_t done = 0;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > 4096) want = 4096;
+        if (copy_from_user(kbuf, (const uint8_t*)buf + done, want) < 0) {
+            total = total ? total : -EFAULT;
+            break;
         }
+        ssize_t n = socket_sendto((int)fd, kbuf, want, flags, NULL, 0);
+        if (n < 0) {
+            total = total ? total : n;
+            break;
+        }
+        if (n == 0) break;
+        total += n;
+        done += (size_t)n;
+        if ((size_t)n < want) break;
     }
-    ssize_t ret = socket_sendto((int)fd, kbuf, chunk, flags, NULL, 0);
-    if (kbuf) kfree(kbuf);
-    return (int64_t)ret;
+    kfree(kbuf);
+    return total;
 }
 
 static int64_t sys_recv(int64_t fd, void* buf, size_t len, int flags) {
     if (!buf && len > 0) return -EFAULT;
     if (buf && len > 0 && !access_ok(buf, len)) return -EFAULT;
-    /* Bounce buffer for SMAP safety. */
-    size_t chunk = len > 4096 ? 4096 : len;
-    void* kbuf = NULL;
-    if (len > 0) {
-        kbuf = kmalloc(chunk);
-        if (!kbuf) return -ENOMEM;
-    }
-    ssize_t ret = socket_recvfrom((int)fd, kbuf, chunk, flags, NULL, NULL);
-    if (kbuf && ret > 0) {
-        if (copy_to_user(buf, kbuf, (size_t)ret) < 0) {
-            kfree(kbuf);
-            return -EFAULT;
+    if (len == 0) return 0;
+    void* kbuf = kmalloc(4096);
+    if (!kbuf) return -ENOMEM;
+    int64_t total = 0;
+    size_t done = 0;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > 4096) want = 4096;
+        ssize_t n = socket_recvfrom((int)fd, kbuf, want, flags, NULL, NULL);
+        if (n < 0) {
+            total = total ? total : n;
+            break;
         }
+        if (n == 0) break;
+        if (copy_to_user((uint8_t*)buf + done, kbuf, (size_t)n) < 0) {
+            total = total ? total : -EFAULT;
+            break;
+        }
+        total += n;
+        done += (size_t)n;
+        if ((size_t)n < want) break;
     }
-    if (kbuf) kfree(kbuf);
-    return (int64_t)ret;
+    kfree(kbuf);
+    return total;
 }
 
 static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
@@ -2103,32 +2121,16 @@ static int64_t sys_truncate(const char* path, long length) {
     if (rc < 0) return -EFAULT;
     if (rc == 0 || kpath[0] == '\0') return -EINVAL;
     if (length < 0) return -EINVAL;
-
-    /* For memfs: stat to find the file, then rewrite the size.
-     * vfs_truncate doesn't exist yet, so we open+write+close to grow
-     * (writing zeros) or open+splice to shrink. The simplest correct
-     * behavior for memfs is to use vfs_open then vfs_lseek+vfs_write
-     * to extend, or just directly manipulate the underlying mem_file.
-     * Since the VFS doesn't expose a truncate API, we use a small
-     * helper: stat to verify existence, then re-open with O_TRUNC
-     * only if length==0; otherwise -ENOSYS for non-zero length.
-     * This is a documented partial implementation. */
+    /* Resolve relative paths against current->cwd like sys_open does. */
+    const char* eff = kpath;
+    const char* resolved = resolve_against_cwd(kpath);
+    if (resolved) eff = resolved;
+    else if (kpath[0] != '/') return -ENAMETOOLONG;
     struct stat kst;
     memset(&kst, 0, sizeof(kst));
-    if (vfs_stat(kpath, &kst) < 0) return -ENOENT;
-    if (length == 0) {
-        int fd = vfs_open(kpath, 0);
-        if (fd < 0) return -EIO;
-        /* O_TRUNC semantics: re-open with O_TRUNC to truncate to 0. */
-        vfs_close(fd);
-        /* vfs_open doesn't truncate on existing files without O_TRUNC
-         * flag — re-open with O_TRUNC explicitly. */
-        fd = vfs_open(kpath, 0x0020 /* O_TRUNC */);
-        if (fd >= 0) vfs_close(fd);
-        return 0;
-    }
-    /* Non-zero truncate not supported without a vfs_truncate helper. */
-    return -ENOSYS;
+    if (vfs_stat(eff, &kst) < 0) return -ENOENT;
+    if (vfs_truncate(eff, (off_t)length) < 0) return -EINVAL;
+    return 0;
 }
 
 static int64_t sys_ftruncate(int fd, long length) {
@@ -2139,15 +2141,10 @@ static int64_t sys_ftruncate(int fd, long length) {
     struct fd_entry* e = &cur->fds[fd];
     if (e->type == FD_UNUSED) return -EBADF;
     if (e->type != FD_VFS) return -EINVAL;
-
-    /* Same partial behavior as sys_truncate: only length==0 supported. */
-    if (length == 0) {
-        /* Seek to end and truncate via VFS — there's no ftruncate API
-         * exposed, so we just return 0 (the underlying file is unchanged).
-         * Document as a stub. */
-        return 0;
-    }
-    return -ENOSYS;
+    if (vfs_ftruncate(e->resource, (off_t)length) < 0) return -EINVAL;
+    /* Clamp per-process offset if it lies beyond new EOF. */
+    if (e->offset > length) e->offset = length;
+    return 0;
 }
 
 static int64_t sys_chown(const char* path, int uid, int gid) {
@@ -2157,14 +2154,11 @@ static int64_t sys_chown(const char* path, int uid, int gid) {
     int rc = strncpy_from_user(kpath, path, sizeof(kpath));
     if (rc < 0) return -EFAULT;
     if (rc == 0 || kpath[0] == '\0') return -EINVAL;
-    /* W3-B: single-user root-only system. mem_file has no uid/gid
-     * fields, so we accept the call and return 0 (fake success) to
-     * keep callers happy. When per-file ownership is added, this
-     * becomes a real metadata write. */
-    (void)uid; (void)gid;
     struct stat kst;
     memset(&kst, 0, sizeof(kst));
     if (vfs_stat(kpath, &kst) < 0) return -ENOENT;
+    /* Now that mem_file stores uid/gid, persist them. */
+    if (vfs_chown(kpath, (uint32_t)uid, (uint32_t)gid) < 0) return -ENOENT;
     return 0;
 }
 

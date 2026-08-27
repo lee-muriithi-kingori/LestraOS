@@ -115,4 +115,8 @@ int  fat32_update_entry_size(const char *name83, uint32_t new_size);
 /* Update both cluster and size of a directory entry on disk. */
 int  fat32_update_entry(const char *name83, uint32_t new_cluster, uint32_t new_size);
 
+/* Update entry size/cluster in a specific directory (for subdir files). */
+int  fat32_update_entry_in_dir(uint32_t dir_cluster, const char *name83,
+                                uint32_t new_cluster, uint32_t new_size);
+
 #endif /* LESTRA_FAT32_H */

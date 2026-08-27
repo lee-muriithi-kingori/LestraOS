@@ -125,6 +125,10 @@ static void theme_load(void) {
 }
 
 static void theme_save(void) {
+    /* Ensure /etc exists — theme_save may be the first writer after boot
+     * (VFS is memfs-backed, /etc is volatile). vfs_mkdir fails harmlessly
+     * if the directory already exists, matching settings_persist() pattern. */
+    vfs_mkdir("/etc", 0755);
     int fd = vfs_open(THEME_PATH, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) return;
     char buf[16];

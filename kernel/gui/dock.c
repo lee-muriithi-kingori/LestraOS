@@ -58,6 +58,7 @@ extern struct widget* about_create(int x, int y);
 extern struct widget* help_create(int x, int y);
 extern struct widget* editor_create(int x, int y);
 extern struct widget* media_create(int x, int y);
+extern struct widget* file_explorer_create(int x, int y);
 extern void compositor_add(struct widget* w);
 extern void compositor_bring_to_front(struct widget* w);
 extern void compositor_quit(void);
@@ -68,6 +69,7 @@ static struct widget* w_about = NULL;
 static struct widget* w_help = NULL;
 static struct widget* w_editor = NULL;
 static struct widget* w_media = NULL;
+static struct widget* w_files = NULL;
 
 static int dock_hovered = -1;
 
@@ -95,8 +97,16 @@ static void dock_launch(int idx) {
             if (!w_media) { w_media = media_create(250, 100); compositor_add(w_media); }
             w = w_media; break;
         case 4:
-            /* Files — not yet implemented as a card */
-            return;
+            /* Files — launches the VFS-backed file explorer. The widget is
+             * created lazily and reused; VFS (memfs) always supports the
+             * "/" directory so no extra capability check is needed. If
+             * creation fails (OOM) w_files stays NULL and the dock click
+             * is a no-op rather than a crash. */
+            if (!w_files) {
+                w_files = file_explorer_create(200, 60);
+                if (w_files) compositor_add(w_files);
+            }
+            w = w_files; break;
         case 5:
             if (!w_about) { w_about = about_create((int)fb_w/2 - 190, 200); compositor_add(w_about); }
             w = w_about; break;

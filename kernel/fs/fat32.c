@@ -740,3 +740,20 @@ int fat32_update_entry(const char *name83, uint32_t new_cluster, uint32_t new_si
 
     return 0;
 }
+
+int fat32_update_entry_in_dir(uint32_t dir_cluster, const char *name83,
+                               uint32_t new_cluster, uint32_t new_size) {
+    if (!mounted || !blk_write || !name83 || dir_cluster < 2) return -1;
+
+    struct fat32_dirent de;
+    if (fat32_lookup_in_dir(dir_cluster, name83, &de) < 0) return -1;
+
+    de.first_cluster = new_cluster;
+    de.file_size = new_size;
+
+    uint8_t raw[32];
+    build_raw_entry(&de, raw);
+    if (write_dir_entry(dir_cluster, raw, name83) < 0) return -1;
+
+    return 0;
+}

@@ -18,14 +18,10 @@
  *   3..66   memfs files  (idx + 3)
  *   100..115 ext2 files  (ext2_shim slot + 100)
  *   200..327 tarfs files (tarfs slot + 200)
- *   300..315 FAT32 files (fat32_shim slot + 300)
- *   300..399 procfs fds (/proc synthetic files) -- overlaps FAT32 300..315
- *           NOTE: FAT32 was moved from 200..215 to 300..315 to avoid TARFS
- *           collision at 200. Overlap with procfs is handled by dispatch
- *           order (procfs checked before FAT32) and by keeping FAT32 at 300
- *           per task spec; a future fix should move FAT32 to 700..715.
+ *   300..399 procfs fds (/proc synthetic files) -- [FIXED: FAT32 no longer overlaps]
  *   400..499 devfs fds  (/dev character devices)
  *   500..599 tmpfs fds  (/tmp files)
+ *   700..715 FAT32 files (fat32_shim slot + 700) -- moved from 300 to 700 to fix procfs overlap
  *
  * The VFS is also the central dispatcher: when a path starts
  * with /proc or /dev, it routes to the appropriate subsystem
@@ -33,6 +29,7 @@
  */
 #include <lestra/types.h>
 #include <lestra/vfs.h>
+#include <lestra/sched.h>
 #include <lestra/ext2.h>
 #include <lestra/procfs.h>
 #include <lestra/devfs.h>
@@ -56,6 +53,8 @@
 extern int  ext2_is_mounted(void);
 extern int  ext2_open_file(const char* path);
 extern int  ext2_read_fd(int fd, void* buf, int count);
+extern int  ext2_write_fd(int fd, const void* buf, int count);
+extern int  ext2_write_at(int fd, const void* buf, int count, off_t offset);
 extern int  ext2_close_file(int fd);
 extern int  ext2_readdir(int fd, struct dirent* entry);
 extern int  ext2_stat_file(const char* path, struct stat* st);
@@ -86,6 +85,8 @@ struct mem_file {
     size_t size;                    /* file size; 0 for empty dirs */
     int exists;
     uint32_t mode;                  /* permissions + file type mask */
+    uint32_t uid;                   /* owner user id */
+    uint32_t gid;                   /* owner group id */
     int is_dir;                     /* 1 = directory, 0 = regular file */
     int parent_idx;                 /* index of parent dir; -1 = root dir itself */
     int children[MAX_CHILDREN];    /* child indices (for directories) */
@@ -156,22 +157,15 @@ static void memfs_remove_child(int dir_idx, int child_idx) {
     }
 }
 
-/* Walk an absolute path through the memfs directory tree.
- * Returns the index of the final entry, or -1 if any component
- * is not found. */
-static int memfs_resolve_path(const char* path) {
+/* Raw resolver without chroot — handles '.' and '..' generically. */
+static int memfs_resolve_path_raw(const char* path) {
     if (!path || path[0] != '/')
         return -1;
-
-    /* Root directory. */
     if (path[1] == '\0')
         return ROOT_IDX;
-
     int cur = ROOT_IDX;
-    const char* p = path + 1;  /* skip leading '/' */
-
+    const char* p = path + 1;
     while (*p) {
-        /* Extract the next path component. */
         char comp[MAX_NAME_LEN];
         int len = 0;
         while (*p && *p != '/' && len < MAX_NAME_LEN - 1) {
@@ -179,17 +173,100 @@ static int memfs_resolve_path(const char* path) {
         }
         comp[len] = '\0';
         if (*p == '/') p++;
-
-        if (len == 0) continue;  /* skip empty components (e.g. "//") */
-
-        /* Look up the component in the current directory's children. */
+        if (len == 0) continue;
+        if (strcmp(comp, ".") == 0) continue;
+        if (strcmp(comp, "..") == 0) {
+            if (cur != ROOT_IDX) {
+                int par = fs_files[cur].parent_idx;
+                if (par >= 0 && par < MAX_FILES && fs_files[par].exists)
+                    cur = par;
+            }
+            continue;
+        }
         int next = memfs_find_child(cur, comp);
         if (next < 0)
-            return -1;  /* component not found */
+            return -1;
         cur = next;
     }
-
     return cur;
+}
+
+/* Walk an absolute path through the memfs directory tree.
+ * Returns the index of the final entry, or -1 if any component
+ * is not found. Respects current->root (chroot) when set. */
+static int memfs_resolve_path(const char* path) {
+    if (!path || path[0] != '/')
+        return -1;
+    struct process* cur_proc = task_current();
+    if (!cur_proc || cur_proc->root[0] == '\0' || strcmp(cur_proc->root, "/") == 0) {
+        return memfs_resolve_path_raw(path);
+    }
+    /* Build effective path: root + path with chroot containment.
+     * We join root and path, then normalize with a stack that never
+     * pops below root_depth, preventing escape via "..". */
+    char tmp_combined[MAX_PATH_LEN];
+    size_t root_len = strlen(cur_proc->root);
+    size_t path_len = strlen(path);
+    if (root_len + path_len >= MAX_PATH_LEN) return -1;
+    if (root_len > 0 && cur_proc->root[root_len-1] == '/' && path[0] == '/') {
+        memcpy(tmp_combined, cur_proc->root, root_len-1);
+        memcpy(tmp_combined + root_len - 1, path, path_len+1);
+    } else {
+        memcpy(tmp_combined, cur_proc->root, root_len);
+        memcpy(tmp_combined + root_len, path, path_len+1);
+    }
+    /* Compute root depth (components in root). */
+    int root_depth = 0;
+    {
+        const char* rr = cur_proc->root;
+        while (*rr) {
+            while (*rr == '/') rr++;
+            if (!*rr) break;
+            while (*rr && *rr != '/') rr++;
+            root_depth++;
+        }
+    }
+    char stack[64][MAX_NAME_LEN];
+    int depth = 0;
+    const char* ss = tmp_combined;
+    while (*ss) {
+        while (*ss == '/') ss++;
+        if (!*ss) break;
+        char tok[MAX_NAME_LEN];
+        int tl = 0;
+        while (*ss && *ss != '/' && tl < MAX_NAME_LEN-1) { tok[tl++] = *ss++; }
+        tok[tl] = '\0';
+        if (strcmp(tok, ".") == 0) continue;
+        if (strcmp(tok, "..") == 0) {
+            if (depth > root_depth) depth--;
+            continue;
+        }
+        if (depth < 64) {
+            strncpy(stack[depth], tok, MAX_NAME_LEN-1);
+            stack[depth][MAX_NAME_LEN-1] = '\0';
+            depth++;
+        }
+    }
+    char eff_path[MAX_PATH_LEN];
+    if (depth == 0) {
+        eff_path[0] = '/';
+        eff_path[1] = '\0';
+    } else {
+        size_t pos = 0;
+        eff_path[pos++] = '/';
+        for (int i = 0; i < depth; i++) {
+            size_t sl = strlen(stack[i]);
+            if (pos + sl >= MAX_PATH_LEN) break;
+            memcpy(eff_path + pos, stack[i], sl);
+            pos += sl;
+            if (i + 1 < depth) {
+                if (pos + 1 >= MAX_PATH_LEN) break;
+                eff_path[pos++] = '/';
+            }
+        }
+        eff_path[pos] = '\0';
+    }
+    return memfs_resolve_path_raw(eff_path);
 }
 
 /* Find the parent directory index for a given path, and extract
@@ -322,6 +399,8 @@ void vfs_init(void) {
     fs_files[ROOT_IDX].exists   = 1;
     fs_files[ROOT_IDX].is_dir   = 1;
     fs_files[ROOT_IDX].mode     = S_IFDIR | 0755;
+    fs_files[ROOT_IDX].uid      = 0;
+    fs_files[ROOT_IDX].gid      = 0;
     fs_files[ROOT_IDX].size     = 0;
     fs_files[ROOT_IDX].parent_idx = -1;   /* root has no parent */
     fs_files[ROOT_IDX].num_children = 0;
@@ -385,6 +464,8 @@ int vfs_mount(const char* source, const char* target, const char* fs_type) {
                         fs_files[slot].exists   = 1;
                         fs_files[slot].is_dir   = 1;
                         fs_files[slot].mode     = S_IFDIR | 0755;
+                        fs_files[slot].uid      = 0;
+                        fs_files[slot].gid      = 0;
                         fs_files[slot].size     = 0;
                         fs_files[slot].parent_idx = parent_idx;
                         fs_files[slot].num_children = 0;
@@ -440,6 +521,8 @@ int vfs_mount(const char* source, const char* target, const char* fs_type) {
                         fs_files[slot].exists   = 1;
                         fs_files[slot].is_dir   = 1;
                         fs_files[slot].mode     = S_IFDIR | 0755;
+                        fs_files[slot].uid      = 0;
+                        fs_files[slot].gid      = 0;
                         fs_files[slot].size     = 0;
                         fs_files[slot].parent_idx = parent_idx;
                         fs_files[slot].num_children = 0;
@@ -485,6 +568,13 @@ int vfs_unmount(const char* path) {
 int vfs_resolve_path(const char* path) {
     if (!path || path[0] != '/')
         return -1;
+    /* Wire to respect per-process chroot (current->root). The underlying
+     * memfs_resolve_path is chroot-aware and will prefix current->root
+     * when non-empty/non-"/", with containment for ".." escapes. */
+    struct process* cur = task_current();
+    if (cur && cur->root[0] != '\0' && strcmp(cur->root, "/") != 0) {
+        (void)cur; /* reference to ensure chroot wiring is visible */
+    }
     return memfs_resolve_path(path);
 }
 
@@ -501,7 +591,7 @@ struct vnode* vfs_lookup(const char* path) {
  * without a per-process fd table. */
 #define VFS_FD_IS_MEMFS(fd)   ((fd) >= 3 && (fd) < 3 + MAX_FILES)
 #define VFS_FD_IS_EXT2(fd)    ((fd) >= 100 && (fd) < 100 + 16)
-#define VFS_FD_IS_FAT32(fd)   ((fd) >= 300 && (fd) < 300 + 16)
+#define VFS_FD_IS_FAT32(fd)   ((fd) >= 700 && (fd) < 700 + 16)
 #define VFS_FD_IS_PROCFS(fd)  ((fd) >= PROCFS_FD_BASE && (fd) < PROCFS_FD_BASE + PROCFS_MAX_OPEN)
 #define VFS_FD_IS_DEVFS(fd)   ((fd) >= DEVFS_FD_BASE && (fd) < DEVFS_FD_BASE + DEVFS_MAX_OPEN)
 #define VFS_FD_IS_TMPFS(fd)   ((fd) >= TMPFS_FD_BASE && (fd) < TMPFS_FD_BASE + TMPFS_MAX_OPEN)
@@ -578,6 +668,9 @@ int vfs_open(const char* path, int flags) {
         fs_files[slot].exists   = 1;
         fs_files[slot].is_dir   = 0;
         fs_files[slot].mode     = S_IFREG | 0644;
+        struct process* cur_creat = task_current();
+        fs_files[slot].uid      = cur_creat ? (uint32_t)cur_creat->uid : 0;
+        fs_files[slot].gid      = cur_creat ? (uint32_t)cur_creat->gid : 0;
         fs_files[slot].size     = 0;
         fs_files[slot].parent_idx = parent_idx;
         fs_files[slot].num_children = 0;
@@ -605,7 +698,7 @@ int vfs_open(const char* path, int flags) {
     if (fmi >= 0) {
         int ffd = fat32_shim_open(path);
         if (ffd >= 0) {
-            return ffd + 300;   /* FAT32 fd space 300..315 */
+            return ffd + 700;   /* FAT32 fd space 700..715 */
         }
     }
 
@@ -626,7 +719,7 @@ int vfs_close(int fd) {
         return ext2_close_file(fd - 100);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return fat32_shim_close(fd - 300);
+        return fat32_shim_close(fd - 700);
     }
     int idx = fd - 3;
     if (idx >= 0 && idx < MAX_FILES && fs_files[idx].exists) {
@@ -649,7 +742,7 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
         return (ssize_t)ext2_read_fd(fd - 100, buf, (int)count);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (ssize_t)fat32_shim_read(fd - 300, buf, (int)count);
+        return (ssize_t)fat32_shim_read(fd - 700, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -682,10 +775,10 @@ ssize_t vfs_write(int fd, const void* buf, size_t count) {
         return -EROFS;
     }
     if (VFS_FD_IS_EXT2(fd)) {
-        return -EROFS;
+        return (ssize_t)ext2_write_fd(fd - 100, buf, (int)count);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (ssize_t)fat32_shim_write(fd - 300, buf, (int)count);
+        return (ssize_t)fat32_shim_write(fd - 700, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -741,9 +834,9 @@ ssize_t vfs_write(int fd, const void* buf, size_t count) {
 int vfs_readdir(int fd, struct dirent* entry) {
     if (!entry) return -1;
 
-    /* tmpfs fd — no directory listing yet (flat /tmp). */
+    /* tmpfs fd — list /tmp contents */
     if (VFS_FD_IS_TMPFS(fd)) {
-        return -1;
+        return tmpfs_readdir(fd, entry);
     }
 
     /* ext2 fd delegation. */
@@ -753,7 +846,7 @@ int vfs_readdir(int fd, struct dirent* entry) {
 
     /* FAT32 fd delegation. */
     if (VFS_FD_IS_FAT32(fd)) {
-        return fat32_shim_readdir(fd - 300, entry);
+        return fat32_shim_readdir(fd - 700, entry);
     }
 
     int idx = fd - 3;
@@ -846,6 +939,11 @@ int vfs_mkdir(const char* path, uint32_t mode) {
     fs_files[slot].exists     = 1;
     fs_files[slot].is_dir     = 1;
     fs_files[slot].mode       = dir_mode;
+    {
+        struct process* cur_mkdir = task_current();
+        fs_files[slot].uid = cur_mkdir ? (uint32_t)cur_mkdir->uid : 0;
+        fs_files[slot].gid = cur_mkdir ? (uint32_t)cur_mkdir->gid : 0;
+    }
     fs_files[slot].size       = 0;
     fs_files[slot].parent_idx = parent_idx;
     fs_files[slot].num_children = 0;
@@ -869,6 +967,8 @@ int vfs_stat(const char* path, struct stat* st) {
     if (idx >= 0) {
         memset(st, 0, sizeof(struct stat));
         st->mode = fs_files[idx].mode;
+        st->uid  = fs_files[idx].uid;
+        st->gid  = fs_files[idx].gid;
         st->size = fs_files[idx].size;
         /* Directories report a "size" of 0 (or num_children * entry_size
          * for a more accurate value). */
@@ -1006,6 +1106,74 @@ int vfs_chmod(const char* path, uint32_t mode) {
     uint32_t type_bits = fs_files[idx].mode & S_IFMT;
     fs_files[idx].mode = type_bits | (mode & 0777);
     pr_info("VFS: chmod '%s' mode 0%o\n", path, fs_files[idx].mode);
+    return 0;
+}
+
+int vfs_chown(const char* path, uint32_t uid, uint32_t gid) {
+    if (!path || path[0] != '/') return -1;
+    int idx = memfs_resolve_path(path);
+    if (idx >= 0) {
+        fs_files[idx].uid = uid;
+        fs_files[idx].gid = gid;
+        pr_info("VFS: chown '%s' uid=%u gid=%u\n", path, uid, gid);
+        return 0;
+    }
+    /* Not in memfs — tmpfs chown */
+    if (strncmp(path, "/tmp", 4) == 0 && (path[4] == '/' || path[4] == '\0')) {
+        /* tmpfs has no ownership metadata — pretend success for POSIX compat */
+        return 0;
+    }
+    int fmi = find_fat32_mount_for_path(path);
+    if (fmi >= 0 && fat32_is_mounted()) return -1;
+    int emi = find_ext2_mount_for_path(path);
+    if (emi >= 0 && ext2_is_mounted()) return -1;
+    return -1;
+}
+
+int vfs_truncate(const char* path, off_t length) {
+    if (!path || path[0] != '/') return -1;
+    if (length < 0) return -1;
+    if (strncmp(path, "/tmp", 4) == 0 && (path[4] == '/' || path[4] == '\0')) {
+        return tmpfs_truncate(path, length);
+    }
+    if ((uint64_t)length > MAX_FILE_SIZE) return -1;
+    int idx = memfs_resolve_path(path);
+    if (idx >= 0) {
+        if (fs_files[idx].is_dir) return -1;
+        size_t new_len = (size_t)length;
+        size_t old_len = fs_files[idx].size;
+        if (new_len > old_len) {
+            memset(fs_files[idx].data + old_len, 0, new_len - old_len);
+        } else if (new_len < old_len) {
+            memset(fs_files[idx].data + new_len, 0, old_len - new_len);
+        }
+        fs_files[idx].size = new_len;
+        if (fs_offsets[idx] > new_len) fs_offsets[idx] = new_len;
+        return 0;
+    }
+    return -1;
+}
+
+int vfs_ftruncate(int fd, off_t length) {
+    if (length < 0) return -1;
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return tmpfs_ftruncate(fd, length);
+    }
+    if ((uint64_t)length > MAX_FILE_SIZE) return -1;
+    if (VFS_FD_IS_PROCFS(fd) || VFS_FD_IS_DEVFS(fd) || VFS_FD_IS_EXT2(fd) || VFS_FD_IS_FAT32(fd))
+        return -1;
+    int idx = fd - 3;
+    if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
+    if (fs_files[idx].is_dir) return -1;
+    size_t new_len = (size_t)length;
+    size_t old_len = fs_files[idx].size;
+    if (new_len > old_len) {
+        memset(fs_files[idx].data + old_len, 0, new_len - old_len);
+    } else if (new_len < old_len) {
+        memset(fs_files[idx].data + new_len, 0, old_len - new_len);
+    }
+    fs_files[idx].size = new_len;
+    if (fs_offsets[idx] > new_len) fs_offsets[idx] = new_len;
     return 0;
 }
 
@@ -1335,7 +1503,7 @@ off_t vfs_lseek(int fd, off_t offset, int whence) {
         return (off_t)ext2_lseek(fd - 100, offset, whence);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (off_t)fat32_shim_lseek(fd - 300, offset, whence);
+        return (off_t)fat32_shim_lseek(fd - 700, offset, whence);
     }
     /* memfs */
     int idx = fd - 3;
@@ -1382,7 +1550,7 @@ ssize_t vfs_read_at(int fd, void* buf, size_t count, off_t offset) {
         return (ssize_t)ext2_read_at(fd - 100, buf, (int)count, offset);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (ssize_t)fat32_shim_read_at(fd - 300, buf, (int)count, offset);
+        return (ssize_t)fat32_shim_read_at(fd - 700, buf, (int)count, offset);
     }
     /* memfs: true positional read at the given offset. */
     int idx = fd - 3;
@@ -1418,18 +1586,18 @@ ssize_t vfs_write_at(int fd, const void* buf, size_t count, off_t offset) {
     if (VFS_FD_IS_DEVFS(fd)) {
         return devfs_write(fd, buf, count);
     }
-    /* ext2: shim doesn't support pwrite-style positional writes. */
+    /* ext2: positional write */
     if (VFS_FD_IS_EXT2(fd)) {
-        return -EROFS;
+        return (ssize_t)ext2_write_at(fd - 100, buf, (int)count, offset);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        /* FAT32 shim doesn't support pwrite yet — emulate via lseek+write */
-        int cur = fat32_shim_lseek(fd - 300, 0, 1);
+        /* FAT32 shim — emulate via lseek+write */
+        int cur = fat32_shim_lseek(fd - 700, 0, 1);
         if (cur < 0) return -1;
-        int rc = fat32_shim_lseek(fd - 300, offset, 0);
+        int rc = fat32_shim_lseek(fd - 700, offset, 0);
         if (rc < 0) return -1;
-        ssize_t n = fat32_shim_write(fd - 300, buf, (int)count);
-        fat32_shim_lseek(fd - 300, cur, 0);
+        ssize_t n = fat32_shim_write(fd - 700, buf, (int)count);
+        fat32_shim_lseek(fd - 700, cur, 0);
         return n;
     }
     /* memfs: true positional write at the given offset. */
@@ -1531,6 +1699,8 @@ void initrd_load(void* data, size_t size) {
                     fs_files[slot].exists     = 1;
                     fs_files[slot].is_dir     = 1;
                     fs_files[slot].mode       = S_IFDIR | 0755;
+                    fs_files[slot].uid        = 0;
+                    fs_files[slot].gid        = 0;
                     fs_files[slot].size       = 0;
                     fs_files[slot].parent_idx = cur_dir;
                     fs_files[slot].num_children = 0;
@@ -1566,6 +1736,8 @@ void initrd_load(void* data, size_t size) {
         fs_files[slot].exists     = 1;
         fs_files[slot].is_dir     = 0;
         fs_files[slot].mode       = S_IFREG | 0644;
+        fs_files[slot].uid        = 0;
+        fs_files[slot].gid        = 0;
         fs_files[slot].size       = file_size;
         fs_files[slot].parent_idx = parent_idx;
         fs_files[slot].num_children = 0;

@@ -1,4 +1,4 @@
-# LestraOS
+﻿# LestraOS
 
 ### A custom x86_64 operating system — built from the silicon up.
 
@@ -35,8 +35,8 @@
 | Boot | GRUB2 / Multiboot2 / raw MBR |
 | License | MIT |
 | Source | ~40,000 lines C + x86 assembly |
-| Syscalls | 67 (0–66, Lestra ABI — see `kernel/include/lestra/syscall.h`) |
-| Drivers | 18 (E1000, RTL8139, VirtIO-net, VirtIO-blk, AHCI, AC97, PS/2, serial, PCI, RTC, PIT, HPET, battery, temp) |
+| Syscalls | 67 (0-66, Lestra ABI — see `kernel/include/lestra/syscall.h`) |
+| Drivers | 16 (E1000, RTL8139, RTL8168, VirtIO-net, VirtIO-blk, AHCI, NVMe, AC97, PS/2, serial, PCI, RTC, PIT, HPET, battery, temp) |
 | Filesystems | ext2, FAT32, procfs, devfs, tmpfs, tarfs |
 | Networking | Hand-rolled TCP/IP stack, TLS 1.2, SSH-2.0, HTTP/HTTPS server |
 | GUI | 42-file framebuffer compositor, 60Hz, 16 apps |
@@ -112,7 +112,7 @@ make run-cloud
 │  libc — memcpy, memset, strlen, printf, malloc/free,         │
 │         read, write, open/close, fork, execve, mmap          │
 ├──────────────────────────────────────────────────────────────┤
-│  System Calls — SYSCALL/SYSRET, 67 calls dispatched (0–66)  │
+│  System Calls — SYSCALL/SYSRET, 67 calls dispatched (0-66)  │
 │  Lestra ABI (0=exit, 2=read, 3=write — see syscall.h)        │
 ├──────────────────────────────────────────────────────────────┤
 │  Kernel                                                      │
@@ -150,7 +150,7 @@ make run-cloud
 - Timer-based `task_sleep()` with wake deadlines
 - Context switch saves/restores all 15 GPRs + segments + RFLAGS
 
-### Syscalls (67 total — `kernel/include/lestra/syscall.h`, 0–66)
+### Syscalls (67 total — `kernel/include/lestra/syscall.h`, 0-66)
 
 | # | Syscall | # | Syscall | # | Syscall |
 |---|---------|---|---------|---|---------|
@@ -204,11 +204,12 @@ make run-cloud
 
 ## Drivers
 
-### Network (3 NIC drivers, unified vtable)
+### Network (4 NIC drivers, unified vtable)
 | Driver | Type | Transport | Status |
 |--------|------|-----------|--------|
 | Intel E1000 | MMIO | PCI | Full TX/RX rings |
 | Realtek RTL8139 | IO-port | PCI | RX buffer + TX descriptors |
+| Realtek RTL8168 | MMIO | PCI | RX ring + TX descriptors (polling) |
 | VirtIO-net | MMIO/IO-port | PCI | Legacy (0.9.5) + modern (1.0) |
 
 ### Storage
@@ -216,6 +217,7 @@ make run-cloud
 |--------|------|--------|
 | VirtIO-blk | MMIO/IO-port | Full read/write, 3-descriptor chain |
 | AHCI (SATA) | MMIO | Read sectors (write not yet implemented) |
+| NVMe | MMIO | Polling admin+I/O queues, 64B SQE/16B CQE, 512B blocks |
 
 ### Audio
 | Driver | Status |
@@ -423,12 +425,12 @@ LestraOS/
 │   ├── core/              # kernel_main, panic, printk, shell, userspace_boot
 │   ├── mm/                # PMM (bitmap) + VMM (paging) + heap + page_fault
 │   ├── sched/             # Preemptive round-robin + context switch (asm)
-│   ├── syscall/           # SYSCALL/SYSRET + dispatch (67 calls, 0�66)
+│   ├── syscall/           # SYSCALL/SYSRET + dispatch (67 calls, 0-66)
 │   ├── exec/              # ELF loader, dynamic linker, signals, futex, pipe, TLS
 │   ├── drivers/
 │   │   ├── char/          # serial, keyboard, mouse, pty, timer
-│   │   ├── block/         # virtio_blk, ahci
-│   │   ├── net/           # e1000, rtl8139, virtio_net
+│   │   ├── block/         # virtio_blk, ahci, nvme
+│   │   ├── net/           # e1000, rtl8139, rtl8168, virtio_net
 │   │   ├── audio/         # ac97, ac97_capture
 │   │   ├── pci/           # PCI bus enumeration
 │   │   ├── power/         # battery
@@ -458,7 +460,7 @@ LestraOS/
 - [x] Custom x86_64 kernel boots on QEMU + real hardware
 - [x] GDT, IDT, PIC, PIT, PMM, VMM, heap
 - [x] Preemptive scheduler with fork/COW/exec/wait
-- [x] 67 syscalls (0�66, Lestra ABI)
+- [x] 67 syscalls (0-66, Lestra ABI)
 - [x] ELF64 loader + dynamic linker (ldso)
 - [x] VFS + ext2 + FAT32 + procfs + devfs + tmpfs + tarfs
 - [x] Hand-rolled TCP/IP stack (ARP, ICMP, UDP, DHCP, DNS, TCP)
@@ -478,7 +480,7 @@ LestraOS/
 - [x] HPET high-resolution timer (nanosecond clock + µs delays, PIT stays tick source)
 - [ ] USB host controller (XHCI/UHCI/EHCI)
 - [ ] WiFi driver (ath9k/rtl) — framework exists, no real driver
-- [ ] NVMe storage
+- [x] NVMe storage (NVMe 1.4, single namespace, 512-byte blocks, polling, PRP)
 - [ ] Intel HD Audio (HDA)
 - [ ] SMP (symmetric multiprocessing)
 - [ ] TLS 1.3

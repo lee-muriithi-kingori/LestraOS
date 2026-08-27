@@ -28,9 +28,10 @@ struct tmpfs_inode {
 
 struct tmpfs_open {
     int   used;
-    int   inode_idx;
+    int   inode_idx;   /* -1 for directory handle */
     size_t pos;
     int   flags;
+    int   is_dir;
 };
 
 static struct tmpfs_inode tmpfs_inodes[TMPFS_MAX_FILES];
@@ -76,6 +77,20 @@ static int alloc_inode(const char* path) {
 }
 
 int tmpfs_open(const char* path, int flags) {
+    /* Directory open for /tmp itself */
+    if (path && (strcmp(path, "/tmp") == 0 || strcmp(path, "/tmp/") == 0)) {
+        for (int i = 0; i < TMPFS_MAX_OPEN; i++) {
+            if (!tmpfs_opens[i].used) {
+                tmpfs_opens[i].used = 1;
+                tmpfs_opens[i].inode_idx = -1;
+                tmpfs_opens[i].pos = 0;
+                tmpfs_opens[i].flags = flags;
+                tmpfs_opens[i].is_dir = 1;
+                return i + TMPFS_FD_BASE;
+            }
+        }
+        return -1;
+    }
     int idx = find_inode(path);
     if (idx < 0 && (flags & O_CREAT)) {
         idx = alloc_inode(path);
@@ -94,6 +109,7 @@ int tmpfs_open(const char* path, int flags) {
             tmpfs_opens[i].inode_idx = idx;
             tmpfs_opens[i].pos = (flags & O_APPEND) ? tmpfs_inodes[idx].size : 0;
             tmpfs_opens[i].flags = flags;
+            tmpfs_opens[i].is_dir = 0;
             tmpfs_inodes[idx].refcount++;
             return i + TMPFS_FD_BASE;
         }
@@ -104,6 +120,11 @@ int tmpfs_open(const char* path, int flags) {
 int tmpfs_close(int fd) {
     fd -= TMPFS_FD_BASE;
     if (fd < 0 || fd >= TMPFS_MAX_OPEN || !tmpfs_opens[fd].used) return -1;
+    if (tmpfs_opens[fd].is_dir) {
+        tmpfs_opens[fd].used = 0;
+        tmpfs_opens[fd].is_dir = 0;
+        return 0;
+    }
     int idx = tmpfs_opens[fd].inode_idx;
     if (idx >= 0 && idx < TMPFS_MAX_FILES && tmpfs_inodes[idx].used) {
         tmpfs_inodes[idx].refcount--;
@@ -111,6 +132,7 @@ int tmpfs_close(int fd) {
          * unlink (which we don't implement yet). Just decrement. */
     }
     tmpfs_opens[fd].used = 0;
+    tmpfs_opens[fd].is_dir = 0;
     return 0;
 }
 
@@ -199,13 +221,92 @@ int tmpfs_unlink(const char* path) {
 }
 
 int tmpfs_stat(const char* path, struct stat* st) {
+    if (!path || !st) return -1;
+    /* /tmp directory itself */
+    if (strcmp(path, "/tmp") == 0 || strcmp(path, "/tmp/") == 0) {
+        memset(st, 0, sizeof(*st));
+        st->mode = S_IFDIR | 0755;
+        st->size = 0;
+        return 0;
+    }
     int idx = find_inode(path);
     if (idx < 0) return -1;
-    if (!st) return -1;
     memset(st, 0, sizeof(*st));
     st->mode = S_IFREG | 0644;
     st->size = tmpfs_inodes[idx].size;
     return 0;
+}
+
+int tmpfs_truncate(const char* path, off_t length) {
+    if (!path) return -1;
+    if (length < 0 || (uint64_t)length > TMPFS_MAX_FILE_SIZE) return -1;
+    int idx = find_inode(path);
+    if (idx < 0) return -1;
+    if (tmpfs_inodes[idx].used == 0) return -1;
+    size_t new_len = (size_t)length;
+    size_t old_len = tmpfs_inodes[idx].size;
+    if (new_len > old_len) {
+        if (tmpfs_inodes[idx].data)
+            memset(tmpfs_inodes[idx].data + old_len, 0, new_len - old_len);
+    } else if (new_len < old_len) {
+        if (tmpfs_inodes[idx].data)
+            memset(tmpfs_inodes[idx].data + new_len, 0, old_len - new_len);
+    }
+    tmpfs_inodes[idx].size = new_len;
+    for (int i = 0; i < TMPFS_MAX_OPEN; i++) {
+        if (tmpfs_opens[i].used && tmpfs_opens[i].inode_idx == idx) {
+            if (tmpfs_opens[i].pos > new_len) tmpfs_opens[i].pos = new_len;
+        }
+    }
+    return 0;
+}
+
+int tmpfs_ftruncate(int fd, off_t length) {
+    if (length < 0 || (uint64_t)length > TMPFS_MAX_FILE_SIZE) return -1;
+    fd -= TMPFS_FD_BASE;
+    if (fd < 0 || fd >= TMPFS_MAX_OPEN || !tmpfs_opens[fd].used) return -1;
+    if (tmpfs_opens[fd].is_dir) return -1;
+    int idx = tmpfs_opens[fd].inode_idx;
+    if (idx < 0 || idx >= TMPFS_MAX_FILES || !tmpfs_inodes[idx].used) return -1;
+    size_t new_len = (size_t)length;
+    size_t old_len = tmpfs_inodes[idx].size;
+    if (new_len > old_len) {
+        if (tmpfs_inodes[idx].data)
+            memset(tmpfs_inodes[idx].data + old_len, 0, new_len - old_len);
+    } else if (new_len < old_len) {
+        if (tmpfs_inodes[idx].data)
+            memset(tmpfs_inodes[idx].data + new_len, 0, old_len - new_len);
+    }
+    tmpfs_inodes[idx].size = new_len;
+    for (int i = 0; i < TMPFS_MAX_OPEN; i++) {
+        if (tmpfs_opens[i].used && tmpfs_opens[i].inode_idx == idx) {
+            if (tmpfs_opens[i].pos > new_len) tmpfs_opens[i].pos = new_len;
+        }
+    }
+    return 0;
+}
+
+int tmpfs_readdir(int fd, struct dirent* entry) {
+    if (!entry) return -1;
+    int slot = fd - TMPFS_FD_BASE;
+    if (slot < 0 || slot >= TMPFS_MAX_OPEN || !tmpfs_opens[slot].used) return -1;
+    if (!tmpfs_opens[slot].is_dir) return -1;
+    int cursor = (int)entry->inode;
+    if (cursor < 0) return -1;
+    int seen = 0;
+    for (int i = 0; i < TMPFS_MAX_FILES; i++) {
+        if (!tmpfs_inodes[i].used) continue;
+        if (seen == cursor) {
+            entry->inode = cursor + 1;
+            entry->type = FT_REGULAR;
+            entry->reclen = sizeof(struct dirent);
+            strncpy(entry->name, tmpfs_inodes[i].name, MAX_NAME_LEN - 1);
+            entry->name[MAX_NAME_LEN - 1] = '\0';
+            return 0;
+        }
+        seen++;
+    }
+    return -1;
 }
 
 void tmpfs_init(void) {

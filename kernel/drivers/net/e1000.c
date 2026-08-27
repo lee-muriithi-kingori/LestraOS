@@ -163,7 +163,7 @@ static const uint16_t e1000_device_ids[] = {
     0x1012,  /* 82546EB (Copper)     */
     0x101D,  /* 82546EB              */
     0x1026,  /* 82545EP (Copper)     */
-    0x10D3,  /* 82574L               */
+    /* 0x10D3 82574L - NOT added: needs SPI flash NVM, not legacy EEPROM */
     0x10A4,  /* 82571EB              */
     0x10A5,  /* 82571EB (Copper)     */
     0x10B9,  /* 82572EI              */

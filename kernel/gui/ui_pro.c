@@ -242,6 +242,7 @@ extern struct widget* about_create(int x, int y);
 extern struct widget* help_create(int x, int y);
 extern struct widget* editor_create(int x, int y);
 extern struct widget* media_create(int x, int y);
+extern struct widget* file_explorer_create(int x, int y);
 extern void compositor_add(struct widget* w);
 extern void compositor_bring_to_front(struct widget* w);
 extern void compositor_quit(void);
@@ -261,6 +262,9 @@ static void dock_launch_new(int idx) {
         case 3:
             if (!dock_widgets[3]) { dock_widgets[3] = media_create(250, 100); compositor_add(dock_widgets[3]); }
             w = dock_widgets[3]; break;
+        case 4:
+            if (!dock_widgets[4]) { dock_widgets[4] = file_explorer_create(200, 60); if (dock_widgets[4]) compositor_add(dock_widgets[4]); }
+            w = dock_widgets[4]; break;
         case 5:
             if (!dock_widgets[5]) { dock_widgets[5] = about_create((int)fb_w/2-190, 200); compositor_add(dock_widgets[5]); }
             w = dock_widgets[5]; break;

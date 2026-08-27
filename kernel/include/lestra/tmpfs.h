@@ -29,7 +29,10 @@ ssize_t tmpfs_write(int fd, const void* buf, size_t count);
 int     tmpfs_is_tmpfs_fd(int fd);
 int     tmpfs_lseek(int fd, off_t offset, int whence);
 int     tmpfs_read_at(int fd, void* buf, size_t count, off_t offset);
+int     tmpfs_readdir(int fd, struct dirent* entry);
 int     tmpfs_unlink(const char* path);
 int     tmpfs_stat(const char* path, struct stat* st);
+int     tmpfs_truncate(const char* path, off_t length);
+int     tmpfs_ftruncate(int fd, off_t length);
 
 #endif /* LESTRA_TMPFS_H */

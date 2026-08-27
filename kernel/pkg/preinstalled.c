@@ -138,8 +138,8 @@ static const struct preinstalled_app preinstalled[MAX_PREINSTALLED] = {
         "lestra-browser", "Lestra Browser", "browser",
         "Internet", "1.0",
         NULL,
-        "Native LestraOS web browser. HTTP/1.0 only; HTTPS requires "
-        "TLS module (currently a stub — see kernel/net/tls.c).",
+        "Native LestraOS web browser. HTTP/1.0 and HTTPS via tls_connect "
+        "(TLS 1.2 ECDHE_RSA AES128_GCM_SHA256, see kernel/net/tls.c).",
         APP_KIND_NATIVE, 32
     },
     {
@@ -268,9 +268,10 @@ static const struct driver_entry drivers[] = {
       "NOT IMPLEMENTED. No USB host controller driver in tree." },
     { "gpu",     "GPU Driver (Intel/AMD)","Display","missing-dep",
       "NOT IMPLEMENTED. Software framebuffer only." },
-    { "tls",     "TLS 1.2 (mbedTLS port)","Crypto","missing-dep",
-      "PARTIAL. tls.c has SHA-256/AES scaffolding but no RSA/ECDH; "
-      "no callers. HTTPS endpoints won't work without this." },
+    { "tls",     "TLS 1.2 (ECDHE_RSA AES128_GCM_SHA256)","Crypto","loaded",
+       "TLS 1.2 with single suite TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 "
+       "(0xC02F): P-256 ECDHE, RSA-2048 PKCS#1 v1.5, AES-128-GCM, SHA-256, "
+       "X.509 verification; used by http.c via tls_connect() for https." },
 };
 
 int drivers_count(void) {

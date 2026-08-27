@@ -1,4 +1,4 @@
-# LestraOS Userspace Architecture
+﻿# LestraOS Userspace Architecture
 
 This document describes the syscall ABI, the user-side ABI, and how to
 add a new userspace binary. It is the authoritative reference for
@@ -25,7 +25,7 @@ Negative return values are `-errno`. Non-negative values are success.
 
 ## Syscall Numbers
 
-These are stable — never renumber. New ones get appended. Matches `kernel/include/lestra/syscall.h` (0–66).
+These are stable — never renumber. New ones get appended. Matches `kernel/include/lestra/syscall.h` (0-66).
 
 ```
   0  exit(code)                         [noreturn]

@@ -31,6 +31,13 @@
 
 #include <lestra/ext2.h>
 
+#ifndef EROFS
+#define EROFS 30
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+
 #define MAX_EXT2_FDS       16
 #define EXT2_MAX_FILE      (256 * 1024)   /* 256 KB cap per open file (cache) */
 #define EXT2_MAX_DIR_ENTRIES 128          /* max cached dir entries per fd */
@@ -52,6 +59,8 @@ struct ext2_open_file {
     uint8_t*  data;                       /* kmalloc'd file data cache (regular files) */
     struct ext2_dir_cache* dir_cache;     /* kmalloc'd dir listing cache (directories) */
     char      path[MAX_PATH_LEN];
+    int       dirty;                      /* 1 if cached data was modified */
+    int       flags;                      /* open flags (for O_APPEND handling) */
 };
 
 static struct ext2_open_file ext2_fds[MAX_EXT2_FDS];
@@ -124,6 +133,8 @@ int ext2_open_file(const char* path) {
         ext2_fds[slot].size      = 0;
         ext2_fds[slot].data      = NULL;
         ext2_fds[slot].dir_cache = dc;
+        ext2_fds[slot].dirty     = 0;
+        ext2_fds[slot].flags     = 0;
         strncpy(ext2_fds[slot].path, path, MAX_PATH_LEN - 1);
         ext2_fds[slot].path[MAX_PATH_LEN - 1] = '\0';
 
@@ -154,6 +165,8 @@ int ext2_open_file(const char* path) {
     ext2_fds[slot].size      = n;
     ext2_fds[slot].data      = buf;
     ext2_fds[slot].dir_cache = NULL;
+    ext2_fds[slot].dirty     = 0;
+    ext2_fds[slot].flags     = 0;
     strncpy(ext2_fds[slot].path, path, MAX_PATH_LEN - 1);
     ext2_fds[slot].path[MAX_PATH_LEN - 1] = '\0';
     return slot;
@@ -181,17 +194,77 @@ int ext2_read_fd(int fd, void* buf, int count) {
     return ext2_read_file_fd(fd, buf, count);
 }
 
-/* Close: free the cache, mark slot free. */
+int ext2_write_fd(int fd, const void* buf, int count) {
+    if (fd < 0 || fd >= MAX_EXT2_FDS || !ext2_fds[fd].used) return -1;
+    if (ext2_fds[fd].is_dir) return -1;
+    if (!buf || count <= 0) return 0;
+    if (!ext2_is_writable()) return -EROFS;
+    struct ext2_open_file* f = &ext2_fds[fd];
+    if (!f->data) {
+        f->data = (uint8_t*)kmalloc(EXT2_MAX_FILE);
+        if (!f->data) return -1;
+        f->size = 0;
+        f->offset = 0;
+    }
+    if (f->flags & O_APPEND) {
+        f->offset = f->size;
+    }
+    if ((size_t)f->offset + (size_t)count > EXT2_MAX_FILE) {
+        if ((size_t)f->offset >= EXT2_MAX_FILE) return 0;
+        count = EXT2_MAX_FILE - f->offset;
+    }
+    memcpy(f->data + f->offset, buf, count);
+    f->offset += count;
+    if (f->offset > f->size) f->size = f->offset;
+    f->dirty = 1;
+    return count;
+}
+
+int ext2_write_at(int fd, const void* buf, int count, off_t offset) {
+    if (fd < 0 || fd >= MAX_EXT2_FDS || !ext2_fds[fd].used) return -1;
+    if (ext2_fds[fd].is_dir) return -1;
+    if (!buf || count <= 0) return 0;
+    if (offset < 0) return -1;
+    if (!ext2_is_writable()) return -EROFS;
+    struct ext2_open_file* f = &ext2_fds[fd];
+    if (!f->data) {
+        f->data = (uint8_t*)kmalloc(EXT2_MAX_FILE);
+        if (!f->data) return -1;
+        f->size = 0;
+    }
+    if ((size_t)offset + (size_t)count > EXT2_MAX_FILE) {
+        if ((size_t)offset >= EXT2_MAX_FILE) return 0;
+        count = EXT2_MAX_FILE - (int)offset;
+    }
+    memcpy(f->data + offset, buf, count);
+    size_t end = (size_t)offset + count;
+    if ((int)end > f->size) f->size = (int)end;
+    f->dirty = 1;
+    return count;
+}
+
+/* Close: free the cache, mark slot free. Write back dirty data via ext2_write_file(). */
 int ext2_close_file(int fd) {
     if (fd < 0 || fd >= MAX_EXT2_FDS || !ext2_fds[fd].used) return -1;
-    if (ext2_fds[fd].data) kfree(ext2_fds[fd].data);
-    if (ext2_fds[fd].dir_cache) kfree(ext2_fds[fd].dir_cache);
-    ext2_fds[fd].used    = 0;
-    ext2_fds[fd].data    = NULL;
-    ext2_fds[fd].dir_cache = NULL;
-    ext2_fds[fd].offset  = 0;
-    ext2_fds[fd].size    = 0;
-    ext2_fds[fd].is_dir  = 0;
+    struct ext2_open_file* f = &ext2_fds[fd];
+    if (f->dirty && !f->is_dir && f->data && ext2_is_writable()) {
+        int wr = ext2_write_file(f->path, f->data, (uint32_t)f->size);
+        if (wr >= 0) {
+            pr_info("ext2-shim: wrote back '%s' (%d bytes)\n", f->path, f->size);
+        } else {
+            pr_warn("ext2-shim: write-back failed for '%s'\n", f->path);
+        }
+    }
+    if (f->data) kfree(f->data);
+    if (f->dir_cache) kfree(f->dir_cache);
+    f->used    = 0;
+    f->data    = NULL;
+    f->dir_cache = NULL;
+    f->offset  = 0;
+    f->size    = 0;
+    f->is_dir  = 0;
+    f->dirty   = 0;
+    f->flags   = 0;
     return 0;
 }
 
