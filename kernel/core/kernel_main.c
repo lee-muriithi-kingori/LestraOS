@@ -506,6 +506,11 @@ void kernel_main(void* mb2_info) {
         }
     }
 
+    /* Initialize NVMe driver (PCIe SSD - the standard modern storage).
+     * Non-fatal if no NVMe controller - kernel still runs. */
+    extern int nvme_init(void);
+    nvme_init();
+
     /* Initialize AC97 audio driver.
      * Non-fatal if no audio controller - kernel still runs. */
     pr_info("Initializing audio subsystem...\n");
