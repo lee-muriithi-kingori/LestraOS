@@ -1,3 +1,4 @@
+# Usage: source ./env.sh — sets DEVTOOLS, PATH, QEMU_DATADIR
 # lestraOS no-root toolchain env (re-created after env reset)
 export DEVTOOLS="${DEVTOOLS:-$HOME/.local/opt/devtools}"
 export PATH="$DEVTOOLS/usr/bin:$PATH"
