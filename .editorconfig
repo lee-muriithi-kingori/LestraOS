@@ -1,0 +1,6 @@
+root = true
+[*.{c,h,asm,ld}]
+indent_style = space
+indent_size = 4
+[*.md]
+trim_trailing_whitespace = true
