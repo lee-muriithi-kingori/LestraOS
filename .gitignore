@@ -29,7 +29,9 @@ screenshots/*
 !screenshots/photo_2026-08-20_09-01-59.jpg
 
 # ===== Dev notes / planning artifacts (kept out of git) =====
-MEMORY.md
+# MEMORY.md moved to docs/MEMORY.md — now tracked
+/MEMORY.md
+!docs/MEMORY.md
 AUDIT_FIXES.md
 WIRING_NOTES.md
 ALPHA*.md
