@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Fix SMAP violations in linux_compat.c - replace the dispatch function body."""
 
-path = '/home/z/lestraOS/kernel/exec/linux_compat.c'
+import os
+repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+path = os.path.join(repo, 'kernel', 'exec', 'linux_compat.c')
 with open(path, 'r') as f:
     content = f.read()
 

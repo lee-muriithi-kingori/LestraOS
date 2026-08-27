@@ -6,7 +6,7 @@ set -e
 
 # Use the locally-extracted dev toolchain if present (no root needed).
 # Falls back to system tools if available.
-DEVTOOLS=/home/z/.local/opt/devtools
+DEVTOOLS="${DEVTOOLS:-$HOME/.local/opt/devtools}"
 if [ -d "$DEVTOOLS" ]; then
     export PATH="$DEVTOOLS/usr/bin:$PATH"
     export LD_LIBRARY_PATH="$DEVTOOLS/usr/lib/x86_64-linux-gnu:$DEVTOOLS/usr/lib:${LD_LIBRARY_PATH}"
@@ -21,7 +21,7 @@ else
     GRUB_DIR=""
     QEMU_DATA=""
 fi
-cd /home/z/lestraOS
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "[smoke] building ISO..."
 make iso >/dev/null 2>&1 || make all >/dev/null 2>&1

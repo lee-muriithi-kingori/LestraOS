@@ -3,7 +3,7 @@
  * Copyright (c) 2026 lestramk.org
  *
  * The SYS_* numbers below are mirrored 1:1 from
- * /home/z/lestraOS/kernel/include/lestra/syscall.h.  Keep them in
+ * kernel/include/lestra/syscall.h.  Keep them in
  * sync with that file whenever the kernel adds or renumbers a call.
  *
  * Wrapper convention (libc/src/unistd.c):

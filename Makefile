@@ -32,7 +32,7 @@ AS := nasm
 # Detect GRUB i386-pc modules directory so grub-mkrescue can find
 # boot.img, eltorito.img, etc. Without this, grub-mkrescue silently
 # produces a non-bootable ISO (no El Torito boot record).
-GRUB_MODULES_DIR ?= $(shell for d in /usr/lib/grub/i386-pc /usr/lib/grub2/i386-pc $(HOME)/opt/cross/lib/grub/i386-pc /usr/local/lib/grub/i386-pc /home/z/.local/qemu-prefix/usr/lib/grub/i386-pc $(HOME)/.local/opt/devtools/usr/lib/grub/i386-pc ; do \
+GRUB_MODULES_DIR ?= $(shell for d in /usr/lib/grub/i386-pc /usr/lib/grub2/i386-pc $(HOME)/opt/cross/lib/grub/i386-pc /usr/local/lib/grub/i386-pc $(HOME)/.local/opt/devtools/usr/lib/grub/i386-pc ; do \
 	if [ -f "$$d/boot.img" ]; then echo $$d; break; fi; \
 done)
 
