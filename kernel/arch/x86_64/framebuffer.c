@@ -133,16 +133,21 @@ void fb_swap(void) {
     if (!fb_available || !fb || !fb_back) return;
 
     if (fb_bpp == 32) {
-        /* Fast path: 32-bit copy */
-        uint32_t* dst = fb;
-        uint32_t* src = fb_back;
-        size_t count = (size_t)fb_w * fb_h;
-        __asm__ volatile (
-            "rep movsd"
-            : "+D"(dst), "+S"(src), "+c"(count)
-            :
-            : "memory"
-        );
+        /* 32-bpp copy must respect pitch — fb_pitch may be > fb_w*4.
+         * Copy row by row like the 24-bpp path. */
+        for (uint32_t y = 0; y < fb_h; y++) {
+            uint8_t* dst_row = (uint8_t*)fb + y * fb_pitch;
+            uint32_t* src_row = fb_back + y * fb_w;
+            uint32_t* dst = (uint32_t*)dst_row;
+            uint32_t* src = src_row;
+            size_t count = fb_w;
+            __asm__ volatile (
+                "rep movsd"
+                : "+D"(dst), "+S"(src), "+c"(count)
+                :
+                : "memory"
+            );
+        }
     } else if (fb_bpp == 24) {
         /* Convert 32-bit ARGB to 24-bit RGB */
         uint8_t* dst = (uint8_t*)fb;

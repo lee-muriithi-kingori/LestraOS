@@ -66,7 +66,7 @@ static int ahci_port = -1;
 
 static struct cmd_header cmd_list[32] __aligned(1024);
 static struct cmd_table cmd_tbl __aligned(128);
-static uint8_t ahci_dma_buf[4096] __aligned(256);
+static uint8_t ahci_dma_buf[4096] __aligned(4096);
 
 static inline uint32_t ahci_read(uint32_t off) {
     return *(volatile uint32_t*)(ahci_abar + off);
@@ -106,8 +106,17 @@ int ahci_init(void) {
         return 0;
     }
 
-    uint32_t bar5 = pci_config_read32(bus, dev, func, 0x24);
-    ahci_abar = bar5 & ~0xFu;
+    uint32_t bar5_low = pci_config_read32(bus, dev, func, 0x24);
+    uint32_t bar5_high = pci_config_read32(bus, dev, func, 0x28);
+    if (bar5_high) {
+        pr_warn("ahci: BAR5 above 4 GB (0x%x%08x), not accessible\n",
+                (unsigned)bar5_high, (unsigned)bar5_low);
+        return 0;
+    }
+    if ((bar5_low & 0x6) == 0x4) {
+        pr_warn("ahci: BAR5 is 64-bit (high dword zero, using low 32 bits)\n");
+    }
+    ahci_abar = bar5_low & ~0xFu;
     pr_info("ahci: ABAR = 0x%x\n", (unsigned)ahci_abar);
 
     uint32_t cmd_reg = pci_config_read32(bus, dev, func, 0x04);

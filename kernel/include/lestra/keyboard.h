@@ -95,6 +95,7 @@ uint8_t keyboard_get_scancode(void);
 char keyboard_getchar(void);
 char keyboard_scancode_to_ascii(uint8_t scancode, bool shift);
 void keyboard_set_handler(void (*handler)(uint8_t scancode, char ascii));
+void (*keyboard_get_handler(void))(uint8_t scancode, char ascii);
 
 /* Inject a single ASCII character into the keyboard ring buffer as if
  * it had been typed on the physical keyboard. Used by the on-screen

@@ -11,5 +11,6 @@ ssize_t pipe_read(int fd, void* buf, size_t count);
 ssize_t pipe_write(int fd, const void* buf, size_t count);
 int pipe_close(int fd);
 int pipe_is_pipe_fd(int fd);
+int pipe_bytes_available(int fd);
 
 #endif

@@ -104,6 +104,7 @@ struct ext2_dirent {
 } __packed;
 
 static int ext2_mounted = 0;
+static int ext2_writable = 1;
 static uint32_t ext2_block_size = 1024;
 static uint32_t ext2_inodes_per_group;
 static uint32_t ext2_blocks_per_group;
@@ -184,6 +185,11 @@ int ext2_mount(void) {
     }
 
     ext2_mounted = 1;
+    ext2_writable = 1;
+    /* If superblock indicates read-only/errors, mark not writable */
+    if (ext2_sb.s_state != 1) {
+        /* s_state 1 = valid, 2 = error; keep writable but future check */
+    }
     return 1;
 }
 
@@ -1076,5 +1082,5 @@ int ext2_write_file(const char* path, const void* buf, uint32_t len) {
 }
 
 int ext2_is_writable(void) {
-    return ext2_mounted;
+    return ext2_mounted && ext2_writable;
 }

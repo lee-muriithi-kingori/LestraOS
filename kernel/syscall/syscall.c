@@ -223,6 +223,7 @@ extern int64_t signal_sigreturn(void);
 
 /* Forward declaration for pipe */
 extern int pipe_create(int fds[2]);
+extern int pipe_bytes_available(int fd);
 
 /* Forward declarations for the ELF loaders. elf_exec handles static
  * (ET_EXEC) binaries; ldso_load_and_run handles dynamic (ET_DYN with
@@ -317,6 +318,33 @@ struct rlimit {
     uint64_t rlim_max;
 };
 
+/* Consistent rlimit store — ensures getrlimit/setrlimit agree on limits */
+static struct rlimit g_rlimit_store[16];
+static int g_rlimit_inited = 0;
+static void rlimit_ensure_init(void) {
+    if (g_rlimit_inited) return;
+    for (int i = 0; i < 16; i++) { g_rlimit_store[i].rlim_cur = 0xFFFFFFFF; g_rlimit_store[i].rlim_max = 0xFFFFFFFF; }
+    g_rlimit_store[RLIMIT_NOFILE].rlim_cur = MAX_FD_PER_PROC;
+    g_rlimit_store[RLIMIT_NOFILE].rlim_max = MAX_FD_PER_PROC;
+    g_rlimit_store[RLIMIT_STACK].rlim_cur = 8 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_STACK].rlim_max = 8 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_DATA].rlim_cur = 16 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_DATA].rlim_max = 16 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_AS].rlim_cur = 256 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_AS].rlim_max = 256 * 1024 * 1024;
+    g_rlimit_store[RLIMIT_CPU].rlim_cur = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_CPU].rlim_max = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_FSIZE].rlim_cur = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_FSIZE].rlim_max = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_CORE].rlim_cur = 0;
+    g_rlimit_store[RLIMIT_CORE].rlim_max = 0;
+    g_rlimit_store[RLIMIT_RSS].rlim_cur = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_RSS].rlim_max = 0xFFFFFFFF;
+    g_rlimit_store[RLIMIT_NPROC].rlim_cur = MAX_PROCS;
+    g_rlimit_store[RLIMIT_NPROC].rlim_max = MAX_PROCS;
+    g_rlimit_inited = 1;
+}
+
 /* pollfd structure for poll() */
 struct pollfd {
     int fd;
@@ -369,25 +397,23 @@ static int64_t sys_read(int64_t fd_num, void* buf, size_t count) {
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
 
-    /* Bounce buffer: kmalloc a kernel buffer so VFS/pipe layers
-     * never see a user pointer.  This is required for SMAP safety —
-     * under CR4.SMAP=1 the kernel cannot directly dereference user
-     * memory without stac/clac, and the deeper layers don't use them.
-     * Cap at 4 KB per call to avoid large kernel heap allocations. */
-    size_t chunk = count > 4096 ? 4096 : count;
-    void* kbuf = kmalloc(chunk);
+    /* Bounce buffer: 4KB kernel buffer. For large counts we loop
+     * over chunks to avoid truncating to a single 4096-byte transfer.
+     * This is required for SMAP safety and to correctly return the
+     * total bytes read for counts >4096. */
+    void* kbuf = kmalloc(4096);
     if (!kbuf) return -ENOMEM;
     int64_t total = 0;
 
     switch (entry->type) {
         case FD_SPECIAL:
             /* stdin (fd 0) reads from keyboard — one char at a time.
-             * We stage into the bounce buffer then copy out. */
+             * Loop over chunks to honor arbitrary count. */
             if (fd_num == 0) {
                 size_t done = 0;
                 while (done < count) {
                     size_t want = count - done;
-                    if (want > chunk) want = chunk;
+                    if (want > 4096) want = 4096;
                     for (size_t i = 0; i < want; i++)
                         ((char*)kbuf)[i] = keyboard_getchar();
                     if (copy_to_user((uint8_t*)buf + done, kbuf, want) < 0) {
@@ -404,30 +430,42 @@ static int64_t sys_read(int64_t fd_num, void* buf, size_t count) {
             goto out;
 
         case FD_VFS: {
-            /* VFS read: fill kbuf, copy to user. */
-            ssize_t n = vfs_read_at(entry->resource, kbuf, chunk,
-                                   entry->offset);
-            if (n >= 0) {
+            /* VFS read: loop over chunks, updating offset and accumulating total. */
+            size_t done = 0;
+            while (done < count) {
+                size_t want = count - done;
+                if (want > 4096) want = 4096;
+                ssize_t n = vfs_read_at(entry->resource, kbuf, want,
+                                       entry->offset);
+                if (n < 0) {
+                    n = vfs_read(entry->resource, kbuf, want);
+                    if (n < 0) { total = total ? total : -EIO; goto out; }
+                }
+                if (n == 0) break;
                 entry->offset += n;
-                if (copy_to_user(buf, kbuf, (size_t)n) < 0)
-                    { total = -EFAULT; goto out; }
-                total = (int64_t)n;
-                goto out;
+                if (copy_to_user((uint8_t*)buf + done, kbuf, (size_t)n) < 0)
+                    { total = total ? total : -EFAULT; goto out; }
+                total += (int64_t)n;
+                done += (size_t)n;
+                if ((size_t)n < want) break;
             }
-            n = vfs_read(entry->resource, kbuf, chunk);
-            if (n < 0) { total = -EIO; goto out; }
-            if (copy_to_user(buf, kbuf, (size_t)n) < 0)
-                { total = -EFAULT; goto out; }
-            total = (int64_t)n;
             goto out;
         }
 
         case FD_PIPE: {
-            ssize_t n = pipe_read(entry->resource, kbuf, chunk);
-            if (n < 0) { total = -EIO; goto out; }
-            if (n > 0 && copy_to_user(buf, kbuf, (size_t)n) < 0)
-                { total = -EFAULT; goto out; }
-            total = (int64_t)n;
+            size_t done = 0;
+            while (done < count) {
+                size_t want = count - done;
+                if (want > 4096) want = 4096;
+                ssize_t n = pipe_read(entry->resource, kbuf, want);
+                if (n < 0) { total = total ? total : -EIO; goto out; }
+                if (n == 0) break;
+                if (copy_to_user((uint8_t*)buf + done, kbuf, (size_t)n) < 0)
+                    { total = total ? total : -EFAULT; goto out; }
+                total += (int64_t)n;
+                done += (size_t)n;
+                if ((size_t)n < want) break;
+            }
             goto out;
         }
 
@@ -450,59 +488,83 @@ static int64_t sys_write(int64_t fd_num, const void* buf, size_t count) {
     struct fd_entry* entry = &cur->fds[fd_num];
     if (entry->type == FD_UNUSED) return -EBADF;
 
-    /* Bounce buffer: copy user data into kernel heap first.
-     * Cap at 4 KB per call. */
-    size_t chunk = count > 4096 ? 4096 : count;
-    void* kbuf = kmalloc(chunk);
+    /* Bounce buffer: 4KB kernel buffer. Loop over chunks for large
+     * counts to avoid truncating to a single 4096-byte transfer. */
+    void* kbuf = kmalloc(4096);
     if (!kbuf) return -ENOMEM;
     int64_t total = 0;
 
-    /* Copy first chunk from user. */
-    if (copy_from_user(kbuf, buf, chunk) < 0) {
-        kfree(kbuf);
-        return -EFAULT;
-    }
-
     switch (entry->type) {
         case FD_SPECIAL:
-            /* stdout/stderr go to VGA+serial */
+            /* stdout/stderr go to VGA+serial — loop over all chunks */
             if (fd_num == 1 || fd_num == 2) {
-                const char* kbc = (const char*)kbuf;
-                for (size_t i = 0; i < chunk; i++) {
-                    if (kbc[i] == '\n') vga_putchar('\r');
-                    vga_putchar(kbc[i]);
-                    serial_default_putchar(kbc[i]);
+                size_t done = 0;
+                while (done < count) {
+                    size_t want = count - done;
+                    if (want > 4096) want = 4096;
+                    if (copy_from_user(kbuf, (const uint8_t*)buf + done, want) < 0) {
+                        total = total ? total : -EFAULT;
+                        goto out;
+                    }
+                    const char* kbc = (const char*)kbuf;
+                    for (size_t i = 0; i < want; i++) {
+                        if (kbc[i] == '\n') vga_putchar('\r');
+                        vga_putchar(kbc[i]);
+                        serial_default_putchar(kbc[i]);
+                    }
+                    done += want;
+                    total += (int64_t)want;
                 }
-                total = (int64_t)chunk;
                 goto out;
             }
             /* stdin cannot be written */
             total = -EBADF;
             goto out;
 
-        case FD_VFS:
-            if (entry->flags & O_APPEND) {
-                off_t end = vfs_lseek(entry->resource, 0, 2);
-                if (end >= 0) entry->offset = end;
-            }
-            {
-                ssize_t n = vfs_write_at(entry->resource, kbuf, chunk,
-                                         entry->offset);
-                if (n >= 0) {
-                    entry->offset += n;
-                    total = (int64_t)n;
+        case FD_VFS: {
+            size_t done = 0;
+            while (done < count) {
+                size_t want = count - done;
+                if (want > 4096) want = 4096;
+                if (copy_from_user(kbuf, (const uint8_t*)buf + done, want) < 0) {
+                    total = total ? total : -EFAULT;
                     goto out;
                 }
-                n = vfs_write(entry->resource, kbuf, chunk);
-                if (n < 0) { total = -EIO; goto out; }
-                total = (int64_t)n;
-                goto out;
+                if (entry->flags & O_APPEND) {
+                    off_t end = vfs_lseek(entry->resource, 0, 2);
+                    if (end >= 0) entry->offset = end;
+                }
+                ssize_t n = vfs_write_at(entry->resource, kbuf, want,
+                                         entry->offset);
+                if (n < 0) {
+                    n = vfs_write(entry->resource, kbuf, want);
+                    if (n < 0) { total = total ? total : -EIO; goto out; }
+                }
+                if (n == 0) break;
+                entry->offset += n;
+                total += (int64_t)n;
+                done += (size_t)n;
+                if ((size_t)n < want) break;
             }
+            goto out;
+        }
 
         case FD_PIPE: {
-            ssize_t n = pipe_write(entry->resource, kbuf, chunk);
-            if (n < 0) { total = -EIO; goto out; }
-            total = (int64_t)n;
+            size_t done = 0;
+            while (done < count) {
+                size_t want = count - done;
+                if (want > 4096) want = 4096;
+                if (copy_from_user(kbuf, (const uint8_t*)buf + done, want) < 0) {
+                    total = total ? total : -EFAULT;
+                    goto out;
+                }
+                ssize_t n = pipe_write(entry->resource, kbuf, want);
+                if (n < 0) { total = total ? total : -EIO; goto out; }
+                if (n == 0) break;
+                total += (int64_t)n;
+                done += (size_t)n;
+                if ((size_t)n < want) break;
+            }
             goto out;
         }
 
@@ -1124,6 +1186,10 @@ static int64_t sys_getdents(int64_t fd_num, void* dirp, size_t count) {
 }
 
 static int64_t sys_reboot(int64_t cmd) {
+    struct process* cur = task_current();
+    if (!cur) return -EPERM;
+    /* Privilege check: only root (uid 0) may reboot/shutdown. */
+    if (cur->uid != 0) return -EPERM;
     if (cmd == 0) {
         printk("Shutting down...\n");
         extern void shutdown_system(void);
@@ -1270,8 +1336,13 @@ static int64_t sys_fstat(int64_t fd_num, void* st) {
         /* Try to get stat via vfs_stat on the open resource.
          * Since vfs_stat takes a path and we only have a fd,
          * we fill in what we can. For memfs files, lseek
-         * SEEK_END gives the file size. */
+         * SEEK_END gives the file size. Save and restore original
+         * offset to avoid mutating file position. */
+        off_t orig = vfs_lseek(entry->resource, 0, 1);
         off_t end = vfs_lseek(entry->resource, 0, 2);
+        if (orig >= 0 && end >= 0) {
+            vfs_lseek(entry->resource, orig, 0);
+        }
         if (end >= 0) {
             ks.mode = S_IFREG | 0644;
             ks.size = (uint64_t)end;
@@ -1361,40 +1432,54 @@ static int64_t sys_ioctl(int64_t fd_num, uint64_t request, uint64_t arg) {
 
     switch (request) {
         case TCGETS:
+            if (entry->type == FD_SPECIAL) {
+                if (!arg) return -EFAULT;
+                if (!access_ok((void*)(uintptr_t)arg, 60)) return -EFAULT;
+                uint8_t zero_termios[60] = {0};
+                if (copy_to_user((void*)(uintptr_t)arg, zero_termios, 60) < 0) return -EFAULT;
+                return 0;
+            }
+            return -ENOTTY;
         case TCSETS:
-            /* Terminal get/set attributes. For FD_SPECIAL (stdin/stdout)
-             * and any tty-like fd, just return success. arg points to
-             * a struct termios in userspace; we accept it silently. */
-            if (entry->type == FD_SPECIAL) return 0;
-            /* Pipes can also be treated as tty-like for ioctl */
-            if (entry->type == FD_PIPE) return 0;
+            if (entry->type == FD_SPECIAL) {
+                if (!arg) return -EFAULT;
+                if (!access_ok((void*)(uintptr_t)arg, 60)) return -EFAULT;
+                uint8_t k_termios[60];
+                if (copy_from_user(k_termios, (void*)(uintptr_t)arg, 60) < 0) return -EFAULT;
+                (void)k_termios;
+                return 0;
+            }
             return -ENOTTY;
 
         case FIONREAD:
-            /* Number of bytes readable. For stdin (fd 0), check the
-             * keyboard buffer. For other fds, return 0.
-             * SMAP-safe: use put_user instead of direct deref. */
+            /* Number of bytes readable. SMAP-safe: use put_user instead of direct deref. */
             if (entry->type == FD_SPECIAL && fd_num == 0) {
                 int count = keyboard_has_key() ? 1 : 0;
                 if (arg) {
+                    if (!access_ok((void*)(uintptr_t)arg, sizeof(int))) return -EFAULT;
                     if (put_user(count, (int*)(uintptr_t)arg) != 0)
                         return -EFAULT;
                 }
                 return 0;
             }
             if (entry->type == FD_PIPE) {
+                int avail = pipe_bytes_available(entry->resource);
+                if (avail < 0) avail = 0;
                 if (arg) {
-                    int zero = 0;
-                    if (put_user(zero, (int*)(uintptr_t)arg) != 0)
+                    if (!access_ok((void*)(uintptr_t)arg, sizeof(int))) return -EFAULT;
+                    if (put_user(avail, (int*)(uintptr_t)arg) != 0)
                         return -EFAULT;
                 }
                 return 0;
             }
             if (entry->type == FD_VFS) {
+                off_t orig = vfs_lseek(entry->resource, 0, 1);
                 off_t end = vfs_lseek(entry->resource, 0, 2);
+                if (orig >= 0 && end >= 0) vfs_lseek(entry->resource, orig, 0);
                 off_t readable = (end >= 0 && end > entry->offset)
                     ? end - entry->offset : 0;
                 if (arg) {
+                    if (!access_ok((void*)(uintptr_t)arg, sizeof(int))) return -EFAULT;
                     if (put_user((int)readable, (int*)(uintptr_t)arg) != 0)
                         return -EFAULT;
                 }
@@ -1485,50 +1570,24 @@ static int64_t sys_clock_gettime(int clk_id, void* tp) {
 static int64_t sys_getrlimit(int resource, void* rlim_ptr) {
     if (!rlim_ptr) return -EFAULT;
     if (!access_ok(rlim_ptr, sizeof(struct rlimit))) return -EFAULT;
-    struct rlimit krl;
-
-    /* Return sensible defaults for each resource limit. In our
-     * minimal OS, most limits are essentially unlimited. */
+    rlimit_ensure_init();
+    if (resource < 0 || resource >= 16) return -EINVAL;
+    /* Only defined resources are consistent between get and set */
     switch (resource) {
-        case RLIMIT_NOFILE:
-            krl.rlim_cur = MAX_FD_PER_PROC;
-            krl.rlim_max = MAX_FD_PER_PROC;
-            break;
-        case RLIMIT_STACK:
-            krl.rlim_cur = 8 * 1024 * 1024;   /* 8 MB */
-            krl.rlim_max = 8 * 1024 * 1024;
-            break;
-        case RLIMIT_DATA:
-            krl.rlim_cur = 16 * 1024 * 1024;  /* 16 MB (matches brk cap) */
-            krl.rlim_max = 16 * 1024 * 1024;
-            break;
-        case RLIMIT_AS:
-            krl.rlim_cur = 256 * 1024 * 1024; /* 256 MB */
-            krl.rlim_max = 256 * 1024 * 1024;
-            break;
         case RLIMIT_CPU:
-            krl.rlim_cur = 0xFFFFFFFF;         /* unlimited */
-            krl.rlim_max = 0xFFFFFFFF;
-            break;
         case RLIMIT_FSIZE:
-            krl.rlim_cur = 0xFFFFFFFF;
-            krl.rlim_max = 0xFFFFFFFF;
-            break;
+        case RLIMIT_DATA:
+        case RLIMIT_STACK:
         case RLIMIT_CORE:
-            krl.rlim_cur = 0;                  /* no core dumps */
-            krl.rlim_max = 0;
-            break;
         case RLIMIT_RSS:
-            krl.rlim_cur = 0xFFFFFFFF;
-            krl.rlim_max = 0xFFFFFFFF;
-            break;
         case RLIMIT_NPROC:
-            krl.rlim_cur = MAX_PROCS;
-            krl.rlim_max = MAX_PROCS;
+        case RLIMIT_NOFILE:
+        case RLIMIT_AS:
             break;
         default:
             return -EINVAL;
     }
+    struct rlimit krl = g_rlimit_store[resource];
     if (copy_to_user(rlim_ptr, &krl, sizeof(krl)) < 0) return -EFAULT;
     return 0;
 }
@@ -1536,14 +1595,29 @@ static int64_t sys_getrlimit(int resource, void* rlim_ptr) {
 static int64_t sys_setrlimit(int resource, const void* rlim_ptr) {
     if (!rlim_ptr) return -EFAULT;
     if (!access_ok(rlim_ptr, sizeof(struct rlimit))) return -EFAULT;
-    /* Copy the user struct in (validates the pointer under SMAP),
-     * even though we don't honor it yet. */
     struct rlimit krl;
     if (copy_from_user(&krl, rlim_ptr, sizeof(krl)) < 0) return -EFAULT;
-    (void)resource;
-    /* We don't allow changing resource limits yet. Return -EPERM
-     * to indicate the operation is not permitted. */
-    return -EPERM;
+    rlimit_ensure_init();
+    if (resource < 0 || resource >= 16) return -EINVAL;
+    switch (resource) {
+        case RLIMIT_CPU:
+        case RLIMIT_FSIZE:
+        case RLIMIT_DATA:
+        case RLIMIT_STACK:
+        case RLIMIT_CORE:
+        case RLIMIT_RSS:
+        case RLIMIT_NPROC:
+        case RLIMIT_NOFILE:
+        case RLIMIT_AS:
+            break;
+        default:
+            return -EINVAL;
+    }
+    /* Basic validation: cur must not exceed max */
+    if (krl.rlim_cur > krl.rlim_max) return -EINVAL;
+    /* Store the new limit — ensures getrlimit reflects what was set (consistency) */
+    g_rlimit_store[resource] = krl;
+    return 0;
 }
 
 /* Forward declaration — the full implementation (hash table + wait
@@ -1735,9 +1809,9 @@ static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
         }
     }
 
-    /* Re-scan after brief sleep if nothing ready */
+    /* Re-scan after sleep if nothing ready — honor full timeout, capped at INT_MAX */
     if (ready == 0 && timeout_ms > 0) {
-        if (timeout_ms > 100) timeout_ms = 100;
+        if (timeout_ms > INT_MAX) timeout_ms = INT_MAX;
         task_sleep((uint64_t)timeout_ms);
         for (uint64_t i = 0; i < nfds; i++) {
             if (kfds[i].fd < 0) continue;
@@ -1788,7 +1862,6 @@ static int64_t sys_poll(void* fds_ptr, uint64_t nfds, int64_t timeout_ms) {
 
 static int64_t sys_select(int nfds, void* readfds, void* writefds,
                            void* exceptfds, const void* timeout) {
-    (void)timeout;
     if (nfds < 0) return -EINVAL;
     if (nfds > LESTRA_POLL_MAX) return -EINVAL;
     if (nfds > FD_SETSIZE_L) nfds = FD_SETSIZE_L;
@@ -1798,21 +1871,30 @@ static int64_t sys_select(int nfds, void* readfds, void* writefds,
     uint8_t krset[FD_SETSIZE_L / 8];
     uint8_t kwset[FD_SETSIZE_L / 8];
     uint8_t keset[FD_SETSIZE_L / 8];
+    uint8_t orig_r[FD_SETSIZE_L / 8];
+    uint8_t orig_w[FD_SETSIZE_L / 8];
+    uint8_t orig_e[FD_SETSIZE_L / 8];
     memset(krset, 0, sizeof(krset));
     memset(kwset, 0, sizeof(kwset));
     memset(keset, 0, sizeof(keset));
+    memset(orig_r, 0, sizeof(orig_r));
+    memset(orig_w, 0, sizeof(orig_w));
+    memset(orig_e, 0, sizeof(orig_e));
 
     if (readfds) {
         if (!access_ok(readfds, set_bytes)) return -EFAULT;
         if (copy_from_user(krset, readfds, set_bytes) < 0) return -EFAULT;
+        memcpy(orig_r, krset, sizeof(orig_r));
     }
     if (writefds) {
         if (!access_ok(writefds, set_bytes)) return -EFAULT;
         if (copy_from_user(kwset, writefds, set_bytes) < 0) return -EFAULT;
+        memcpy(orig_w, kwset, sizeof(orig_w));
     }
     if (exceptfds) {
         if (!access_ok(exceptfds, set_bytes)) return -EFAULT;
         if (copy_from_user(keset, exceptfds, set_bytes) < 0) return -EFAULT;
+        memcpy(orig_e, keset, sizeof(orig_e));
     }
 
     struct process* cur = task_current();
@@ -1863,6 +1945,63 @@ static int64_t sys_select(int nfds, void* readfds, void* writefds,
         }
     }
 
+    /* Honor timeout if nothing ready yet */
+    if (ready == 0 && timeout) {
+        struct timeval {
+            int64_t tv_sec;
+            int64_t tv_usec;
+        } ktv;
+        if (!access_ok(timeout, sizeof(ktv))) return -EFAULT;
+        if (copy_from_user(&ktv, timeout, sizeof(ktv)) < 0) return -EFAULT;
+        int64_t timeout_ms = ktv.tv_sec * 1000 + ktv.tv_usec / 1000;
+        if (timeout_ms < 0) timeout_ms = 0;
+        if (timeout_ms > INT_MAX) timeout_ms = INT_MAX;
+        if (timeout_ms > 0) {
+            task_sleep((uint64_t)timeout_ms);
+            /* Re-scan after sleep for newly ready fds */
+            for (int fd = 0; fd < nfds; fd++) {
+                int fd_byte = fd / 8;
+                int fd_bit  = fd % 8;
+                int watching_r = (orig_r[fd_byte] & (1 << fd_bit));
+                int watching_w = (orig_w[fd_byte] & (1 << fd_bit));
+                int watching_e = (orig_e[fd_byte] & (1 << fd_bit));
+                if (!watching_r && !watching_w && !watching_e) continue;
+                int already_r = (krset[fd_byte] & (1 << fd_bit));
+                int already_w = (kwset[fd_byte] & (1 << fd_bit));
+                int already_e = (keset[fd_byte] & (1 << fd_bit));
+                if (watching_r && !already_r) {
+                    if (socket_is_socket_fd(fd)) { krset[fd_byte] |= (1 << fd_bit); ready++; }
+                    else if (cur && fd >= 0 && fd < MAX_FD_PER_PROC) {
+                        struct fd_entry* e = &cur->fds[fd];
+                        if (e->type == FD_SPECIAL && fd == 0) {
+                            if (keyboard_has_key()) { krset[fd_byte] |= (1 << fd_bit); ready++; }
+                        } else if (e->type != FD_UNUSED && e->type != FD_SPECIAL) {
+                            krset[fd_byte] |= (1 << fd_bit); ready++;
+                        } else if (e->type == FD_SPECIAL && (fd==1||fd==2)) {
+                            /* special out not for read */
+                        } else if (e->type != FD_UNUSED) {
+                            krset[fd_byte] |= (1 << fd_bit); ready++;
+                        }
+                    }
+                }
+                if (watching_w && !already_w) {
+                    if (socket_is_socket_fd(fd)) { kwset[fd_byte] |= (1 << fd_bit); ready++; }
+                    else if (cur && fd >= 0 && fd < MAX_FD_PER_PROC) {
+                        struct fd_entry* e = &cur->fds[fd];
+                        if (e->type == FD_SPECIAL && (fd==1||fd==2)) { kwset[fd_byte] |= (1 << fd_bit); ready++; }
+                        else if (e->type != FD_UNUSED) { kwset[fd_byte] |= (1 << fd_bit); ready++; }
+                    }
+                }
+                if (watching_e && !already_e) {
+                    if (cur && fd >= 0 && fd < MAX_FD_PER_PROC) {
+                        struct fd_entry* e = &cur->fds[fd];
+                        if (e->type == FD_UNUSED) { keset[fd_byte] |= (1 << fd_bit); ready++; }
+                    }
+                }
+            }
+        }
+    }
+
     /* Copy results back to user */
     if (readfds) {
         if (copy_to_user(readfds, krset, set_bytes) < 0) return -EFAULT;
@@ -1902,8 +2041,11 @@ static int64_t sys_dup(int oldfd) {
     }
     if (newfd < 0) return -EMFILE;
 
-    /* Copy the fd entry (shared underlying resource, independent offset). */
+    /* Copy the fd entry (shared underlying resource, independent offset).
+     * POSIX requires dup() to clear FD_CLOEXEC on the new fd. */
     cur->fds[newfd] = cur->fds[oldfd];
+    cur->fds[newfd].flags &= ~0x80000000;
+    cur->fds[newfd].flags &= ~FD_CLOEXEC;
     return (int64_t)newfd;
 }
 
@@ -1928,6 +2070,8 @@ static int64_t sys_fcntl(int fd, int cmd, long arg) {
             cur->fds[newfd] = *e;
             /* Clear any inherited CLOEXEC bit on the new fd (POSIX:
              * F_DUPFD clears FD_CLOEXEC; F_DUPFD_CLOEXEC sets it). */
+            cur->fds[newfd].flags &= ~0x80000000;
+            cur->fds[newfd].flags &= ~FD_CLOEXEC;
             return (int64_t)newfd;
         }
         case F_GETFD:

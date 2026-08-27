@@ -392,9 +392,12 @@ run-cloud: all
 		 -netdev user,id=net0 -device e1000,netdev=net0 \
 		 -name "Lestra OS [cloud]"
 
-# QEMU firmware (SeaBIOS) lookup dir. The devtools prefix is created by
-# scripts/setup-devtools.sh; fall back to the system path if absent.
-QEMU_FW_DIR ?= $(or $(wildcard $(HOME)/.local/opt/devtools/usr/share/qemu),/usr/share/qemu)
+# QEMU firmware (SeaBIOS) lookup dir — detected dynamically, not hardcoded.
+# Search a list of common install prefixes (devtools, system, OVMF) and
+# take the first that exists; allow override via environment ( ?= ).
+QEMU_FW_DIR ?= $(shell for d in $(HOME)/.local/opt/devtools/usr/share/qemu /usr/share/qemu /usr/share/ovmf /usr/local/share/qemu; do \
+	if [ -d "$$d" ]; then echo $$d; break; fi; done)
+QEMU_FW_DIR := $(or $(QEMU_FW_DIR),/usr/share/qemu)
 
 # Headless test ISO: same kernel+initrd as the release ISO, but with a
 # grub.cfg that boots straight into cloud/serial mode (timeout=0, no menu,

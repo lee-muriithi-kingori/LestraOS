@@ -175,6 +175,8 @@ void idt_init(void) {
     for (int i = 0; i < 32; i++) {
         idt_set_gate(i, isr_stubs[i], IDT_TYPE_INTERRUPT, IDT_ATTR_RING0);
     }
+    /* FIX: #DF (vector 8) must use IST1 - otherwise kernel stack overflow triple faults */
+    idt_entries[ISR_DOUBLE_FAULT].ist = 1;
     
     /* Set up IRQ handlers (vectors 32-47) */
     for (int i = 32; i < 48; i++) {

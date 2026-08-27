@@ -21,7 +21,7 @@ SECTIONS
     __kernel_start_phys = .;
 
     /* Multiboot2 header - MUST be in first 32K of file, 8-byte aligned */
-    .multiboot2 :
+    .multiboot2 : ALIGN(8)
     {
         KEEP(*(.multiboot2))
     }
@@ -39,6 +39,8 @@ SECTIONS
         __text_start = .;
         *(.text)
         *(.text.*)
+        *(.ltext)
+        *(.ltext.*)
         . = ALIGN(4096);
         __text_end = .;
     }
@@ -49,6 +51,8 @@ SECTIONS
         __rodata_start = .;
         *(.rodata)
         *(.rodata.*)
+        *(.lrodata)
+        *(.lrodata.*)
         . = ALIGN(4096);
         __rodata_end = .;
     }
@@ -59,6 +63,8 @@ SECTIONS
         __data_start = .;
         *(.data)
         *(.data.*)
+        *(.ldata)
+        *(.ldata.*)
         . = ALIGN(4096);
         __data_end = .;
     }
@@ -69,6 +75,8 @@ SECTIONS
         __bss_start = .;
         *(.bss)
         *(.bss.*)
+        *(.lbss)
+        *(.lbss.*)
         *(COMMON)
         . = ALIGN(4096);
         __bss_end = .;

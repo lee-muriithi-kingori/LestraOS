@@ -266,7 +266,7 @@ phys_addr_t pmm_alloc_page(void) {
                      * a metadata page, so the bitmap can never be zeroed
                      * by a caller's memset, and the cascade cannot start. */
                     if (pmm_is_protected(candidate)) {
-                        bitmap_set(pfn);
+                        if (!bitmap_test(pfn)) { bitmap_set(pfn); used_pages++; }
                         continue;
                     }
                     bitmap_set(pfn);
@@ -293,9 +293,9 @@ phys_addr_t pmm_alloc_pages(size_t count) {
         if (!bitmap_test(pfn)) {
             phys_addr_t candidate = pfn * PAGE_SIZE;
             /* KE-35: same dynamic metadata protection as pmm_alloc_page.
-             * Treat protected pages as "used" so the contiguous run breaks. */
+              * Treat protected pages as "used" so the contiguous run breaks. */
             if (pmm_is_protected(candidate)) {
-                bitmap_set(pfn);
+                if (!bitmap_test(pfn)) { bitmap_set(pfn); used_pages++; }
                 found = 0;
                 continue;
             }

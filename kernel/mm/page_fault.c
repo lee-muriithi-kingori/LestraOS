@@ -253,7 +253,7 @@ void page_fault_handler(uintptr_t fault_addr, uint64_t error_code,
      * unmapped page, or if a race left a hole). Map a zeroed
      * user-RW-NX page and resume.
      * ================================================================ */
-    if (user && write && cur && cur->brk_base != 0 &&
+    if (user && cur && cur->brk_base != 0 &&
         fault_addr >= cur->brk_base && fault_addr < cur->brk) {
         /* Make sure the page isn't already present (avoid masking
          * a protection violation on an existing brk page). */

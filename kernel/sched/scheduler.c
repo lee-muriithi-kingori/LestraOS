@@ -24,6 +24,18 @@ static int next_pid = 1;
 static int scheduler_enabled = 0;
 uint64_t save_kernel_cr3 = 0;
 
+/* FIX 2b/2c/2d: file-scope static kstack for PID 1 so proc_reap and
+ * sched_start_first can both see it for kfree guard checks. Previously
+ * pid1_kstack was a function-static inside sched_start_first, invisible
+ * to proc_reap, causing a leak check to be impossible. Similarly, the
+ * old per-fork child_kstack static is replaced by per-child kmalloc
+ * (FIX 2c) — keep a dummy symbol for guard compatibility if needed. */
+static uint8_t pid1_kstack[16384] __aligned(16);
+/* legacy static child stack kept only for guard comparison in proc_reap
+ * when checking `kernel_stack != child_kstack`; after FIX 2c, live child
+ * stacks are kmalloc'd per fork and this buffer is unused. */
+static uint8_t child_kstack[16384] __aligned(16);
+
 /* External: context switch assembly (KE-30: v3 — ISR frame swap + ret) */
 extern void context_switch(struct cpu_state* old_state, struct cpu_state* new_state,
                            uint64_t new_pml4, uint64_t new_kstack_top);
@@ -71,6 +83,8 @@ static void proc_init_per_process_state(struct process* p) {
     p->umask = 0022;            /* default POSIX umask */
     p->needs_kstack_free = 0;
     p->priority = PRIO_DEFAULT;
+    p->uid = 0;
+    p->gid = 0;
 }
 
 struct process* sched_alloc_proc(void) {
@@ -397,9 +411,13 @@ void proc_reap(struct process* p) {
         p->pml4 = NULL;
     }
 
-    /* Free kernel stack */
+    /* Free kernel stack — FIX 2d: do not kfree static stacks.
+     * pid1_kstack and the legacy child_kstack are BSS buffers, not
+     * heap allocations. Freeing them would corrupt the heap. */
     if (p->kernel_stack) {
-        kfree(p->kernel_stack);
+        if (p->kernel_stack != (void*)pid1_kstack && p->kernel_stack != (void*)child_kstack) {
+            kfree(p->kernel_stack);
+        }
         p->kernel_stack = NULL;
     }
 }
@@ -491,6 +509,15 @@ int proc_fork(void) {
     child->umask = current->umask;
     child->priority = current->priority;
 
+    /* FIX 2e: proc_fork was missing copies of sigactions, fs_base,
+     * exe_path and is_linux_process. Without these, the child lost
+     * signal handlers, TLS base, executable path, and Linux-compat flag
+     * after fork, breaking signal delivery and fs/gs handling. */
+    memcpy(child->sigactions, current->sigactions, sizeof(child->sigactions));
+    child->fs_base = current->fs_base;
+    memcpy(child->exe_path, current->exe_path, sizeof(child->exe_path));
+    child->is_linux_process = current->is_linux_process;
+
     child->pml4 = create_proc_pml4();
     if (!child->pml4) { child->state = PROC_FREE; return -1; }
 
@@ -504,15 +531,21 @@ int proc_fork(void) {
     /* Copy stack_bottom from parent (both start with same stack range) */
     child->stack_bottom = current->stack_bottom;
 
-    /* KE-31: Use a static kernel stack for the child.
-     * TODO(KE-34): switch to kmalloc — current kmalloc causes hang
-     * after deep_copy_user_pages returns (investigate heap allocator
-     * interaction with deep-copy page allocations). The static buffer
-     * limits us to ONE forked child at a time, which is fine for the
-     * current fork test but must be fixed before multi-process use. */
-    static uint8_t child_kstack[16384] __aligned(16);
+    /* FIX 2c: per-child kmalloc'd kernel stack. The previous
+     * `static uint8_t child_kstack[16384]` limited the system to a
+     * single live forked child (all children shared the same BSS stack,
+     * clobbering each others' saved_state). Now each child gets its own
+     * heap allocation, stored in proc->kernel_stack and freed in
+     * proc_reap (which now guards against freeing the static pid1_kstack).
+     * If kmalloc fails, unwind the address space and return -ENOMEM. */
+    uint8_t *child_kstack = (uint8_t*)kmalloc(16384);
+    if (!child_kstack) {
+        vmm_destroy_address_space(child->pml4);
+        child->state = PROC_FREE;
+        return -1;
+    }
     child->kernel_stack = child_kstack;
-    child->kernel_stack_top = (uint64_t)child_kstack + sizeof(child_kstack);
+    child->kernel_stack_top = (uint64_t)child_kstack + 16384;
     child->saved_state = (struct cpu_state*)(child->kernel_stack_top - sizeof(struct cpu_state));
 
     /* KE-31: Build child's return state from SYSCALL-saved values.
@@ -672,9 +705,38 @@ void proc_exit(int status) {
 /* Track what PID each process is waiting for (for waitpid blocking) */
 static int wait_target[MAX_PROCS];
 
+/* FIX 2f: Voluntary-block model incoherence.
+ *
+ * task_block/task_sleep call schedule() from kernel context expecting
+ * a voluntary context switch that saves the KERNEL call stack and
+ * returns when the task is re-scheduled. However, context_switch's
+ * direct mode (g_isr_frame == NULL) does `mov rsp, new_kstack_top`
+ * and `iretq` to user space — it discards the old kernel RSP and never
+ * returns to the caller. The blocked task's call stack is thus lost;
+ * when it is next picked, context_switch will build a fresh iret frame
+ * on its kernel stack top, but the previous `schedule()` caller never
+ * gets resumed via `ret`.
+ *
+ * Correct fix is to save the voluntary kernel RSP into
+ * prev->saved_state->krsp (or a per-process saved_kernel_rsp) before
+ * calling schedule(), and have a kernel-restore path that restores RSP
+ * and returns. For now we at least persist the entry RSP so the info
+ * is not lost, and document that schedule() must return without
+ * switching if no other runnable exists (which it already does).
+ *
+ * This function now saves the current kernel RSP into
+ * current->saved_state->krsp (FIX 1b) before calling schedule().
+ */
 void task_block(void) {
     if (!current) return;
     current->state = PROC_BLOCKED;
+    /* FIX 1b/2f: save voluntary kernel RSP for later resume.
+     * context_switch direct mode also saves entry RSP into CS_KRSP,
+     * but saving here captures the caller's RSP before the extra
+     * `push r15`/`push rdx`/`push rcx` prologue in context_switch. */
+    if (current->saved_state) {
+        __asm__ volatile("mov %%rsp, %0" : "=m" (current->saved_state->krsp) :: "memory");
+    }
     schedule();
     /* We've been resumed — either because another task called
      * task_unblock() on us and the scheduler picked us again, or
@@ -746,6 +808,12 @@ void task_sleep(uint64_t ms) {
         if ((int64_t)(timer_get_ms() - deadline) >= 0) break;
 
         current->state = PROC_BLOCKED;
+        /* FIX 1b/2f: save voluntary kernel RSP like task_block does.
+         * See task_block's incoherence comment — direct-mode iret loses
+         * the call stack unless we persist RSP. */
+        if (current->saved_state) {
+            __asm__ volatile("mov %%rsp, %0" : "=m" (current->saved_state->krsp) :: "memory");
+        }
         schedule();
 
         /* If schedule() returned without switching (no other task
@@ -844,6 +912,10 @@ int proc_wait_blocking(int pid, int* status) {
     /* Store which PID we're waiting for (use current's slot index) */
     int idx = (int)(current - procs);
     wait_target[idx] = pid > 0 ? pid : -1;
+    /* FIX 1b/2f: save kernel RSP for voluntary switch (see task_block) */
+    if (current->saved_state) {
+        __asm__ volatile("mov %%rsp, %0" : "=m" (current->saved_state->krsp) :: "memory");
+    }
     schedule();
     wait_target[idx] = 0;
 
@@ -878,6 +950,16 @@ void schedule(void) {
     struct process* prev = current;
     struct process* next = pick_next();
 
+    /* FIX 2f: Voluntary-block coherence requires that schedule()
+     * returns without switching if no other RUNNABLE task exists.
+     * Otherwise a task_block/task_sleep caller would be left in
+     * PROC_BLOCKED with no one to run, hanging forever. This check
+     * already existed (return if !next and prev is RUNNING); we keep
+     * it and document the invariant. Callers in the voluntary path
+     * must have saved their kernel RSP into prev->saved_state->krsp
+     * before calling here (see task_block), because direct-mode
+     * context_switch will switch RSP to next->kernel_stack_top and
+     * iretq — the old RSP would otherwise be lost. */
     if (!next) {
         if (prev && prev->state == PROC_RUNNING) return;
         return;
@@ -935,7 +1017,16 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
         return;
     }
 
-    current = &procs[pid - 1];
+    /* FIX 2a: fragile pid-1 indexing — proc_create may not allocate slot
+     * pid-1 if PIDs are not densely packed or if the table is sparse.
+     * Keep the proc* returned via lookup instead of indexing. This is
+     * robust even if proc_create's slot selection changes. */
+    struct process* _p = sched_find_by_pid_impl(pid);
+    if (!_p) {
+        pr_warn("sched: failed to find just-created pid %d\n", pid);
+        return;
+    }
+    current = _p;
     current->state = PROC_RUNNING;
 
     /* KE-26: Re-enabled preemption. The KE-26 fixes (GDT swap, iretq
@@ -969,7 +1060,16 @@ void sched_start_first(const char* name, const void* elf_data, size_t elf_size) 
      * 16-byte aligned and in the identity-mapped BSS, so both interrupt
      * delivery (TSS.RSP0) and syscall entry (g_syscall_kstack) can
      * reliably push frames here. */
-    static uint8_t pid1_kstack[16384] __aligned(16);
+    /* FIX 2b: pid1_kstack leak — proc_create already kmalloc'd a 16K
+     * kernel stack and stored it in current->kernel_stack. Overwriting
+     * the pointer without freeing leaks that heap block. Free it first
+     * if it was heap-allocated (i.e., not the static pid1_kstack / legacy
+     * child_kstack buffers). */
+    if (current->kernel_stack &&
+        current->kernel_stack != (void*)pid1_kstack &&
+        current->kernel_stack != (void*)child_kstack) {
+        kfree(current->kernel_stack);
+    }
     current->kernel_stack = pid1_kstack;
     current->kernel_stack_top = (uint64_t)pid1_kstack + sizeof(pid1_kstack);
     extern void tss_set_rsp0(uint64_t);

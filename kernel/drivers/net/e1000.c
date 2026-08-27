@@ -84,7 +84,7 @@ static int       e1000_present = 0;
 static uintptr_t e1000_mmio = 0;
 static mac_addr_t e1000_mac = MAC_ZERO;
 
-static struct rx_desc rx_descs[NUM_TX] __aligned(16);
+static struct rx_desc rx_descs[NUM_RX] __aligned(16);
 static struct tx_desc tx_descs[NUM_TX] __aligned(16);
 static uint8_t rx_buffers[NUM_RX][RX_BUF_SZ] __aligned(16);
 static uint8_t tx_buffers[NUM_TX][TX_BUF_SZ] __aligned(16);
@@ -194,7 +194,21 @@ int e1000_init(void) {
         pr_info("e1000: no Intel NIC found via PCI\n");
         return 0;
     }
-    e1000_mmio = pdev->bar[0] & ~0xFu;
+    /* BAR0 is MMIO. Check for 64-bit BAR above 4GB (not accessible without ioremap). */
+    uint32_t bar0_low = pci_config_read32(pdev->bus, pdev->dev, pdev->func, 0x10);
+    uint32_t bar0_high = pci_config_read32(pdev->bus, pdev->dev, pdev->func, 0x14);
+    if ((bar0_low & 0x6) == 0x4) {
+        if (bar0_high) {
+            pr_warn("e1000: BAR0 above 4 GB (0x%x%08x), not accessible\n",
+                    (unsigned)bar0_high, (unsigned)bar0_low);
+            return 0;
+        }
+    } else if (pdev->bar[1]) {
+        pr_warn("e1000: BAR0 high dword non-zero (0x%x), not accessible\n",
+                (unsigned)pdev->bar[1]);
+        return 0;
+    }
+    e1000_mmio = bar0_low & ~0xFu;
     pci_device_enable(pdev);
     pr_info("e1000: found at PCI %02x:%02x.%x, MMIO=0x%x\n",
             pdev->bus, pdev->dev, pdev->func, (unsigned)e1000_mmio);

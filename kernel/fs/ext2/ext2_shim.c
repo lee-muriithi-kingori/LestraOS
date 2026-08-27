@@ -270,3 +270,33 @@ int ext2_file_size(int fd) {
     if (ext2_fds[fd].is_dir) return -1;   /* directories don't have a meaningful "file size" */
     return ext2_fds[fd].size;
 }
+
+/* lseek for ext2 fds — supports SEEK_SET/SEEK_CUR/SEEK_END */
+int ext2_lseek(int fd, off_t offset, int whence) {
+    if (fd < 0 || fd >= MAX_EXT2_FDS || !ext2_fds[fd].used) return -1;
+    if (ext2_fds[fd].is_dir) return -1;
+    off_t base;
+    switch (whence) {
+        case 0: base = 0; break;
+        case 1: base = (off_t)ext2_fds[fd].offset; break;
+        case 2: base = (off_t)ext2_fds[fd].size; break;
+        default: return -1;
+    }
+    off_t new_off = base + offset;
+    if (new_off < 0) return -1;
+    ext2_fds[fd].offset = (int)new_off;
+    return (int)new_off;
+}
+
+/* positional read (pread) for ext2 — does not move offset */
+int ext2_read_at(int fd, void* buf, int count, off_t offset) {
+    if (fd < 0 || fd >= MAX_EXT2_FDS || !ext2_fds[fd].used) return -1;
+    if (ext2_fds[fd].is_dir) return -1;
+    if (!buf || count <= 0) return 0;
+    if (offset < 0) return -1;
+    if ((size_t)offset >= (size_t)ext2_fds[fd].size) return 0;
+    int avail = ext2_fds[fd].size - (int)offset;
+    if (count > avail) count = avail;
+    memcpy(buf, ext2_fds[fd].data + offset, count);
+    return count;
+}

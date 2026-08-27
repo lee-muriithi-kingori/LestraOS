@@ -239,7 +239,7 @@ static uint16_t   vblk_last_used = 0;
 /* Request buffers (one per request slot) */
 static struct virtio_blk_req_hdr vblk_req_hdrs[VBLK_QUEUE_SIZE] __aligned(16);
 static uint8_t   vblk_req_status[VBLK_QUEUE_SIZE] __aligned(4);
-static uint8_t   vblk_data_buf[8 * VBLK_SECTOR_SIZE] __aligned(256);  /* max 8 sectors */
+static uint8_t   vblk_data_buf[8 * VBLK_SECTOR_SIZE] __aligned(4096);  /* max 8 sectors */
 
 /* ========================================================================
  * IO Port Access Helpers (Legacy)

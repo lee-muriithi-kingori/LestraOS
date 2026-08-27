@@ -555,7 +555,9 @@ int tls_connect(ipv4_addr_t ip, uint16_t port, const char* hostname) {
         }
     }
     if (!cert_verified) {
-        pr_warn("tls: WARNING - proceeding without certificate verification\n");
+        pr_warn("tls: certificate verification FAILED — aborting handshake\n");
+        tls_send_alert(TLS_ALERT_FATAL, TLS_ALERT_HANDSHAKE_FAILURE);
+        return 0;
     }
 
     static uint8_t ske_buf[512];

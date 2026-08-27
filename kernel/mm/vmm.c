@@ -179,6 +179,17 @@ void vmm_map_page(uintptr_t* pml4, virt_addr_t virt, phys_addr_t paddr, uint64_t
      * nobody for boot memory). Freeing them here is always wrong. Only
      * user-allocated pages (PAGE_USER set, refcount-tracked) should be
      * freed when their last PTE reference is replaced. */
+    /* Same-virt remap guard: if remapping the same physical page, just update flags
+     * without dec/free to avoid freeing the page we are about to remap. */
+    if (pt[pt_idx] & PAGE_PRESENT) {
+        uint64_t old_phys = pt[pt_idx] & PTE_PHYS_MASK;
+        if (old_phys == paddr) {
+            pt[pt_idx] = paddr | flags | PAGE_PRESENT;
+            invlpg((void*)virt);
+            clac();
+            return;
+        }
+    }
     if ((pt[pt_idx] & PAGE_PRESENT) && (pt[pt_idx] & PAGE_USER)) {
         phys_addr_t old_phys = pt[pt_idx] & PTE_PHYS_MASK;
         /* Decrement refcount of the old physical page. Only free if

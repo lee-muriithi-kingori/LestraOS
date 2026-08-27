@@ -45,6 +45,9 @@ struct fd_entry {
  *   [15..16] = int_no, err_code (saved for diagnostics, not restored)
  *   [17..21] = rip, cs, rflags, rsp, ss (interrupt frame)
  *   [22]    = fs_base (MSR 0xC0000100)
+ *   [23]    = gs_base (MSR 0xC0000101)
+ *   [24]    = kgs_base (MSR 0xC0000102, KernelGSBase)
+ *   [25]    = krsp (saved kernel RSP for voluntary switch, FIX 1b)
  */
 struct cpu_state {
     /* GPRs in isr_common push order (rax first, r15 last) */
@@ -56,6 +59,11 @@ struct cpu_state {
     uint64_t rip, cs, rflags, rsp, ss;
     /* FS segment base */
     uint64_t fs_base;
+    /* GS bases — FIX 1c: must be saved/restored alongside FS */
+    uint64_t gs_base;   /* MSR 0xC0000101 (GS.base) */
+    uint64_t kgs_base;  /* MSR 0xC0000102 (KernelGSBase) */
+    /* Saved kernel RSP for voluntary block path — FIX 1b */
+    uint64_t krsp;
 } __packed;
 
 struct sigaction_entry {
@@ -96,6 +104,8 @@ struct process {
     uint64_t stack_bottom;               /* bottom of mapped stack region (grows downward) */
     uint64_t wake_tick;                  /* timer_get_ms() deadline while sleeping in task_sleep; 0 = not sleeping */
     int priority;                         /* scheduling priority 0..39 (lower = higher priority, PRIO_DEFAULT=20) */
+    int uid;                              /* user ID (0 = root, non-zero = unprivileged) */
+    int gid;                              /* group ID (0 = root) */
     struct fd_entry fds[MAX_FD_PER_PROC]; /* per-process file descriptor table */
 };
 

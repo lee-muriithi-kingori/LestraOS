@@ -146,3 +146,10 @@ int pipe_close(int fd) {
     if (!p->read_open && !p->write_open) p->in_use = 0;
     return 0;
 }
+
+int pipe_bytes_available(int fd) {
+    if (!pipe_is_pipe_fd(fd)) return -1;
+    struct pipe_fd* pfd = &pipe_fds[fd - PIPE_FD_BASE];
+    struct pipe* p = &pipes[pfd->pipe_idx];
+    return p->bytes_available;
+}

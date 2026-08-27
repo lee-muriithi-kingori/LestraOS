@@ -136,7 +136,7 @@ pm32:
     ; GRUB ISO (make iso + make run). GRUB loads kernel.bin as a
     ; multiboot2 kernel and jumps directly to _start, ignoring stage1.
     ; stage1 is only needed if you dd the image directly to a USB/HDD.
-    mov eax, 0x11E00
+    mov eax, 0x10E00
     jmp eax
 
 gdt:

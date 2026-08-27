@@ -1655,6 +1655,7 @@ int net_is_up(void) {
 }
 ipv4_addr_t  net_get_ip(void)        { return my_ip; }
 ipv4_addr_t  net_get_gateway(void)   { return my_gw; }
+ipv4_addr_t  net_get_mask(void)      { return my_mask; }
 ipv4_addr_t  net_get_dns(void)       { return my_dns; }
 mac_addr_t   net_get_mac(void)       { return my_mac; }
 const char*  net_get_iface_name(void){ return net_iface_name; }

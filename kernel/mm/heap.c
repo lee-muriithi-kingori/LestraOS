@@ -37,8 +37,8 @@ void heap_init(void) {
     /* KE-15: Randomize the kernel heap base address.
      * Uses early TSC-based entropy (csprng not yet initialized).
      * The heap region is 512 MB, 2 MB aligned, within the identity-mapped
-     * first 4 GB.  We randomize the start within a 512 MB window
-     * (256 positions at 2 MB alignment = 8 bits of entropy).
+     * first 4 GB.  We randomize the start within a 192 MB window
+     * (96 positions at 2 MB alignment).
      * Constraints: stay above 64 MB (well clear of kernel + page tables),
      * below 768 MB (leave room for VMM alloc region at 2 GB+). */
     uint32_t lo, hi;
@@ -48,7 +48,7 @@ void heap_init(void) {
     tsc ^= tsc >> 33;
     tsc *= 0xff51afd7ed558ccdULL;
     tsc ^= tsc >> 33;
-    /* Random range: 64 MB to 256 MB, 2 MB aligned (256 slots = 8 bits) */
+    /* Random range: 64 MB to 256 MB, 2 MB aligned (96 slots) — 192 MiB / 2 MiB = 96 positions */
     #define KASLR_HEAP_MIN  (64ULL * MiB)
     #define KASLR_HEAP_RANGE (192ULL * MiB)
     uintptr_t slide = (tsc & (KASLR_HEAP_RANGE - 1)) & ~(2ULL * MiB - 1);
@@ -77,15 +77,19 @@ void* kmalloc(size_t size) {
     struct heap_block* curr = free_list;
     while (curr) {
         if (curr->free && curr->size >= total) {
+            /* Unlink from free list to avoid self-loop */
+            if (prev) prev->next = curr->next;
+            else free_list = curr->next;
+            curr->next = NULL;
             curr->free = 0;
             /* Split if block is significantly larger */
             if (curr->size >= total + sizeof(struct heap_block) + 16) {
                 struct heap_block* new_block = (struct heap_block*)((char*)curr + total);
                 new_block->size = curr->size - total;
                 new_block->free = 1;
-                new_block->next = curr->next;
+                new_block->next = free_list;
+                free_list = new_block;
                 curr->size = total;
-                curr->next = new_block;
             }
             return (char*)curr + sizeof(struct heap_block);
         }
@@ -137,10 +141,14 @@ void* krealloc(void* ptr, size_t size) {
 void kfree(void* ptr) {
     if (!ptr) return;
     struct heap_block* block = (struct heap_block*)((char*)ptr - sizeof(struct heap_block));
+    if (block->free) return; /* double-free guard */
     block->free = 1;
 
-    /* Coalesce with next block if free */
-    if (block->next && block->next->free) {
+    /* Coalesce only if physically adjacent, not just list adjacent.
+     * Bump allocator + free-list has no guaranteed physical adjacency
+     * via next pointer; merging non-adjacent blocks corrupts size. */
+    if (block->next && block->next->free &&
+        (uint8_t*)block + block->size == (uint8_t*)block->next) {
         block->size += block->next->size;
         block->next = block->next->next;
     }

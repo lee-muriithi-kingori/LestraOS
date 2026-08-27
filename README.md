@@ -35,7 +35,7 @@
 | Boot | GRUB2 / Multiboot2 / raw MBR |
 | License | MIT |
 | Source | ~40,000 lines C + x86 assembly |
-| Syscalls | 75 (Linux ABI-compatible numbering) |
+| Syscalls | 67 (0–66, Lestra ABI — see `kernel/include/lestra/syscall.h`) |
 | Drivers | 18 (E1000, RTL8139, VirtIO-net, VirtIO-blk, AHCI, AC97, PS/2, serial, PCI, RTC, PIT, HPET, battery, temp) |
 | Filesystems | ext2, FAT32, procfs, devfs, tmpfs, tarfs |
 | Networking | Hand-rolled TCP/IP stack, TLS 1.2, SSH-2.0, HTTP/HTTPS server |
@@ -112,8 +112,8 @@ make run-cloud
 │  libc — memcpy, memset, strlen, printf, malloc/free,         │
 │         read, write, open/close, fork, execve, mmap          │
 ├──────────────────────────────────────────────────────────────┤
-│  System Calls — SYSCALL/SYSRET, 75 calls dispatched          │
-│  Linux ABI-compatible numbering (0=exit, 1=read, 2=write)    │
+│  System Calls — SYSCALL/SYSRET, 67 calls dispatched (0–66)  │
+│  Lestra ABI (0=exit, 2=read, 3=write — see syscall.h)        │
 ├──────────────────────────────────────────────────────────────┤
 │  Kernel                                                      │
 │  [GDT][IDT][ISR][IRQ][PIT] [PMM][VMM][Heap] [Scheduler]     │
@@ -150,22 +150,33 @@ make run-cloud
 - Timer-based `task_sleep()` with wake deadlines
 - Context switch saves/restores all 15 GPRs + segments + RFLAGS
 
-### Syscalls (75 total)
+### Syscalls (67 total — `kernel/include/lestra/syscall.h`, 0–66)
 
 | # | Syscall | # | Syscall | # | Syscall |
 |---|---------|---|---------|---|---------|
-| 0 | exit | 26 | kill | 52 | setpgid |
-| 1 | read | 27 | uname | 56 | dup2 |
-| 2 | write | 29 | getcwd | 59 | getdents |
-| 3 | open | 30 | chdir | 64 | gettimeofday |
-| 4 | close | 31 | mkdir | 67 | sysinfo |
-| 5 | stat | 32 | rmdir | 74 | getrandom |
-| 8 | lseek | 34 | unlink | | ... |
-| 9 | mmap | 35 | rename | | +40 more |
-| 10 | brk | 36 | chmod | | |
-| 13 | pipe | 38 | getpid | | |
-| 16 | rt_sigaction | 21 | fork | | |
-| 23 | execve | 25 | wait4 | | |
+| 0 | exit | 23 | pipe | 46 | connect |
+| 1 | fork | 24 | kill | 47 | listen |
+| 2 | read | 25 | rt_sigaction | 48 | accept |
+| 3 | write | 26 | rt_sigprocmask | 49 | send |
+| 4 | open | 27 | rt_sigreturn | 50 | recv |
+| 5 | close | 28 | dup2 | 51 | poll |
+| 6 | waitpid | 29 | unlink | 52 | select |
+| 7 | execve | 30 | chmod | 53 | dup |
+| 8 | getpid | 31 | fstat | 54 | fcntl |
+| 9 | brk | 32 | access | 55 | truncate |
+| 10 | mmap | 33 | rename | 56 | ftruncate |
+| 11 | munmap | 34 | ioctl | 57 | chown |
+| 12 | gettimeofday | 35 | getuid | 58 | symlink |
+| 13 | sleep | 36 | getgid | 59 | link |
+| 14 | getcwd | 37 | getppid | 60 | readlink |
+| 15 | chdir | 38 | setuid | 61 | chroot |
+| 16 | mkdir | 39 | times | 62 | fchdir |
+| 17 | rmdir | 40 | clock_gettime | 63 | umask |
+| 18 | stat | 41 | getrlimit | 64 | setpriority |
+| 19 | lseek | 42 | setrlimit | 65 | getpriority |
+| 20 | getdents | 43 | futex | 66 | nice |
+| 21 | reboot | 44 | socket | | |
+| 22 | uname | 45 | bind | | |
 
 ### ELF Loading
 - Static ELF64 loader: parses headers, maps PT_LOAD segments, jumps to ring 3 via IRETQ
@@ -412,7 +423,7 @@ LestraOS/
 │   ├── core/              # kernel_main, panic, printk, shell, userspace_boot
 │   ├── mm/                # PMM (bitmap) + VMM (paging) + heap + page_fault
 │   ├── sched/             # Preemptive round-robin + context switch (asm)
-│   ├── syscall/           # SYSCALL/SYSRET + dispatch (75 calls)
+│   ├── syscall/           # SYSCALL/SYSRET + dispatch (67 calls, 0�66)
 │   ├── exec/              # ELF loader, dynamic linker, signals, futex, pipe, TLS
 │   ├── drivers/
 │   │   ├── char/          # serial, keyboard, mouse, pty, timer
@@ -447,7 +458,7 @@ LestraOS/
 - [x] Custom x86_64 kernel boots on QEMU + real hardware
 - [x] GDT, IDT, PIC, PIT, PMM, VMM, heap
 - [x] Preemptive scheduler with fork/COW/exec/wait
-- [x] 75 syscalls (Linux ABI-compatible numbering)
+- [x] 67 syscalls (0�66, Lestra ABI)
 - [x] ELF64 loader + dynamic linker (ldso)
 - [x] VFS + ext2 + FAT32 + procfs + devfs + tmpfs + tarfs
 - [x] Hand-rolled TCP/IP stack (ARP, ICMP, UDP, DHCP, DNS, TCP)

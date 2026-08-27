@@ -30,6 +30,7 @@
 #include <lestra/types.h>
 #include <lestra/printk.h>
 #include <lestra/net.h>
+#include <lestra/nic.h>
 #include <lestra/timer.h>
 #include <lestra/wifi.h>
 #include <string.h>
@@ -159,13 +160,29 @@ static int      is_authenticated = 0;
 static int      is_associated    = 0;
 
 /* ===================================================================
- * E1000 driver entry points (defined in drivers/net/e1000.c)
+ * NIC driver abstraction — use active_nic_ops vtable instead of hardcoded e1000
+ * Fallback to e1000 for early init before active_nic_ops is set.
  * =================================================================== */
 
 extern int        e1000_send(const void* data, uint16_t len);
 extern int        e1000_recv(void* buf, uint16_t bufsz);
 extern mac_addr_t e1000_get_mac(void);
 extern int        e1000_is_present(void);
+
+static inline int wifi_nic_send(const void* data, uint16_t len) {
+    if (active_nic_ops && active_nic_ops->send)
+        return active_nic_ops->send(data, len);
+    return e1000_send(data, len);
+}
+static inline mac_addr_t wifi_nic_get_mac(void) {
+    if (active_nic_ops && active_nic_ops->get_mac)
+        return active_nic_ops->get_mac();
+    return e1000_get_mac();
+}
+static inline int wifi_nic_is_present(void) {
+    if (active_nic_ops) return 1;
+    return e1000_is_present();
+}
 
 /* ===================================================================
  * Local Ethernet header (matches net.c's struct eth_hdr layout)
@@ -336,7 +353,7 @@ static void wifi_send_frame(const uint8_t* mgmt_frame, int mgmt_len)
     uint8_t eth_buf[sizeof(struct wifi_eth_hdr) + WIFI_FRAME_BUF];
     struct wifi_eth_hdr* eth = (struct wifi_eth_hdr*)eth_buf;
 
-    mac_addr_t our_mac = e1000_get_mac();
+    mac_addr_t our_mac = wifi_nic_get_mac();
     mac_addr_t bcast   = MAC_BROADCAST;
 
     eth->dst       = bcast;
@@ -344,7 +361,7 @@ static void wifi_send_frame(const uint8_t* mgmt_frame, int mgmt_len)
     eth->ethertype = htons16(WIFI_ETH_TYPE);
     memcpy(eth_buf + sizeof(struct wifi_eth_hdr), mgmt_frame, mgmt_len);
 
-    e1000_send(eth_buf, (uint16_t)(sizeof(struct wifi_eth_hdr) + mgmt_len));
+    wifi_nic_send(eth_buf, (uint16_t)(sizeof(struct wifi_eth_hdr) + mgmt_len));
 }
 
 static void wifi_send_probe_request(mac_addr_t our_mac,
@@ -699,7 +716,7 @@ static void wpa_generate_snonce(void)
 
 static void wpa_derive_ptk(void)
 {
-    mac_addr_t our_mac = e1000_get_mac();
+    mac_addr_t our_mac = wifi_nic_get_mac();
     memcpy(wpa.mac_addr, our_mac.bytes, 6);
     wpa2_prf512(wpa.pmk, wpa.ap_mac, wpa.mac_addr,
                 wpa.anonce, wpa.snonce, wpa.ptk);
@@ -720,7 +737,7 @@ static void wifi_send_eapol(const uint8_t* body, uint16_t body_len,
     int off = 0;
 
     memcpy(pkt + off, dst_mac, 6);           off += 6;
-    mac_addr_t our_mac = e1000_get_mac();
+    mac_addr_t our_mac = wifi_nic_get_mac();
     memcpy(pkt + off, our_mac.bytes, 6);      off += 6;
     pkt[off++] = (uint8_t)((EAPOL_ETH_TYPE >> 8) & 0xFF);
     pkt[off++] = (uint8_t)(EAPOL_ETH_TYPE & 0xFF);
@@ -733,7 +750,7 @@ static void wifi_send_eapol(const uint8_t* body, uint16_t body_len,
     memcpy(pkt + off, body, body_len);
     off += body_len;
 
-    e1000_send(pkt, (uint16_t)off);
+    wifi_nic_send(pkt, (uint16_t)off);
 }
 
 static void wpa_send_message_2(void)
@@ -1058,8 +1075,9 @@ void wifi_init(void)
     memset(&wpa, 0, sizeof(wpa));
     initialized   = 1;
 
-    if (e1000_is_present()) {
-        pr_info("wifi: NIC present, probes ethertype 0x%04X, EAPOL 0x%04X\n",
+    if (wifi_nic_is_present()) {
+        pr_info("wifi: NIC present (%s), probes ethertype 0x%04X, EAPOL 0x%04X\n",
+                active_nic_ops ? active_nic_ops->name : "e1000",
                 WIFI_ETH_TYPE, EAPOL_ETH_TYPE);
     } else {
         pr_warn("wifi: no network hardware — WiFi unavailable\n");
@@ -1075,12 +1093,12 @@ int wifi_scan(void)
 {
     if (!initialized) return 0;
 
-    if (!e1000_is_present()) {
+    if (!wifi_nic_is_present()) {
         pr_warn("wifi: no NIC — cannot scan\n");
         return 0;
     }
 
-    mac_addr_t our_mac = e1000_get_mac();
+    mac_addr_t our_mac = wifi_nic_get_mac();
 
     pr_info("wifi: scanning channels ");
     for (int i = 0; i < WIFI_SCAN_CHANNELS; i++) {
@@ -1154,7 +1172,7 @@ void wifi_handle_frame(const uint8_t* data, uint16_t len)
             if (wifi_parse_auth_response(data, len) == 0) {
                 is_authenticated = 1;
                 pr_info("wifi: authenticated — sending assoc request\n");
-                mac_addr_t our_mac = e1000_get_mac();
+                mac_addr_t our_mac = wifi_nic_get_mac();
                 mac_addr_t bssid;
                 memcpy(bssid.bytes, assoc_bssid, 6);
                 wifi_send_assoc_request(our_mac, bssid,
@@ -1208,7 +1226,7 @@ int wifi_connect(const char* ssid, const char* password)
 
     pr_info("wifi: connect request to \"%s\"\n", ssid);
 
-    if (!e1000_is_present()) {
+    if (!wifi_nic_is_present()) {
         pr_warn("wifi: no NIC — cannot connect\n");
         return -1;
     }
@@ -1252,7 +1270,7 @@ int wifi_connect(const char* ssid, const char* password)
 
     /* --- Step 1: Open-System Authentication --- */
     pr_info("wifi: authenticating (open system) with %s ...\n", ssid);
-    mac_addr_t our_mac = e1000_get_mac();
+    mac_addr_t our_mac = wifi_nic_get_mac();
     mac_addr_t bssid;
     memcpy(bssid.bytes, assoc_bssid, 6);
     wifi_send_auth_request(our_mac, bssid);

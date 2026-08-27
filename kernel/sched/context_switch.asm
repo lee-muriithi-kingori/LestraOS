@@ -58,6 +58,9 @@ global context_switch
 %define CS_RSP    0xA0
 %define CS_SS     0xA8
 %define CS_FSBASE 0xB0
+%define CS_GSBASE 0xB8
+%define CS_KGSBASE 0xC0
+%define CS_KRSP   0xC8
 
 ; ISR frame offsets (from g_isr_frame)
 ;; ISR frame offsets (from g_isr_frame = RSP after all 15 GPRs pushed).
@@ -71,7 +74,7 @@ global context_switch
 ;; struct cpu_state layout (sched.h):
 ;;   [0x00] rax .. [0x70] r15  (push order, NOT stack order)
 ;;   [0x78] int_no  [0x80] err_code
-;;   [0x88] rip .. [0xA8] ss  [0xB0] fs_base
+;;   [0x88] rip .. [0xA8] ss  [0xB0] fs_base [0xB8] gs_base [0xC0] kgs_base [0xC8] krsp
 ;;
 ;; KE-32 BUGFIX: The original KE-30/31 offsets assumed g_isr_frame
 ;; pointed to rax (first push), but it actually points to r15 (last
@@ -111,6 +114,12 @@ section .text
 context_switch:
     cli
 
+    ;; FIX 1a: save original r15 before clobbering it.
+    ;; `mov r15,rdi` would otherwise destroy the user r15 value that
+    ;; .save_no_isr later needs to store into CS_R15. By pushing r15
+    ;; first, the original value lives at [rsp+16] after the two
+    ;; further pushes and can be reloaded for the CS_R15 store.
+    push    r15
     ;; Save new_pml4 (rdx) and new_kstack_top (rcx) on the stack.
     ;; We will pop them after reading new_state (rbp).
     push    rdx
@@ -134,6 +143,19 @@ context_switch:
     rdmsr
     mov     [r15 + CS_FSBASE], eax
     mov     [r15 + CS_FSBASE + 4], edx
+
+    ;; Save GS base MSRs (0xC0000101 = GS.base, 0xC0000102 = KernelGS.base)
+    ;; Mirror FS handling — both must be preserved per-process so that
+    ;; user thread-local storage and per-CPU kernel GS don't leak across
+    ;; context switches.
+    mov     ecx, 0xC0000101
+    rdmsr
+    mov     [r15 + CS_GSBASE], eax
+    mov     [r15 + CS_GSBASE + 4], edx
+    mov     ecx, 0xC0000102
+    rdmsr
+    mov     [r15 + CS_KGSBASE], eax
+    mov     [r15 + CS_KGSBASE + 4], edx
 
     ;; Check for ISR frame
     mov     r8, [g_isr_frame]
@@ -166,13 +188,27 @@ context_switch:
     jmp     .save_done
 
 .save_no_isr:
-    ;; No ISR frame — save callee-saved from registers
+    ;; No ISR frame — save callee-saved from registers.
+    ;; FIX 1a: original r15 was pushed at entry; it lives at [rsp+16].
+    ;; Using `mov [r15+CS_R15],r15` would store the old_state pointer
+    ;; (r15 == rdi) rather than the user r15. Reload the saved value.
     mov     [r15 + CS_RBX], rbx
     mov     [r15 + CS_RBP], rbp
     mov     [r15 + CS_R12], r12
     mov     [r15 + CS_R13], r13
     mov     [r15 + CS_R14], r14
-    mov     [r15 + CS_R15], r15
+    mov     rax, [rsp + 16]
+    mov     [r15 + CS_R15], rax
+
+    ;; FIX 1b: save voluntary kernel RSP so the blocked task's call
+    ;; stack is not lost. Direct-mode currently discards old RSP by
+    ;; `mov rsp,r9` to the new kstack. Persist entry RSP (return address
+    ;; slot) into CS_KRSP for a future kernel-restore path. The
+    ;; scheduler's voluntary-block helpers (task_block/task_sleep) must
+    ;; ensure kernel state is saved; see scheduler.c comment.
+    mov     rax, rsp
+    add     rax, 24
+    mov     [r15 + CS_KRSP], rax
 
 .save_done:
 .no_save:
@@ -186,9 +222,17 @@ context_switch:
     ;; =============================================
     ;; DIRECT MODE
     ;; =============================================
-    ;; Pop saved args
+    ;; FIX 1a stack: we pushed r15,r dx,rcx (3 slots) at entry.
+    ;; Pop new_kstack_top (rcx) and new_pml4 (rdx), then discard saved r15.
+    ;; FIX 1b: direct mode builds iret frame on new_kstack_top. This
+    ;; correctly builds the user return frame without touching the old
+    ;; kernel call stack (which remains at saved CS_KRSP). Callers in
+    ;; voluntary-block path (task_block/task_sleep) must save kernel RSP
+    ;; into prev->saved_state->krsp before calling schedule(); see
+    ;; scheduler.c voluntary-block comment.
     pop     r9                        ; r9  = new_kstack_top
     pop     r8                        ; r8  = new_pml4
+    add     rsp, 8                    ; discard saved original r15 (FIX 1a)
 
     ;; Switch CR3
     mov     rax, cr3
@@ -226,6 +270,15 @@ context_switch:
     mov     eax, [r11 + CS_FSBASE]
     mov     edx, [r11 + CS_FSBASE + 4]
     wrmsr
+    ;; Restore GS bases (FIX 1c)
+    mov     ecx, 0xC0000101
+    mov     eax, [r11 + CS_GSBASE]
+    mov     edx, [r11 + CS_GSBASE + 4]
+    wrmsr
+    mov     ecx, 0xC0000102
+    mov     eax, [r11 + CS_KGSBASE]
+    mov     edx, [r11 + CS_KGSBASE + 4]
+    wrmsr
 
     ;; Push iretq frame: SS, RSP, RFLAGS, CS, RIP
     push    rdi                      ; SS
@@ -248,7 +301,9 @@ context_switch:
     ;; ISR-SWAP MODE
     ;; =============================================
 .isr_swap:
-    ;; Pop saved args (still on stack below our pushes)
+    ;; FIX 1a stack: we pushed r15,rdx,rcx (3 slots). Layout:
+    ;; [rsp]=rcx (new_kstack_top), [rsp+8]=rdx (new_pml4),
+    ;; [rsp+16]=saved r15, [rsp+24]=return address.
     ;; KE-32 BUGFIX: rdx (new_pml4) was pushed first → [rsp+8],
     ;; rcx (new_kstack_top) pushed second → [rsp].
     ;; Original KE-31 had these swapped, causing CR3 to be loaded
@@ -281,16 +336,16 @@ context_switch:
     mov     rax, [r11 + CS_SS];   mov [r8 + ISR_SS], rax
 
     ;; Switch CR3 to new process's page table
-    ;; KE-36 DIAG: capture return address ([rsp+16]) before CR3 switch
-    mov     rax, [rsp + 16]
+    ;; KE-36 DIAG: capture return address ([rsp+24]) before CR3 switch (FIX 1a offset)
+    mov     rax, [rsp + 24]
     mov     [rel g_ke36_ret_before_cr3], rax
     mov     rax, cr3
     cmp     rax, r10
     je      .isr_cr3_ok
     mov     cr3, r10                   ; r10 = new_pml4
 .isr_cr3_ok:
-    ;; KE-36 DIAG: capture return address ([rsp+16]) after CR3 switch
-    mov     rax, [rsp + 16]
+    ;; KE-36 DIAG: capture return address ([rsp+24]) after CR3 switch
+    mov     rax, [rsp + 24]
     mov     [rel g_ke36_ret_after_cr3], rax
 
     ;; Update TSS.RSP0 and g_syscall_kstack for new process
@@ -301,6 +356,15 @@ context_switch:
     mov     ecx, 0xC0000100
     mov     eax, [r11 + CS_FSBASE]
     mov     edx, [r11 + CS_FSBASE + 4]
+    wrmsr
+    ;; Restore GS bases (FIX 1c)
+    mov     ecx, 0xC0000101
+    mov     eax, [r11 + CS_GSBASE]
+    mov     edx, [r11 + CS_GSBASE + 4]
+    wrmsr
+    mov     ecx, 0xC0000102
+    mov     eax, [r11 + CS_KGSBASE]
+    mov     edx, [r11 + CS_KGSBASE + 4]
     wrmsr
 
     ;; KE-35 FIX: Do NOT restore callee-saved regs (rbx/rbp/r12-r15) or
@@ -313,8 +377,8 @@ context_switch:
     ;; Return to interrupt_dispatch -> isr_common.
     ;; isr_common will pop all 15 GPRs (now the new process's values)
     ;; and iretq using the updated interrupt frame.
-    add     rsp, 16                   ; clean up our two saved args
-    ;; KE-36 DIAG: capture [rsp] right before ret (after add rsp, 16)
+    add     rsp, 24                   ; clean up 3 saved args (FIX 1a was 16)
+    ;; KE-36 DIAG: capture [rsp] right before ret (after add rsp, 24)
     mov     rax, [rsp]
     mov     [rel g_ke36_ret_at_ret], rax
     ret

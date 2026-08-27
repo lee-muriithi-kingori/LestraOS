@@ -128,14 +128,14 @@ void gdt_init(void) {
     gdt_set_entry(2, 0, 0xFFFFF,
                   GDT_ACCESS_PRESENT | GDT_ACCESS_RING0 |
                   GDT_ACCESS_S | GDT_ACCESS_RW,
-                  GDT_GRAN_4K | GDT_GRAN_64BIT);
+                  GDT_GRAN_4K);
 
     /* KE-26: User DATA segment (ring 3) — slot 3 (selector 0x18)
      * MUST precede USER_CS for the sysret SS = (STAR[63:48]+8)|3 formula. */
     gdt_set_entry(3, 0, 0xFFFFF,
                   GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 |
                   GDT_ACCESS_S | GDT_ACCESS_RW,
-                  GDT_GRAN_4K | GDT_GRAN_64BIT);
+                  GDT_GRAN_4K);
 
     /* KE-26: User CODE segment (64-bit, ring 3) — slot 4 (selector 0x20) */
     gdt_set_entry(4, 0, 0xFFFFF,
@@ -172,7 +172,7 @@ void gdt_init(void) {
     }
     write_cr4(cr4);
 
-    pr_debug("GDT initialized with 6 entries (5 code/data + TSS, IST1 #DF stack)\n");
+    pr_debug("GDT initialized with 7 entries (5 code/data + TSS, IST1 #DF stack)\n");
     pr_debug("SMEP: %s  SMAP: %s\n",
               g_security.smep ? "ENABLED" : "not available",
               g_security.smap ? "ENABLED" : "not available");

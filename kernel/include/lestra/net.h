@@ -141,6 +141,7 @@ void net_tick(void);
 int          net_is_up(void);             /* 1 once DHCP completes */
 ipv4_addr_t  net_get_ip(void);
 ipv4_addr_t  net_get_gateway(void);
+ipv4_addr_t  net_get_mask(void);
 ipv4_addr_t  net_get_dns(void);
 mac_addr_t   net_get_mac(void);
 const char*  net_get_iface_name(void);

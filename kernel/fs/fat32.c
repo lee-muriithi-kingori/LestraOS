@@ -371,7 +371,7 @@ int fat32_init(fat32_read_fn read_fn) {
         memcpy(&ts, sec_buf + 19, 2);
         total_sec = ts;
     }
-    uint32_t data_sec = total_sec - bpb.reserved_sectors - fat_size;
+    uint32_t data_sec = total_sec - bpb.reserved_sectors - fat_size * num_fats;
     bpb.total_clusters = data_sec / bpb.sectors_per_cluster;
 
     mounted = 1;

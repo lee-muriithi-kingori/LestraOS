@@ -48,9 +48,17 @@ int http_parse_url(const char* url,
         p = colon + 3;   /* skip "://" */
     }
 
+    /* Set default port based on scheme — https uses 443 */
+    int is_https = 0;
+    if (schemelen > 0 && scheme_out && scheme_out[0]) {
+        if (strcmp(scheme_out, "https") == 0) is_https = 1;
+    } else if (schemelen == 5) {
+        /* Fallback if scheme_out buffer was too small: check raw url prefix */
+        if (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s') is_https = 1;
+    }
     /* Extract host[:port] */
     int hostlen = 0;
-    *port_out = 80;   /* default HTTP port */
+    *port_out = is_https ? 443 : 80;
     while (*p && *p != '/' && *p != '\0') {
         if (*p == ':') {
             /* Port number follows */

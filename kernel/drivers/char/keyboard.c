@@ -276,6 +276,10 @@ void keyboard_set_handler(void (*handler)(uint8_t scancode, char ascii)) {
     key_handler = handler;
 }
 
+void (*keyboard_get_handler(void))(uint8_t scancode, char ascii) {
+    return key_handler;
+}
+
 void keyboard_inject_char(char c) {
     /* Push a single ASCII char into the keyboard ring buffer so that
      * keyboard_getchar() / keyboard_has_key() see it, exactly as if

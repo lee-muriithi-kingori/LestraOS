@@ -495,9 +495,9 @@ static int vnet_detect_modern(void) {
     uint8_t dev = vnet_pci_entry->dev;
     uint8_t func = vnet_pci_entry->func;
 
-    /* Cache all BAR base addresses from the pci_device (already decoded by pci.c) */
+    /* Cache all BAR base addresses — properly combine high dword for 64-bit BARs */
     for (int i = 0; i < 6; i++) {
-        uint32_t bar_val = vnet_pci_entry->bar[i];
+        uint32_t bar_val = pci_config_read32(bus, dev, func, 0x10 + i * 4);
         if (bar_val == 0 || bar_val == 0xFFFFFFFFu) {
             vnet_bars[i] = 0;
             continue;
@@ -505,7 +505,17 @@ static int vnet_detect_modern(void) {
         if (bar_val & 1) {
             vnet_bars[i] = bar_val & ~0x3u;
         } else {
-            vnet_bars[i] = bar_val & ~0xFu;
+            uint8_t bar_type = (bar_val >> 1) & 3;
+            if (bar_type == 0) {
+                vnet_bars[i] = bar_val & ~0xFu;
+            } else if (bar_type == 2 && i + 1 < 6) {
+                uint32_t bar_hi = pci_config_read32(bus, dev, func, 0x10 + (i + 1) * 4);
+                vnet_bars[i] = (bar_val & ~0xFu) | ((uint64_t)bar_hi << 32);
+                vnet_bars[i + 1] = 0;
+                i++;
+            } else {
+                vnet_bars[i] = bar_val & ~0xFu;
+            }
         }
     }
 
@@ -671,13 +681,10 @@ static int vnet_register_vq(uint16_t queue_idx, uint16_t qsz,
             return 0;
         }
     } else {
-        /* Legacy: write page frame number of the virtqueue allocation */
-        /* The PFN is the physical page number (address / 4096) */
-        /* Since LestraOS uses identity mapping, virt addr = phys addr */
-        uintptr_t vq_phys = (uintptr_t)vnet_rx_vq_mem; /* base of the contiguous allocation */
-        /* Actually, the PFN should be the start of the page containing the
-         * virtqueue data. Since our allocation is page-aligned, this is
-         * simply vq_phys / 4096. */
+        /* Legacy: write page frame number — must use THIS queue's desc_addr,
+         * not a hardcoded RX base. Queue 1 (TX) would otherwise point at
+         * the RX virtqueue memory. desc_addr is page-aligned and identity-
+         * mapped (virt == phys). */
         uint32_t pfn = (uint32_t)(desc_addr / VNET_VQ_ALIGN);
         vnet_io_write32(VIRTIO_PCI_QUEUE_PFN, pfn);
     }
@@ -784,14 +791,16 @@ int virtio_net_init(void) {
     /* Step 9: Set up RX virtqueue (queue 0) */
     vnet_select_queue(0);
     vnet_rx_qsz = vnet_read_queue_size();
-    if (vnet_rx_qsz == 0 || vnet_rx_qsz > VNET_QUEUE_SIZE) {
-        pr_warn("virtio_net: RX queue size %u, using %u\n",
-                (unsigned)vnet_rx_qsz, (unsigned)VNET_QUEUE_SIZE);
-        vnet_rx_qsz = VNET_QUEUE_SIZE;
-    }
-    /* For legacy, vnet_rx_qsz is the max; we can use it directly.
-     * For modern, we need to write our chosen size back. */
+    if (vnet_rx_qsz == 0) vnet_rx_qsz = VNET_QUEUE_SIZE;
     if (vnet_is_modern) {
+        /* CRITICAL: legacy device computes queue layout from its own QueueNum.
+         * If we clamp for legacy, avail/used offsets mismatch and device never
+         * sees our descriptors. Clamp only for modern. */
+        if (vnet_rx_qsz > VNET_QUEUE_SIZE) {
+            pr_warn("virtio_net: RX queue size %u clamped to %u (modern)\n",
+                    (unsigned)vnet_rx_qsz, (unsigned)VNET_QUEUE_SIZE);
+            vnet_rx_qsz = VNET_QUEUE_SIZE;
+        }
         vnet_write_queue_size(vnet_rx_qsz);
     }
 
@@ -830,12 +839,13 @@ int virtio_net_init(void) {
     /* Step 10: Set up TX virtqueue (queue 1) */
     vnet_select_queue(1);
     vnet_tx_qsz = vnet_read_queue_size();
-    if (vnet_tx_qsz == 0 || vnet_tx_qsz > VNET_QUEUE_SIZE) {
-        pr_warn("virtio_net: TX queue size %u, using %u\n",
-                (unsigned)vnet_tx_qsz, (unsigned)VNET_QUEUE_SIZE);
-        vnet_tx_qsz = VNET_QUEUE_SIZE;
-    }
+    if (vnet_tx_qsz == 0) vnet_tx_qsz = VNET_QUEUE_SIZE;
     if (vnet_is_modern) {
+        if (vnet_tx_qsz > VNET_QUEUE_SIZE) {
+            pr_warn("virtio_net: TX queue size %u clamped to %u (modern)\n",
+                    (unsigned)vnet_tx_qsz, (unsigned)VNET_QUEUE_SIZE);
+            vnet_tx_qsz = VNET_QUEUE_SIZE;
+        }
         vnet_write_queue_size(vnet_tx_qsz);
     }
 
@@ -947,10 +957,13 @@ int virtio_net_send(const void* data, uint16_t len) {
     barrier();
     vnet_notify_queue(1);  /* queue 1 = TX */
 
-    /* Wait for the device to process the descriptor (polling) */
+    /* Wait for the device to process the descriptor (polling)
+     * CRITICAL: used->idx is written by the device via DMA — must use
+     * volatile to prevent GCC -O2 hoisting the load out of the loop. */
+    volatile struct virtq_used* tx_used_v = (volatile struct virtq_used*)vnet_tx_used;
     int timed_out = 1;
     for (int i = 0; i < 10000000; i++) {
-        if (vnet_tx_used->idx != vnet_tx_last_used) {
+        if (tx_used_v->idx != vnet_tx_last_used) {
             timed_out = 0;
             break;
         }
@@ -959,7 +972,7 @@ int virtio_net_send(const void* data, uint16_t len) {
     if (timed_out) {
         pr_warn("virtio_net: TX timeout (desc %u, len=%u, used.idx=%u, last_used=%u)\n",
                 (unsigned)desc_idx, (unsigned)len,
-                (unsigned)vnet_tx_used->idx, (unsigned)vnet_tx_last_used);
+                (unsigned)tx_used_v->idx, (unsigned)vnet_tx_last_used);
         /* Don't advance the descriptor index on timeout to avoid corruption */
         return 0;
     }
@@ -991,8 +1004,10 @@ int virtio_net_send(const void* data, uint16_t len) {
 int virtio_net_recv(void* buf, uint16_t bufsz) {
     if (!vnet_present) return 0;
 
-    /* Check if the device has placed any completed descriptors in the used ring */
-    if (vnet_rx_used->idx == vnet_rx_last_used) {
+    /* Check if the device has placed any completed descriptors in the used ring
+     * Must use volatile — device writes used->idx via DMA. */
+    volatile struct virtq_used* rx_used_v = (volatile struct virtq_used*)vnet_rx_used;
+    if (rx_used_v->idx == vnet_rx_last_used) {
         return 0;  /* no new packets */
     }
 

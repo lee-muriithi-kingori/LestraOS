@@ -5,7 +5,7 @@
  * Bridges the path-based FAT32 driver to the fd-based VFS interface.
  * Follows the same pattern as ext2_shim.c but adds write support.
  *
- * FD range: 200..299 (fat32 fd = actual fd - 200)
+ * FD range: 300..315 (fat32 fd = actual fd - 300)
  *
  * Write strategy:
  *   - File data is cached in memory on open (like ext2_shim).
@@ -284,4 +284,32 @@ int fat32_shim_file_size(int fd) {
     if (fd < 0 || fd >= MAX_FAT32_FDS || !fat32_fds[fd].used) return -1;
     if (fat32_fds[fd].is_dir) return -1;
     return fat32_fds[fd].size;
+}
+
+int fat32_shim_lseek(int fd, off_t offset, int whence) {
+    if (fd < 0 || fd >= MAX_FAT32_FDS || !fat32_fds[fd].used) return -1;
+    if (fat32_fds[fd].is_dir) return -1;
+    off_t base;
+    switch (whence) {
+        case 0: base = 0; break;
+        case 1: base = (off_t)fat32_fds[fd].offset; break;
+        case 2: base = (off_t)fat32_fds[fd].size; break;
+        default: return -1;
+    }
+    off_t new_off = base + offset;
+    if (new_off < 0) return -1;
+    fat32_fds[fd].offset = (int)new_off;
+    return (int)new_off;
+}
+
+int fat32_shim_read_at(int fd, void* buf, int count, off_t offset) {
+    if (fd < 0 || fd >= MAX_FAT32_FDS || !fat32_fds[fd].used) return -1;
+    if (fat32_fds[fd].is_dir) return -1;
+    if (!buf || count <= 0) return 0;
+    if (offset < 0) return -1;
+    if ((size_t)offset >= (size_t)fat32_fds[fd].size) return 0;
+    int avail = fat32_fds[fd].size - (int)offset;
+    if (count > avail) count = avail;
+    memcpy(buf, fat32_fds[fd].data + offset, count);
+    return count;
 }

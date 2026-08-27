@@ -43,7 +43,7 @@ enum {
     TK_COUNT
 };
 
-static uint32_t theme_tokens[2][TK_COUNT] = {
+static const uint32_t theme_base_tokens[2][TK_COUNT] = {
     /* Dark variant — matches the existing UI_* palette in fb.h. */
     [THEME_DARK] = {
         [TK_BG_BASE]      = 0xFF0A0C12,
@@ -77,6 +77,11 @@ static uint32_t theme_tokens[2][TK_COUNT] = {
         [TK_SUCCESS]      = 0xFF16A34A,
     }
 };
+
+/* Current (active) palette — mutated by theme_set/theme_toggle so the base
+ * table stays immutable. Fixes the mutation bug where theme_tokens[variant][TK_ACCENT]
+ * would permanently overwrite the base accent color. */
+static uint32_t theme_current[TK_COUNT];
 
 /* Accent palette — 6 options, indexed 0..5. */
 static uint32_t theme_accents[6] = {
@@ -129,10 +134,19 @@ static void theme_save(void) {
     vfs_close(fd);
 }
 
+/* Apply the base variant to theme_current and overlay the accent. */
+static void theme_apply(void) {
+    memcpy(theme_current, theme_base_tokens[theme_state.variant],
+           sizeof(theme_current));
+    theme_current[TK_ACCENT]     = theme_accents[theme_state.accent_idx];
+    theme_current[TK_ACCENT_HOT] = theme_accents[theme_state.accent_idx];
+}
+
 /* ---------- public API ---------- */
 void theme_init(void) {
     if (theme_state.inited) return;
     theme_load();
+    theme_apply();
     pr_info("theme: initialised (variant=%s, accent=%d)\n",
             theme_state.variant == THEME_DARK ? "dark" : "light",
             theme_state.accent_idx);
@@ -146,59 +160,56 @@ void theme_set(int variant, int accent_idx) {
     if (accent_idx >= 0 && accent_idx < 6) {
         theme_state.accent_idx = accent_idx;
     }
-    /* Override the accent token in the active table. */
-    theme_tokens[theme_state.variant][TK_ACCENT]      = theme_accents[theme_state.accent_idx];
-    theme_tokens[theme_state.variant][TK_ACCENT_HOT]  = theme_accents[theme_state.accent_idx];
+    theme_apply();
     theme_save();
 }
 
 void theme_toggle(void) {
     if (!theme_state.inited) theme_init();
     theme_state.variant = (theme_state.variant == THEME_DARK)
-                          ? THEME_LIGHT : THEME_DARK;
-    theme_tokens[theme_state.variant][TK_ACCENT]      = theme_accents[theme_state.accent_idx];
-    theme_tokens[theme_state.variant][TK_ACCENT_HOT]  = theme_accents[theme_state.accent_idx];
+                           ? THEME_LIGHT : THEME_DARK;
+    theme_apply();
     theme_save();
 }
 
 uint32_t theme_accent(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_ACCENT];
+    return theme_current[TK_ACCENT];
 }
 
 uint32_t theme_text_primary(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_TEXT_PRIMARY];
+    return theme_current[TK_TEXT_PRIMARY];
 }
 
 uint32_t theme_text_muted(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_TEXT_MUTED];
+    return theme_current[TK_TEXT_MUTED];
 }
 
 uint32_t theme_bg_base(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_BG_BASE];
+    return theme_current[TK_BG_BASE];
 }
 
 uint32_t theme_card_bg(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_CARD_BG];
+    return theme_current[TK_CARD_BG];
 }
 
 uint32_t theme_card_border(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_CARD_BORDER];
+    return theme_current[TK_CARD_BORDER];
 }
 
 uint32_t theme_danger(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_DANGER];
+    return theme_current[TK_DANGER];
 }
 
 uint32_t theme_success(void) {
     if (!theme_state.inited) theme_init();
-    return theme_tokens[theme_state.variant][TK_SUCCESS];
+    return theme_current[TK_SUCCESS];
 }
 
 int theme_variant(void) {

@@ -150,6 +150,64 @@ ssize_t tmpfs_write(int fd, const void* buf, size_t count) {
     return (ssize_t)count;
 }
 
+int tmpfs_lseek(int fd, off_t offset, int whence) {
+    fd -= TMPFS_FD_BASE;
+    if (fd < 0 || fd >= TMPFS_MAX_OPEN || !tmpfs_opens[fd].used) return -1;
+    int idx = tmpfs_opens[fd].inode_idx;
+    if (idx < 0 || !tmpfs_inodes[idx].used) return -1;
+    off_t base;
+    switch (whence) {
+        case 0: base = 0; break;
+        case 1: base = (off_t)tmpfs_opens[fd].pos; break;
+        case 2: base = (off_t)tmpfs_inodes[idx].size; break;
+        default: return -1;
+    }
+    off_t new_off = base + offset;
+    if (new_off < 0) return -1;
+    tmpfs_opens[fd].pos = (size_t)new_off;
+    return (int)new_off;
+}
+
+int tmpfs_read_at(int fd, void* buf, size_t count, off_t offset) {
+    fd -= TMPFS_FD_BASE;
+    if (fd < 0 || fd >= TMPFS_MAX_OPEN || !tmpfs_opens[fd].used) return -1;
+    if (!buf) return -EFAULT;
+    int idx = tmpfs_opens[fd].inode_idx;
+    if (idx < 0 || !tmpfs_inodes[idx].used) return -1;
+    struct tmpfs_inode* ino = &tmpfs_inodes[idx];
+    if ((size_t)offset >= ino->size) return 0;
+    size_t avail = ino->size - (size_t)offset;
+    if (count > avail) count = avail;
+    memcpy(buf, ino->data + (size_t)offset, count);
+    return (int)count;
+}
+
+int tmpfs_unlink(const char* path) {
+    int idx = find_inode(path);
+    if (idx < 0) return -1;
+    if (tmpfs_inodes[idx].refcount > 0) {
+        /* File is still open — deny unlink or allow? For simplicity allow but mark */
+        /* If open, we still free data but keep inode until close? Simpler: fail if open */
+        return -1;
+    }
+    if (tmpfs_inodes[idx].data) kfree(tmpfs_inodes[idx].data);
+    tmpfs_inodes[idx].data = NULL;
+    tmpfs_inodes[idx].used = 0;
+    tmpfs_inodes[idx].size = 0;
+    tmpfs_inodes[idx].name[0] = '\0';
+    return 0;
+}
+
+int tmpfs_stat(const char* path, struct stat* st) {
+    int idx = find_inode(path);
+    if (idx < 0) return -1;
+    if (!st) return -1;
+    memset(st, 0, sizeof(*st));
+    st->mode = S_IFREG | 0644;
+    st->size = tmpfs_inodes[idx].size;
+    return 0;
+}
+
 void tmpfs_init(void) {
     memset(tmpfs_inodes, 0, sizeof(tmpfs_inodes));
     memset(tmpfs_opens,  0, sizeof(tmpfs_opens));

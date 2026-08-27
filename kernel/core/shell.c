@@ -434,32 +434,15 @@ void reboot_system(void) {
  * the QEMU/Bochs-specific port writes that the previous code used.
  */
 
-/* PCI config space access (type 1 mechanism) */
-#define PCI_CONFIG_ADDR  0xCF8
-#define PCI_CONFIG_DATA  0xCFC
-
-static uint32_t pci_read_config(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
-    uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
-                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (reg & 0xFC);
-    outl(PCI_CONFIG_ADDR, addr);
-    return inl(PCI_CONFIG_DATA);
-}
-
-static void pci_write_config(uint8_t bus, uint8_t dev, uint8_t func,
-                             uint8_t reg, uint32_t val) {
-    uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
-                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (reg & 0xFC);
-    outl(PCI_CONFIG_ADDR, addr);
-    outl(PCI_CONFIG_DATA, val);
-}
-
 /* Scan PCI bus 0 for ACPI PM device (Intel PIIX4/ICH).
  * Vendor 8086, device 7000 (PIIX4) or 7113 (PIIX4E/ICH0 ACPI).
- * Returns: PM base I/O address from config register, or 0 if not found. */
+ * Returns: PM base I/O address from config register, or 0 if not found.
+ * Uses the shared pci_config_read32() helper from drivers/pci/pci.c
+ * (deduplicated — previously duplicated Type 1 access was copy-pasted here). */
 static uint16_t pci_find_acpi_pm_base(void) {
     for (uint8_t dev = 0; dev < 32; dev++) {
         for (uint8_t func = 0; func < 8; func++) {
-            uint32_t id = pci_read_config(0, dev, func, 0);
+            uint32_t id = pci_config_read32(0, dev, func, 0);
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = (id >> 16) & 0xFFFF;
 
@@ -468,7 +451,7 @@ static uint16_t pci_find_acpi_pm_base(void) {
                 /* PM base is in PCI config register 0x40 (PIIX4) or 0x48 (ICH).
                  * Bits [15:7] = base address, bits [6:0] = reserved/zero.
                  * Mask out the low bits to get the I/O port base. */
-                uint32_t pm_reg = pci_read_config(0, dev, func, 0x40);
+                uint32_t pm_reg = pci_config_read32(0, dev, func, 0x40);
                 uint16_t pm_base = (uint16_t)((pm_reg & 0xFF80) >> 0);
                 /* PIIX4 PM1a_CNT_BLK = pm_base + 0x04 */
                 pr_info("acpi: found Intel PIIX4 ACPI (bus=0,dev=%d,func=%d,dev_id=0x%x)\n",
@@ -1293,10 +1276,11 @@ static void cmd_ifconfig(int argc, char** argv) {
            mac.bytes[3], mac.bytes[4], mac.bytes[5]);
     if (net_is_up()) {
         ipv4_addr_t ip = net_get_ip();
-        ipv4_addr_t mask = net_get_gateway();  /* approximate */
+        ipv4_addr_t mask = net_get_mask();
         ipv4_addr_t gw = net_get_gateway();
         ipv4_addr_t dns = net_get_dns();
         printk("    IPv4:     %u.%u.%u.%u\n", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+        printk("    Netmask:  %u.%u.%u.%u\n", mask.bytes[0], mask.bytes[1], mask.bytes[2], mask.bytes[3]);
         printk("    Gateway:  %u.%u.%u.%u\n", gw.bytes[0], gw.bytes[1], gw.bytes[2], gw.bytes[3]);
         printk("    DNS:      %u.%u.%u.%u\n", dns.bytes[0], dns.bytes[1], dns.bytes[2], dns.bytes[3]);
     } else {
@@ -2162,18 +2146,30 @@ static void execute_command(void) {
 
     if (strcmp(cmd, "help") == 0) cmd_help();
     else if (strcmp(cmd, "echo") == 0) cmd_echo();
-    else if (strcmp(cmd, "cd") == 0) {
+    else     if (strcmp(cmd, "cd") == 0) {
         if (argc < 2) {
             /* No arg: go to root */
             strcpy(cwd, "/");
         } else {
+            char new_path[64];
             if (argv[1][0] == '/') {
-                strncpy(cwd, argv[1], sizeof(cwd) - 1);
+                strncpy(new_path, argv[1], sizeof(new_path) - 1);
+                new_path[sizeof(new_path) - 1] = '\0';
             } else {
-                strncat(cwd, "/", sizeof(cwd) - strlen(cwd) - 1);
-                strncat(cwd, argv[1], sizeof(cwd) - strlen(cwd) - 1);
+                if (strcmp(cwd, "/") == 0) {
+                    ksnprintf(new_path, sizeof(new_path), "/%s", argv[1]);
+                } else {
+                    ksnprintf(new_path, sizeof(new_path), "%s/%s", cwd, argv[1]);
+                }
             }
-            cwd[sizeof(cwd) - 1] = '\0';
+            /* Validate like sys_chdir does: ensure target exists and is a directory */
+            struct stat st;
+            if (vfs_stat(new_path, &st) < 0 || !S_ISDIR(st.mode)) {
+                printk("cd: %s: No such directory\n", argv[1]);
+            } else {
+                strncpy(cwd, new_path, sizeof(cwd) - 1);
+                cwd[sizeof(cwd) - 1] = '\0';
+            }
         }
     }
     else if (strcmp(cmd, "clear") == 0) cmd_clear();

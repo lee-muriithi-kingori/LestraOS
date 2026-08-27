@@ -14,6 +14,7 @@
 #define LESTRA_TMPFS_H
 
 #include <lestra/types.h>
+#include <lestra/vfs.h>
 
 #define TMPFS_FD_BASE        500
 #define TMPFS_MAX_OPEN        100   /* fds 500..599 */
@@ -26,5 +27,9 @@ int     tmpfs_close(int fd);
 ssize_t tmpfs_read(int fd, void* buf, size_t count);
 ssize_t tmpfs_write(int fd, const void* buf, size_t count);
 int     tmpfs_is_tmpfs_fd(int fd);
+int     tmpfs_lseek(int fd, off_t offset, int whence);
+int     tmpfs_read_at(int fd, void* buf, size_t count, off_t offset);
+int     tmpfs_unlink(const char* path);
+int     tmpfs_stat(const char* path, struct stat* st);
 
 #endif /* LESTRA_TMPFS_H */

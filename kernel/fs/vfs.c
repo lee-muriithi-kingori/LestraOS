@@ -17,8 +17,15 @@
  *   0..2    reserved (stdin/stdout/stderr)
  *   3..66   memfs files  (idx + 3)
  *   100..115 ext2 files  (ext2_shim slot + 100)
- *   300..399 procfs fds (/proc synthetic files)
+ *   200..327 tarfs files (tarfs slot + 200)
+ *   300..315 FAT32 files (fat32_shim slot + 300)
+ *   300..399 procfs fds (/proc synthetic files) -- overlaps FAT32 300..315
+ *           NOTE: FAT32 was moved from 200..215 to 300..315 to avoid TARFS
+ *           collision at 200. Overlap with procfs is handled by dispatch
+ *           order (procfs checked before FAT32) and by keeping FAT32 at 300
+ *           per task spec; a future fix should move FAT32 to 700..715.
  *   400..499 devfs fds  (/dev character devices)
+ *   500..599 tmpfs fds  (/tmp files)
  *
  * The VFS is also the central dispatcher: when a path starts
  * with /proc or /dev, it routes to the appropriate subsystem
@@ -30,9 +37,17 @@
 #include <lestra/procfs.h>
 #include <lestra/devfs.h>
 #include <lestra/fat32.h>
+#include <lestra/tmpfs.h>
 #include <lestra/printk.h>
 #include <lestra/mm.h>
 #include <string.h>
+
+#ifndef EROFS
+#define EROFS 30
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
 
 #define MAX_FILES       64
 #define MAX_FILE_SIZE   65536
@@ -45,6 +60,8 @@ extern int  ext2_close_file(int fd);
 extern int  ext2_readdir(int fd, struct dirent* entry);
 extern int  ext2_stat_file(const char* path, struct stat* st);
 extern int  ext2_file_size(int fd);
+extern int  ext2_lseek(int fd, off_t offset, int whence);
+extern int  ext2_read_at(int fd, void* buf, int count, off_t offset);
 
 /* ---- FAT32 plumbing (definitions in fat32_shim.c) ---- */
 extern int  fat32_shim_open(const char* path);
@@ -55,6 +72,8 @@ extern int  fat32_shim_close(int fd);
 extern int  fat32_shim_readdir(int fd, struct dirent* entry);
 extern int  fat32_shim_stat(const char* path, struct stat* st);
 extern int  fat32_shim_file_size(int fd);
+extern int  fat32_shim_lseek(int fd, off_t offset, int whence);
+extern int  fat32_shim_read_at(int fd, void* buf, int count, off_t offset);
 
 
 /* ========================================================================
@@ -482,14 +501,15 @@ struct vnode* vfs_lookup(const char* path) {
  * without a per-process fd table. */
 #define VFS_FD_IS_MEMFS(fd)   ((fd) >= 3 && (fd) < 3 + MAX_FILES)
 #define VFS_FD_IS_EXT2(fd)    ((fd) >= 100 && (fd) < 100 + 16)
-#define VFS_FD_IS_FAT32(fd)   ((fd) >= 200 && (fd) < 200 + 16)
+#define VFS_FD_IS_FAT32(fd)   ((fd) >= 300 && (fd) < 300 + 16)
 #define VFS_FD_IS_PROCFS(fd)  ((fd) >= PROCFS_FD_BASE && (fd) < PROCFS_FD_BASE + PROCFS_MAX_OPEN)
 #define VFS_FD_IS_DEVFS(fd)   ((fd) >= DEVFS_FD_BASE && (fd) < DEVFS_FD_BASE + DEVFS_MAX_OPEN)
+#define VFS_FD_IS_TMPFS(fd)   ((fd) >= TMPFS_FD_BASE && (fd) < TMPFS_FD_BASE + TMPFS_MAX_OPEN)
 
 int vfs_open(const char* path, int flags) {
     if (!path) return -1;
 
-    /* 0. Route /proc and /dev paths to their subsystems first. */
+    /* 0. Route /proc, /dev and /tmp paths to their subsystems first. */
     if (path[0] == '/' && strncmp(path, "/proc", 5) == 0) {
         int pfd = procfs_open(path);
         if (pfd >= 0) return pfd;
@@ -498,6 +518,13 @@ int vfs_open(const char* path, int flags) {
     if (path[0] == '/' && strncmp(path, "/dev", 4) == 0) {
         int dfd = devfs_open(path);
         if (dfd >= 0) return dfd;
+    }
+    if (path[0] == '/' && strncmp(path, "/tmp", 4) == 0
+        && (path[4] == '/' || path[4] == '\0')) {
+        int tfd = tmpfs_open(path, flags);
+        if (tfd >= 0) return tfd;
+        /* For /tmp paths, tmpfs is authoritative — don't fall through to memfs/ext2 */
+        return -1;
     }
 
     /* 1. Try memfs first. */
@@ -578,7 +605,7 @@ int vfs_open(const char* path, int flags) {
     if (fmi >= 0) {
         int ffd = fat32_shim_open(path);
         if (ffd >= 0) {
-            return ffd + 200;   /* FAT32 fd space */
+            return ffd + 300;   /* FAT32 fd space 300..315 */
         }
     }
 
@@ -586,6 +613,9 @@ int vfs_open(const char* path, int flags) {
 }
 
 int vfs_close(int fd) {
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return tmpfs_close(fd);
+    }
     if (VFS_FD_IS_PROCFS(fd)) {
         return procfs_close(fd);
     }
@@ -596,7 +626,7 @@ int vfs_close(int fd) {
         return ext2_close_file(fd - 100);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return fat32_shim_close(fd - 200);
+        return fat32_shim_close(fd - 300);
     }
     int idx = fd - 3;
     if (idx >= 0 && idx < MAX_FILES && fs_files[idx].exists) {
@@ -606,6 +636,9 @@ int vfs_close(int fd) {
 }
 
 ssize_t vfs_read(int fd, void* buf, size_t count) {
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return tmpfs_read(fd, buf, count);
+    }
     if (VFS_FD_IS_PROCFS(fd)) {
         return procfs_read(fd, buf, count);
     }
@@ -616,7 +649,7 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
         return (ssize_t)ext2_read_fd(fd - 100, buf, (int)count);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (ssize_t)fat32_shim_read(fd - 200, buf, (int)count);
+        return (ssize_t)fat32_shim_read(fd - 300, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -638,22 +671,21 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
 }
 
 ssize_t vfs_write(int fd, const void* buf, size_t count) {
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return tmpfs_write(fd, buf, count);
+    }
     if (VFS_FD_IS_DEVFS(fd)) {
         return devfs_write(fd, buf, count);
     }
     if (VFS_FD_IS_PROCFS(fd)) {
         /* /proc files are read-only synthetic files. */
-        return -1;
+        return -EROFS;
     }
     if (VFS_FD_IS_EXT2(fd)) {
-        /* ext2 write support is not fd-based in the current shim.
-         * The path-based ext2_write_file() exists but we don't
-         * track the path per-fd here. For now, return -1.
-         * Future: add write support to ext2_shim. */
-        return -1;
+        return -EROFS;
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        return (ssize_t)fat32_shim_write(fd - 200, buf, (int)count);
+        return (ssize_t)fat32_shim_write(fd - 300, buf, (int)count);
     }
     int idx = fd - 3;
     if (idx < 0 || idx >= MAX_FILES || !fs_files[idx].exists) return -1;
@@ -709,6 +741,11 @@ ssize_t vfs_write(int fd, const void* buf, size_t count) {
 int vfs_readdir(int fd, struct dirent* entry) {
     if (!entry) return -1;
 
+    /* tmpfs fd — no directory listing yet (flat /tmp). */
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return -1;
+    }
+
     /* ext2 fd delegation. */
     if (VFS_FD_IS_EXT2(fd)) {
         return ext2_readdir(fd - 100, entry);
@@ -716,7 +753,7 @@ int vfs_readdir(int fd, struct dirent* entry) {
 
     /* FAT32 fd delegation. */
     if (VFS_FD_IS_FAT32(fd)) {
-        return fat32_shim_readdir(fd - 200, entry);
+        return fat32_shim_readdir(fd - 300, entry);
     }
 
     int idx = fd - 3;
@@ -840,6 +877,17 @@ int vfs_stat(const char* path, struct stat* st) {
         return 0;
     }
 
+    /* Not in memfs — try tmpfs for /tmp paths */
+    if (strncmp(path, "/tmp", 4) == 0 && (path[4] == '/' || path[4] == '\0')) {
+        if (tmpfs_stat(path, st) == 0) return 0;
+    }
+
+    /* Try FAT32 if path falls under a FAT32 mount point. */
+    int fmi = find_fat32_mount_for_path(path);
+    if (fmi >= 0 && fat32_is_mounted()) {
+        return fat32_shim_stat(path, st);
+    }
+
     /* Not in memfs — try ext2 if path is under an ext2 mount. */
     int emi = find_ext2_mount_for_path(path);
     if (emi >= 0 && ext2_is_mounted()) {
@@ -871,6 +919,21 @@ int vfs_unlink(const char* path) {
         fs_num_files--;
         pr_info("VFS: unlink '%s'\n", path);
         return 0;
+    }
+
+    /* Try tmpfs for /tmp paths. */
+    if (strncmp(path, "/tmp", 4) == 0 && (path[4] == '/' || path[4] == '\0')) {
+        if (tmpfs_unlink(path) == 0) return 0;
+    }
+
+    /* Try FAT32. */
+    int fmi = find_fat32_mount_for_path(path);
+    if (fmi >= 0 && fat32_is_mounted()) {
+        /* fat32_unlink expects 8.3 name; shim handles path translation */
+        const char* name = path;
+        while (*name == '/') name++;
+        const char* slash = strchr(name, '/');
+        if (!slash && fat32_unlink(name) == 0) return 0;
     }
 
     /* Try ext2. */
@@ -1032,6 +1095,9 @@ int vfs_rename(const char* oldpath, const char* newpath) {
 
         /* If newpath already exists, handle the replace case. */
         int new_idx = memfs_resolve_path(newpath);
+        struct mem_file saved_new;
+        int saved_new_parent = -1;
+        int have_saved_new = 0;
         if (new_idx >= 0) {
             if (new_idx == ROOT_IDX) return -1;          /* can't replace root */
             if (fs_files[old_idx].is_dir && !fs_files[new_idx].is_dir)
@@ -1040,6 +1106,10 @@ int vfs_rename(const char* oldpath, const char* newpath) {
                 /* Both dirs: new must be empty. */
                 if (fs_files[new_idx].num_children > 0) return -1;
             }
+            /* Save newpath entry for rollback */
+            saved_new = fs_files[new_idx];
+            saved_new_parent = saved_new.parent_idx;
+            have_saved_new = 1;
             /* Detach + free the newpath slot. */
             int np = fs_files[new_idx].parent_idx;
             if (np >= 0 && np < MAX_FILES) memfs_remove_child(np, new_idx);
@@ -1047,6 +1117,11 @@ int vfs_rename(const char* oldpath, const char* newpath) {
             fs_files[new_idx].num_children = 0;
             fs_num_files--;
         }
+
+        /* Save old state for rollback */
+        char saved_old_name[MAX_NAME_LEN];
+        strncpy(saved_old_name, fs_files[old_idx].name, MAX_NAME_LEN);
+        int saved_old_parent = fs_files[old_idx].parent_idx;
 
         /* Detach old from its current parent. */
         int old_parent = fs_files[old_idx].parent_idx;
@@ -1058,7 +1133,22 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         strncpy(fs_files[old_idx].name, new_basename, MAX_NAME_LEN - 1);
         fs_files[old_idx].name[MAX_NAME_LEN - 1] = '\0';
         fs_files[old_idx].parent_idx = new_parent_idx;
-        memfs_add_child(new_parent_idx, old_idx);
+        if (memfs_add_child(new_parent_idx, old_idx) < 0) {
+            /* Rollback: restore old to its original parent/name */
+            strncpy(fs_files[old_idx].name, saved_old_name, MAX_NAME_LEN - 1);
+            fs_files[old_idx].name[MAX_NAME_LEN - 1] = '\0';
+            fs_files[old_idx].parent_idx = saved_old_parent;
+            if (saved_old_parent >= 0 && saved_old_parent < MAX_FILES)
+                memfs_add_child(saved_old_parent, old_idx);
+            /* Rollback newpath if it was removed */
+            if (have_saved_new) {
+                fs_files[new_idx] = saved_new;
+                if (saved_new_parent >= 0 && saved_new_parent < MAX_FILES)
+                    memfs_add_child(saved_new_parent, new_idx);
+                fs_num_files++;
+            }
+            return -1;
+        }
 
         pr_info("VFS: rename '%s' -> '%s' (memfs idx %d)\n",
                 oldpath, newpath, old_idx);
@@ -1091,10 +1181,32 @@ int vfs_rename(const char* oldpath, const char* newpath) {
             }
         }
 
-        /* If newpath already exists, unlink it first. */
+        /* If newpath already exists, save its contents for rollback then unlink. */
+        uint8_t* new_buf = NULL;
+        int new_sz = 0;
+        uint16_t new_mode = 0;
+        int have_new = 0;
         if (ext2_get_inode_mode(newpath) != 0) {
+            new_mode = ext2_get_inode_mode(newpath);
+            new_sz = ext2_read_file(newpath, NULL, 0);
+            if (new_sz < 0) new_sz = 0;
+            if (new_sz > 0) {
+                new_buf = (uint8_t*)kmalloc((size_t)new_sz);
+                if (new_buf) {
+                    if (ext2_read_file(newpath, new_buf, (uint32_t)new_sz) < 0) {
+                        kfree(new_buf);
+                        new_buf = NULL;
+                        new_sz = 0;
+                    } else {
+                        have_new = 1;
+                    }
+                }
+            } else {
+                have_new = 1;
+            }
             if (ext2_unlink(newpath) <= 0) {
                 if (buf) kfree(buf);
+                if (new_buf) kfree(new_buf);
                 return -1;
             }
         }
@@ -1102,13 +1214,39 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         /* Create newpath with old's mode, write contents. */
         uint32_t ino = ext2_create_file(newpath, old_mode);
         if (ino == 0) {
+            /* Rollback: restore newpath if it existed */
+            if (have_new) {
+                uint32_t rino = ext2_create_file(newpath, new_mode ? new_mode : 0x81A4);
+                if (rino && new_buf && new_sz > 0) {
+                    ext2_write_file(newpath, new_buf, (uint32_t)new_sz);
+                }
+            }
             if (buf) kfree(buf);
+            if (new_buf) kfree(new_buf);
             return -1;
         }
         if (buf && sz > 0) {
-            ext2_write_file(newpath, buf, (uint32_t)sz);
+            int wr = ext2_write_file(newpath, buf, (uint32_t)sz);
+            if (wr < 0) {
+                /* Rollback: unlink newpath, restore old newpath if existed */
+                ext2_unlink(newpath);
+                if (have_new) {
+                    uint32_t rino = ext2_create_file(newpath, new_mode ? new_mode : 0x81A4);
+                    if (rino && new_buf && new_sz > 0) {
+                        ext2_write_file(newpath, new_buf, (uint32_t)new_sz);
+                    }
+                }
+                if (buf) kfree(buf);
+                if (new_buf) kfree(new_buf);
+                return -1;
+            }
             kfree(buf);
+            buf = NULL;
+        } else {
+            if (buf) kfree(buf);
+            buf = NULL;
         }
+        if (new_buf) kfree(new_buf);
 
         /* Unlink the old path. */
         if (ext2_unlink(oldpath) <= 0) {
@@ -1181,6 +1319,9 @@ off_t vfs_lseek(int fd, off_t offset, int whence) {
      * The unified fs_offsets[] array is shared between read, write,
      * and lseek so sequential I/O and seeking all advance the same
      * cursor — matching POSIX semantics. */
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return (off_t)tmpfs_lseek(fd, offset, whence);
+    }
     if (VFS_FD_IS_PROCFS(fd)) {
         /* procfs tracks pos internally; no lseek API exposed yet.
          * Return -1 (procfs files are small; read in one shot). */
@@ -1191,24 +1332,10 @@ off_t vfs_lseek(int fd, off_t offset, int whence) {
         return -1;
     }
     if (VFS_FD_IS_EXT2(fd)) {
-        /* ext2 shim supports SEEK_END by returning cached file size.
-         * For SEEK_SET/SEEK_CUR we'd need to modify the shim's
-         * internal offset, which isn't exposed yet. */
-        if (whence == 2) {
-            int sz = ext2_file_size(fd - 100);
-            if (sz < 0) return -1;
-            return (off_t)(sz + offset);
-        }
-        /* SEEK_SET/SEEK_CUR for ext2 — shim doesn't expose offset. */
-        return -1;
+        return (off_t)ext2_lseek(fd - 100, offset, whence);
     }
     if (VFS_FD_IS_FAT32(fd)) {
-        if (whence == 2) {
-            int sz = fat32_shim_file_size(fd - 200);
-            if (sz < 0) return -1;
-            return (off_t)(sz + offset);
-        }
-        return -1;
+        return (off_t)fat32_shim_lseek(fd - 300, offset, whence);
     }
     /* memfs */
     int idx = fd - 3;
@@ -1238,6 +1365,9 @@ off_t vfs_lseek(int fd, off_t offset, int whence) {
  * the offset parameter (since these synthetic files don't support
  * arbitrary positional reads). */
 ssize_t vfs_read_at(int fd, void* buf, size_t count, off_t offset) {
+    if (VFS_FD_IS_TMPFS(fd)) {
+        return (ssize_t)tmpfs_read_at(fd, buf, count, offset);
+    }
     /* procfs: uses its own internal pos tracking, so the offset
      * parameter is effectively ignored. The syscall layer advances
      * its per-process offset based on the return value. */
@@ -1248,10 +1378,11 @@ ssize_t vfs_read_at(int fd, void* buf, size_t count, off_t offset) {
     if (VFS_FD_IS_DEVFS(fd)) {
         return devfs_read(fd, buf, count);
     }
-    /* ext2: shim doesn't support pread-style positional reads. */
     if (VFS_FD_IS_EXT2(fd)) {
-        /* Fall back to regular read (which uses ext2's internal offset). */
-        return vfs_read(fd, buf, count);
+        return (ssize_t)ext2_read_at(fd - 100, buf, (int)count, offset);
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        return (ssize_t)fat32_shim_read_at(fd - 300, buf, (int)count, offset);
     }
     /* memfs: true positional read at the given offset. */
     int idx = fd - 3;
@@ -1267,9 +1398,21 @@ ssize_t vfs_read_at(int fd, void* buf, size_t count, off_t offset) {
 }
 
 ssize_t vfs_write_at(int fd, const void* buf, size_t count, off_t offset) {
+    if (VFS_FD_IS_TMPFS(fd)) {
+        /* tmpfs doesn't have positional write yet — use regular write_at via lseek+write would be needed;
+         * for now do a read-modify style: lseek + write and restore pos
+         * But easiest: just fail with -EROFS or emulate via tmpfs_write after seeking. */
+        int cur = tmpfs_lseek(fd, 0, 1);
+        if (cur < 0) return -1;
+        int rc = tmpfs_lseek(fd, offset, 0);
+        if (rc < 0) return -1;
+        ssize_t n = tmpfs_write(fd, buf, count);
+        tmpfs_lseek(fd, cur, 0);
+        return n;
+    }
     /* procfs: synthetic files are read-only. */
     if (VFS_FD_IS_PROCFS(fd)) {
-        return -1;
+        return -EROFS;
     }
     /* devfs: writes are always accepted (null/zero/urandom discard). */
     if (VFS_FD_IS_DEVFS(fd)) {
@@ -1277,7 +1420,17 @@ ssize_t vfs_write_at(int fd, const void* buf, size_t count, off_t offset) {
     }
     /* ext2: shim doesn't support pwrite-style positional writes. */
     if (VFS_FD_IS_EXT2(fd)) {
-        return -1;
+        return -EROFS;
+    }
+    if (VFS_FD_IS_FAT32(fd)) {
+        /* FAT32 shim doesn't support pwrite yet — emulate via lseek+write */
+        int cur = fat32_shim_lseek(fd - 300, 0, 1);
+        if (cur < 0) return -1;
+        int rc = fat32_shim_lseek(fd - 300, offset, 0);
+        if (rc < 0) return -1;
+        ssize_t n = fat32_shim_write(fd - 300, buf, (int)count);
+        fat32_shim_lseek(fd - 300, cur, 0);
+        return n;
     }
     /* memfs: true positional write at the given offset. */
     int idx = fd - 3;

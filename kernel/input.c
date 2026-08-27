@@ -170,8 +170,10 @@ void input_init(void) {
     mouse_set_callback(input_mouse_callback);
 
     /* Hook into the keyboard handler to push key events for the GUI.
-     * keyboard.c's set_handler lets us register a callback. */
-    prev_kb_handler = NULL;  /* keyboard.c doesn't chain; we capture directly */
+     * Save the previous handler before overwriting so we can chain to it,
+     * fixing the bug where input_init would discard an existing handler
+     * (e.g. the shell's history Up/Down hook). */
+    prev_kb_handler = keyboard_get_handler();
     keyboard_set_handler(input_kb_hook);
 
     pr_info("input: subsystem initialized (mouse callback + keyboard hook)\n");
