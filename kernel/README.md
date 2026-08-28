@@ -14,10 +14,11 @@ LestraOS kernel — 40k lines C + x86_64 ASM. Public headers: `kernel/include/le
 - `net/` — TCP/IP, TLS 1.2, HTTP, socket, wifi framework
 - `drivers/` — block (ahci/nvme/virtio_blk), net (e1000/rtl8139/rtl8168/virtio_net), char (keyboard/mouse/pty/serial/timer/vga), pci, apic (lapic/ioapic), audio (ac97), clock (hpet/rtc), power (battery), sensor (temp)
 - `gui/` — 42-file compositor, 60 Hz, dock/top_bar/window manager
+- `ui/` — cyberpunk text-mode UI (themes, panels)
 - `ai/` + `audio/` — pickle GGUF inference, offline, TTS/STT
-- `sys/` — cron, device_id, sandbox, ssh_server, net_config
 - `acpi/` — ACPI tables and power management
 - `pkg/` — lestra-pkg, deb, preinstalled manifests
+- `sys/` — cron, device_id, sandbox, ssh_server, net_config
 - `include/lestra/` — public kernel headers (`<lestra/...>`) — keep stable
 
 ## Build
