@@ -23,11 +23,11 @@ make iso         # bootable ISO
 ## Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Users\leeki\AppData\Local\Temp\opencode\build-kernel.ps1"
+powershell -ExecutionPolicy Bypass -File "scripts/build-kernel.ps1"
 # expected: 138 C + 7 asm, LINK OK
 ```
 
-Or use WSL2 (Ubuntu 24.04) inside Windows — same Ubuntu steps as above.
+Or use WSL2 (Ubuntu 24.04) inside Windows — same Ubuntu steps as above (`make all && make run`).
 
 ## Style
 

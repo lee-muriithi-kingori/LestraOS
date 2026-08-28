@@ -25,10 +25,10 @@ sudo apt install build-essential nasm qemu-system-x86 grub-pc-bin xorriso python
 ### Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Users\leeki\AppData\Local\Temp\opencode\build-kernel.ps1"
+powershell -ExecutionPolicy Bypass -File "scripts/build-kernel.ps1"
 ```
 
-This verifies `138 C + 7 asm, LINK OK` without WSL.
+This verifies `138 C + 7 asm, LINK OK` without WSL (requires `clang`, `nasm`, `ld.lld` — see script header). Alternatively use WSL2 (Ubuntu 24.04) and run `make all` as on Linux.
 
 ### Build Cross Compiler (recommended)
 
@@ -92,33 +92,33 @@ make clean        # Remove all build artifacts
 
 ```
 LestraOS/
-├── boot/              # Bootloader (multiboot2)
-│   ├── boot.asm       # 32→64 bit transition
-│   ├── stage1.asm     # 16-bit MBR bootloader (raw HDD only)
-│   └── grub.cfg       # GRUB config for ISO
-├── kernel/
-│   ├── arch/          # x86_64 (GDT, IDT, ISRs, linker.ld)
-│   ├── core/          # kernel_main, printk, panic, shell
-│   ├── drivers/       # vga, keyboard, serial, pit
-│   ├── mm/            # PMM, VMM, heap
-│   ├── sched/         # Real preemptive round-robin scheduler + context switch
-│   ├── syscall/        # SYSCALL/SYSRET + dispatch (67 syscalls 0-66)
-│   ├── fs/            # VFS + ext2 driver + procfs + devfs + initrd loader
-│   ├── net/           # TCP/IP: ARP, ICMP, UDP, DHCP, DNS, TCP, TLS 1.2 client+server
-│   ├── gui/           # Framebuffer compositor — wired into boot via kernel_main.c
-│   ├── ui/            # Cyberpunk text-mode UI (themes, panels, menus)
-│   ├── ai/            # AI subsystem (NEW)
-│   └── include/       # Kernel headers
-├── libc/              # Custom C library
-├── user/              # Userspace programs
-├── pkg/               # Package manager (60+ prebuilt)
-├── desktop/           # Dead code — not called; kernel_main.c uses kernel/gui/ directly
-├── installer/         # Host-side OS installer
-├── scripts/           # Build scripts (was build/, moved to avoid make clean collision)
-│   ├── mkinitrd.py    # packs user binaries into initrd.img
-│   └── cross-compiler.sh  # builds x86_64-elf-gcc to ~/opt/cross
-├── docs/              # Architecture, build, boot, AI docs
-└── Makefile
+├── boot/               # stage1.asm, boot.asm, grub.cfg — Multiboot2 + MBR
+├── kernel/             # 40k lines C+ASM — 17 subdirs, see kernel/README.md & docs/STRUCTURE.md
+│   ├── arch/x86_64/    # GDT/IDT/ISR, linker.ld, framebuffer
+│   ├── core/           # kernel_main, panic, printk, shell
+│   ├── mm/             # PMM bitmap, VMM paging, heap
+│   ├── sched/          # preemptive RR, context_switch.asm
+│   ├── syscall/        # 67 calls 0-66, SYSCALL/SYSRET
+│   ├── exec/           # ELF + PE, ldso, pipe, signals
+│   ├── fs/             # VFS + ext2/FAT32/procfs/devfs/tmpfs/tarfs
+│   ├── net/            # TCP/IP + TLS 1.2 + HTTP + wifi framework
+│   ├── drivers/        # block/net/char/pci/apic/audio/clock/...
+│   ├── gui/            # 42-file compositor 60Hz
+│   ├── ui/             # cyberpunk text-mode UI (themes, panels)
+│   ├── ai/ + audio/    # GGUF inference, TTS/STT
+│   ├── acpi/           # ACPI tables & power mgmt
+│   ├── pkg/            # lestra-pkg, preinstalled manifests
+│   ├── sys/            # cron, sandbox, ssh_server, net_config
+│   └── include/lestra/ # public headers <lestra/...> — keep stable
+├── libc/               # C library (alias libs/libc in docs)
+├── user/               # init + shell + bin (alias userspace)
+├── scripts/            # mkinitrd, mkext2, cross-compiler (alias tools/)
+├── docs/               # ARCHITECTURE, BUILD, NETWORKING, etc.
+├── third_party/lestramanika  # GGUF submodule
+├── .github/workflows/  # CI build + smoke boot
+├── screenshots/        # boot/docs images
+├── tools/              # alias → scripts/ (see tools/README.md)
+└── Makefile + env.sh + LICENSE
 ```
 
 ## Booting

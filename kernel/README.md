@@ -22,7 +22,7 @@ LestraOS kernel — 40k lines C + x86_64 ASM. Public headers: `kernel/include/le
 
 ## Build
 
-Built via top-level `Makefile` and `powershell .../build-kernel.ps1` — 138 C + 7 asm, LINK OK.
+Built via top-level `Makefile` (`make all`) and `powershell -ExecutionPolicy Bypass -File "scripts/build-kernel.ps1"` — 138 C + 7 asm, LINK OK.
 Headers are included as `#include <lestra/foo.h>` → `kernel/include/lestra/foo.h`.
 
 ## Notes
